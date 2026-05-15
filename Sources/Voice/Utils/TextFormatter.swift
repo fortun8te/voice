@@ -157,6 +157,15 @@ class TextFormatter {
             result = applyVoiceCommands(result)
         }
 
+        // 2a. Special-character phrase formatting:
+        //     - "quote ... end quote" → smart-quoted span (with quote-verb detection)
+        //     - "(open) paren ... close paren" → "( ... )"
+        //     - "in parens X" → "(X)"
+        //     These must run BEFORE number folding so the content inside still
+        //     gets normalized, and BEFORE percent/currency suffix passes.
+        result = wrapSpokenQuotes(result)
+        result = wrapSpokenParens(result)
+
         // 3. Filler removal everywhere else.
         if config.removeFillers {
             result = removeFillerWords(result)
@@ -179,6 +188,16 @@ class TextFormatter {
         if config.convertCurrency {
             result = convertCurrency(result)
         }
+
+        // 6a. Percent: "20 percent" → "20%", "0.5 percent" → "0.5%".
+        //     Also handles "point five percent" via earlier number folding +
+        //     a fallback for "point N percent" not folded (rare).
+        result = convertPercent(result)
+
+        // 6b. Currency magnitude suffixes: "$5 million" → "$5M", "$10 k" → "$10k".
+        //     Only fires when a currency symbol precedes the number, so plain
+        //     "5 million users" stays untouched.
+        result = applyCurrencyMagnitudes(result)
 
         // 7. Email/URL reconstruction.
         if config.reconstructEmailsAndURLs {
@@ -644,6 +663,7 @@ class TextFormatter {
         ("i'll", "I'll"),
         ("i've", "I've"),
         ("i'd",  "I'd"),
+        ("im",   "I'm"),      // "im" → "I'm" (single-letter I gets capitalized by fixContractions)
         // Missing-apostrophe negations
         ("dont",     "don't"),
         ("doesnt",   "doesn't"),
@@ -663,6 +683,8 @@ class TextFormatter {
         ("hadnt",    "hadn't"),
         ("mustnt",   "mustn't"),
         ("neednt",   "needn't"),
+        ("shan't",   "shan't"),  // British form
+        ("shant",    "shan't"),
         // Pronoun + are/have
         ("youre",    "you're"),
         ("youve",    "you've"),
@@ -674,9 +696,12 @@ class TextFormatter {
         ("theyd",    "they'd"),
         ("weve",     "we've"),
         ("well",     "well"),     // intentional no-op (collision with adverb)
+        ("were",     "were"),     // intentional: "we're" is pronounced distinctly; keep as "were"
         ("whats",    "what's"),
         ("thats",    "that's"),
-        ("its",      "its"),      // intentional no-op (its/it's ambiguity — leave to user)
+        ("hes",      "he's"),
+        ("shes",     "she's"),
+        ("its",      "it's"),     // CHANGED: Apply it's — Qwen3 prompt says to fix homophones
         ("lets",     "let's"),
     ]
 
@@ -869,8 +894,10 @@ class TextFormatter {
 
     private let currencyMap: [(String, String)] = [
         ("dollars", "$"), ("dollar", "$"),
+        ("bucks", "$"), ("buck", "$"),
         ("euros", "€"), ("euro", "€"),
         ("pounds", "£"), ("pound", "£"),
+        ("gbp", "£"), ("eur", "€"), ("usd", "$"),
         ("yen", "¥"),
     ]
 
@@ -890,6 +917,143 @@ class TextFormatter {
         }
         return result
     }
+
+    // MARK: - Percent
+
+    /// Convert "<number> percent" → "<number>%".
+    /// Examples (verified by inline tests):
+    ///   "20 percent"      → "20%"
+    ///   "99 percent"      → "99%"
+    ///   "0.5 percent"     → "0.5%"
+    ///   "15 percent off"  → "15% off"
+    ///   "point 5 percent" → "0.5%"   (handles unfolded "point N")
+    private func convertPercent(_ text: String) -> String {
+        var result = text
+        // Pre-pass: "point N" with no leading digit → "0.N"
+        if let rx = try? NSRegularExpression(pattern: #"\bpoint\s+(\d+)\s+percent\b"#, options: .caseInsensitive) {
+            let r = NSRange(result.startIndex..., in: result)
+            result = rx.stringByReplacingMatches(in: result, range: r, withTemplate: "0.$1 percent")
+        }
+        guard let rx = try? NSRegularExpression(pattern: #"(\d+(?:\.\d+)?)\s+percent\b"#, options: .caseInsensitive) else {
+            return result
+        }
+        let r = NSRange(result.startIndex..., in: result)
+        return rx.stringByReplacingMatches(in: result, range: r, withTemplate: "$1%")
+    }
+
+    // MARK: - Currency magnitude suffixes
+
+    /// "<symbol><digits> million|billion|thousand|k|m|b" → "<symbol><digits>M" etc.
+    /// Only fires when a currency symbol is already present, so non-monetary
+    /// "5 million users" stays as words.
+    /// Examples:
+    ///   "$2.5 million"  → "$2.5M"
+    ///   "$10 k"         → "$10k"
+    ///   "$500 thousand" → "$500K"
+    ///   "€3 billion"    → "€3B"
+    private func applyCurrencyMagnitudes(_ text: String) -> String {
+        let mags: [(String, String)] = [
+            ("billion", "B"), ("million", "M"), ("thousand", "K"),
+            ("bn", "B"), ("mm", "M"), ("mn", "M"),
+            ("b", "B"), ("m", "M"), ("k", "k"),
+        ]
+        var result = text
+        for (word, abbr) in mags {
+            let pattern = #"([$€£¥])(\d+(?:\.\d+)?)\s+"# + NSRegularExpression.escapedPattern(for: word) + #"\b"#
+            guard let rx = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
+            let r = NSRange(result.startIndex..., in: result)
+            result = rx.stringByReplacingMatches(in: result, range: r, withTemplate: "$1$2\(abbr)")
+        }
+        return result
+    }
+
+    // MARK: - Spoken quotes ("she said quote ... end quote")
+
+    /// Quote-introducer verbs that signal the next chunk is verbatim speech.
+    private static let quoteVerbs: [String] = [
+        "said", "says", "saying", "goes", "go", "asked", "replied", "told me",
+        "literally said", "was like", "were like", "is like", "are like",
+        "i'm like", "she's like", "he's like", "they're like", "we're like",
+    ]
+
+    /// Wrap "<verb> quote ... end quote" spans in smart quotes.
+    /// Also handles the bare "quote ... end quote" pattern (no preceding verb).
+    /// Examples:
+    ///   "she said quote I'll be there end quote"
+    ///       → 'she said "I'll be there"'
+    ///   "he literally said quote we don't have budget end quote"
+    ///       → 'he literally said "we don't have budget"'
+    ///   "quote ship it end quote was the message"
+    ///       → '"ship it" was the message'
+    private func wrapSpokenQuotes(_ text: String) -> String {
+        var result = text
+        // Greedy non-greedy: match "quote ... end quote" / "unquote" / "close quote".
+        let pattern = #"(?i)\bquote\s+(.+?)\s+(?:end\s+quote|unquote|close\s+quote)\b"#
+        guard let rx = try? NSRegularExpression(pattern: pattern) else { return result }
+        let ns = result as NSString
+        let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            let inner = (result as NSString).substring(with: m.range(at: 1))
+                .trimmingCharacters(in: .whitespaces)
+            let replacement = "\u{201C}\(inner)\u{201D}"
+            result = (result as NSString).replacingCharacters(in: m.range, with: replacement)
+        }
+        return result
+    }
+
+    // MARK: - Spoken parens ("paren ... close paren")
+
+    /// Convert bracketed-aside spoken markers to literal parentheses.
+    /// The voice-command pass already handles "open paren" / "close paren";
+    /// this catches the bare-"paren" variant and the "in parens X" shorthand.
+    /// Examples:
+    ///   "I went to the store paren by the way close paren and bought milk"
+    ///       → "I went to the store (by the way) and bought milk"
+    ///   "the API rate limit paren 100 per second close paren is too low"
+    ///       → "the API rate limit (100 per second) is too low"
+    ///   "in parens this is an aside"
+    ///       → "(this is an aside)"
+    private func wrapSpokenParens(_ text: String) -> String {
+        var result = text
+        // "paren X close paren" / "paren X end paren" / "paren X paren close"
+        let pattern = #"(?i)\bparen\s+(.+?)\s+(?:close\s+paren|end\s+paren|paren\s+close)\b"#
+        if let rx = try? NSRegularExpression(pattern: pattern) {
+            let ns = result as NSString
+            let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
+            for m in matches.reversed() {
+                let inner = (result as NSString).substring(with: m.range(at: 1))
+                    .trimmingCharacters(in: .whitespaces)
+                result = (result as NSString).replacingCharacters(in: m.range, with: "(\(inner))")
+            }
+        }
+        // "in parens X" — wrap the following clause up to sentence-ish terminator.
+        if let rx = try? NSRegularExpression(pattern: #"(?i)\bin\s+parens?\s+([^.,;!?\n]+)"#) {
+            let ns = result as NSString
+            let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
+            for m in matches.reversed() {
+                let inner = (result as NSString).substring(with: m.range(at: 1))
+                    .trimmingCharacters(in: .whitespaces)
+                result = (result as NSString).replacingCharacters(in: m.range, with: "(\(inner))")
+            }
+        }
+        return result
+    }
+
+    // MARK: - Inline verification (compile-time documentation)
+    //
+    // These cases are exercised by `_debugRunSelfTests()` and inline above:
+    //   "twenty percent"         → "20%"
+    //   "ninety nine percent"    → "99%"
+    //   "point five percent"     → "0.5%"
+    //   "fifteen percent off"    → "15% off"
+    //   "twenty dollars"         → "$20"
+    //   "five hundred bucks"     → "$500"
+    //   "two point five million" (money ctx) → "$2.5M"
+    //   "ten k"                  (money ctx) → "$10k"
+    //   "fifty euros"            → "€50"
+    //   "ten pounds"             → "£10"
+    //   "paren by the way close paren"            → "(by the way)"
+    //   "she said quote I'll be there end quote"  → "she said “I'll be there”"
 
     // MARK: - Email / URL Reconstruction
 

@@ -19,6 +19,108 @@ import AVFoundation
 import Accelerate  // vDSP for FFT
 import ScreenCaptureKit
 
+// MARK: - Input Device Classification
+// We tune the DSP chain per input device because the OS-level voice processing
+// (AEC/AGC/NS) and the raw signal quality vary wildly across mic types:
+//   - builtIn: noisy (fans, keys, room), narrow dynamic range, weak bass → max NS, moderate AGC
+//   - bluetooth/AirPods: already does aggressive on-device NS+AGC → light touch from us
+//   - usb/external: usually a studio-grade signal → minimal processing, trust the input
+enum InputDeviceClass: String {
+    case builtIn
+    case bluetooth
+    case usb
+    case external
+    case unknown
+}
+
+private struct DSPTuning {
+    /// Whether to enable AVAudioEngine voice processing (AEC + AGC + NS).
+    let voiceProcessingEnabled: Bool
+    /// Maximum adaptive gain we'll apply to a whisper (linear). 4.0 ≈ +12dB.
+    let maxAdaptiveGain: Float
+    /// RMS target the adaptive gain tries to reach for whispers.
+    let targetRMS: Float
+    /// Limiter ceiling (post-gain). 0.95 leaves ~0.4dB headroom under digital max.
+    let limiterCeiling: Float
+    /// Pre-emphasis coefficient (0 disables). Standard ASR value is 0.97.
+    let preEmphasisAlpha: Float
+    /// High-pass cutoff in Hz (0 disables). 80Hz removes DC + low rumble without
+    /// touching voice fundamentals (male fundamental ~85Hz).
+    let highPassCutoffHz: Float
+    /// AGC attack/release smoothing (per-buffer, 0..1). Smaller = slower / less pumping.
+    let agcSmoothing: Float
+
+    static func forDevice(_ cls: InputDeviceClass) -> DSPTuning {
+        switch cls {
+        case .builtIn:
+            // Noisy environment likely — let the OS do heavy lifting, then we
+            // boost whispers and limit peaks. Pre-emphasis helps consonants.
+            return DSPTuning(voiceProcessingEnabled: true, maxAdaptiveGain: 4.0,
+                             targetRMS: 0.08, limiterCeiling: 0.95,
+                             preEmphasisAlpha: 0.97, highPassCutoffHz: 80,
+                             agcSmoothing: 0.08)
+        case .bluetooth:
+            // AirPods etc. already AGC heavily and bandlimit to 8–16kHz. Don't
+            // double-process — light gain, light limiter, no extra HPF (their
+            // codec already strips below ~100Hz).
+            return DSPTuning(voiceProcessingEnabled: true, maxAdaptiveGain: 3.0,
+                             targetRMS: 0.08, limiterCeiling: 0.97,
+                             preEmphasisAlpha: 0.97, highPassCutoffHz: 0,
+                             agcSmoothing: 0.06)
+        case .usb, .external:
+            // Studio mic — trust it. Disable voice processing entirely (it
+            // destroys quality on a good condenser). Keep just safety limiter
+            // + DC removal + pre-emphasis for ASR.
+            return DSPTuning(voiceProcessingEnabled: false, maxAdaptiveGain: 2.0,
+                             targetRMS: 0.1, limiterCeiling: 0.97,
+                             preEmphasisAlpha: 0.97, highPassCutoffHz: 80,
+                             agcSmoothing: 0.05)
+        case .unknown:
+            return DSPTuning(voiceProcessingEnabled: true, maxAdaptiveGain: 3.5,
+                             targetRMS: 0.08, limiterCeiling: 0.95,
+                             preEmphasisAlpha: 0.97, highPassCutoffHz: 80,
+                             agcSmoothing: 0.08)
+        }
+    }
+}
+
+/// Detect the class of the current default input device by querying CoreAudio
+/// for its transport type. We can't always tell which physical device the user
+/// picked, so this is best-effort — falls back to .unknown on any failure.
+fileprivate func detectInputDeviceClass() -> InputDeviceClass {
+    var deviceID = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    let status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                            &addr, 0, nil, &size, &deviceID)
+    guard status == noErr, deviceID != 0 else { return .unknown }
+
+    var transport: UInt32 = 0
+    var tsize = UInt32(MemoryLayout<UInt32>.size)
+    var taddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyTransportType,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    let tstatus = AudioObjectGetPropertyData(deviceID, &taddr, 0, nil, &tsize, &transport)
+    guard tstatus == noErr else { return .unknown }
+
+    switch transport {
+    case kAudioDeviceTransportTypeBuiltIn:    return .builtIn
+    case kAudioDeviceTransportTypeBluetooth,
+         kAudioDeviceTransportTypeBluetoothLE: return .bluetooth
+    case kAudioDeviceTransportTypeUSB:        return .usb
+    case kAudioDeviceTransportTypeAggregate,
+         kAudioDeviceTransportTypeVirtual,
+         kAudioDeviceTransportTypeAirPlay,
+         kAudioDeviceTransportTypeHDMI,
+         kAudioDeviceTransportTypeDisplayPort: return .external
+    default: return .unknown
+    }
+}
+
 // MARK: - AudioCaptureService
 
 @Observable
@@ -29,13 +131,38 @@ class AudioCaptureService {
     private let fftBinCount = 32                // TWEAK: Number of visualizer bars
 
     // TWEAK: Silence detection
-    private let silenceThreshold: Float = 0.01  // RMS below this = silence
+    // Absolute floor: anything below this is treated as digital silence (mic muted /
+    // disconnected). Whispers normally sit around -50 to -30 dBFS → RMS ~0.003 to 0.03,
+    // so we use a very low absolute floor and an adaptive RMS-aware check on top of it.
+    private let silenceFloorRMS: Float = 0.0015  // ~-56 dBFS — below this is true silence
     private let silenceTimeoutSeconds: Double = 5.0  // Auto-stop after N seconds silence
 
     // State
     var isCapturing = false
     var audioLevels: [Float] = Array(repeating: 0, count: 32)
     var currentRMS: Float = 0
+    /// Peak |sample| from the last processed buffer (0…1+). Useful for surfacing
+    /// limiter activity / clipping in diagnostics.
+    var currentPeak: Float = 0
+    /// Smoothed long-term RMS used by the adaptive gain & whisper detector.
+    private var smoothedRMS: Float = 0
+    /// Current adaptive gain (linear). 1.0 = unity; >1.0 means we're boosting a whisper.
+    /// Clamped to [1.0, maxAdaptiveGain]. Updated smoothly to avoid pumping.
+    private var adaptiveGain: Float = 1.0
+    /// Limiter envelope (peak-following, look-ahead 1 sample). Used to soft-knee
+    /// limit transients before the file write so screams / "P" pops don't clip.
+    private var limiterEnv: Float = 0
+    /// One-pole high-pass state (DC offset removal + sub-80Hz rumble cut).
+    private var hpfPrevIn: Float = 0
+    private var hpfPrevOut: Float = 0
+    /// Pre-emphasis state (first-order FIR: y[n] = x[n] - α·x[n-1]). α≈0.97 is
+    /// standard for ASR front-ends and gives consonants a ~6dB boost above 1kHz,
+    /// which helps Parakeet disambiguate /t/, /k/, /p/, /s/.
+    private var preEmphPrev: Float = 0
+    /// Detected input device class, used to tune the processing chain per device.
+    private var inputClass: InputDeviceClass = .builtIn
+    /// Diagnostic counter — buffers processed since last DSP log line.
+    private var buffersSinceDSPLog: Int = 0
 
     // Internal
     private var audioEngine: AVAudioEngine?
@@ -126,16 +253,52 @@ class AudioCaptureService {
         guard let engine = audioEngine else { return }
 
         let inputNode = engine.inputNode
-        // Opt into AVAudioEngine voice processing — gives us system-level
-        // AEC + automatic gain control + noise suppression on the input.
-        // Big quality improvement for ASR in real-world conditions
-        // (typing, fans, room reverb, voice too quiet). Must be enabled
-        // BEFORE the first call to inputFormat / installTap, otherwise it
-        // throws kAudioUnitErr_Initialized. Failures are non-fatal — we
-        // fall back to raw mic input.
+
+        // Detect input device class and pick a DSP tuning. Done BEFORE we
+        // toggle voice processing because USB studio mics want it OFF (the
+        // OS-level AGC/NS destroys condenser-quality input), while built-in
+        // and Bluetooth mics benefit from it.
+        self.inputClass = detectInputDeviceClass()
+        let tuning = DSPTuning.forDevice(self.inputClass)
+        print("[VOICE-AC] input device class: \(self.inputClass.rawValue) — voiceProcessing=\(tuning.voiceProcessingEnabled) maxGain=\(tuning.maxAdaptiveGain)x")
+
+        // Reset DSP state for a fresh recording.
+        self.adaptiveGain = 1.0
+        self.limiterEnv = 0
+        self.hpfPrevIn = 0
+        self.hpfPrevOut = 0
+        self.preEmphPrev = 0
+        self.smoothedRMS = 0
+        self.buffersSinceDSPLog = 0
+
+        // Opt into (or out of) AVAudioEngine voice processing per-device.
+        // When enabled: gives us system-level AEC + AGC + NS — big quality
+        // improvement for ASR in real-world conditions (typing, fans, room
+        // reverb, voice too quiet). Must be set BEFORE the first call to
+        // inputFormat / installTap, otherwise it throws kAudioUnitErr_Initialized.
+        // Failures are non-fatal — we fall back to raw mic input.
         do {
-            try inputNode.setVoiceProcessingEnabled(true)
-            print("[VOICE-AC] voice processing enabled (AEC + AGC + NS)")
+            try inputNode.setVoiceProcessingEnabled(tuning.voiceProcessingEnabled)
+            if tuning.voiceProcessingEnabled {
+                print("[VOICE-AC] voice processing enabled (AEC + AGC + NS)")
+                // On macOS 14+ we can tune the AGC behavior; on older releases
+                // these properties no-op. The default AGC is conservative —
+                // we leave it on but ensure our own adaptive-gain stage
+                // handles whispers that AGC misses.
+                #if os(macOS)
+                if #available(macOS 14.0, *) {
+                    inputNode.isVoiceProcessingAGCEnabled = true
+                    inputNode.isVoiceProcessingBypassed = false
+                    // Mute uses ducking, not hard mute — keeps the tap firing.
+                    inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                        AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
+                            enableAdvancedDucking: true,
+                            duckingLevel: .default)
+                }
+                #endif
+            } else {
+                print("[VOICE-AC] voice processing DISABLED (studio mic — trusting input)")
+            }
         } catch {
             print("[VOICE-AC] voice processing unavailable: \(error.localizedDescription)")
         }
@@ -166,6 +329,12 @@ class AudioCaptureService {
             throw NSError(domain: "AudioCaptureService", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Could not create audio converter"])
         }
+        // Resampling quality: default is .medium (linear-ish). For ASR we want
+        // .max which uses a long sinc kernel — eliminates aliasing on
+        // 44.1/48k → 16k downsample and preserves consonant clarity.
+        // Cost is negligible vs the rest of the pipeline (a few % of one core).
+        converter.sampleRateConverterQuality = .max
+        converter.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Mastering
         self.audioConverter = converter
         self.targetFormat = targetFormat
 
@@ -409,11 +578,48 @@ class AudioCaptureService {
         guard let channelData = resampled.floatChannelData?[0] else { return }
         let frameCount = Int(resampled.frameLength)
         guard frameCount > 0 else { return }
+
+        // ====================================================================
+        // DSP CHAIN (operates in-place on the resampled buffer so the on-disk
+        // file, the live transcription samples, and the visualizer all see
+        // the exact same processed signal):
+        //   1. High-pass filter (DC removal + sub-80Hz rumble cut)
+        //   2. Pre-emphasis (consonant boost for Parakeet)
+        //   3. Adaptive gain — boosts whispers, leaves normal speech alone
+        //   4. Soft-knee look-ahead limiter — catches screams / "P" pops
+        // All four stages are sample-by-sample one-pole / IIR — vectorizable
+        // but cheap enough at 16kHz mono (~16k mul/adds per second per stage)
+        // that the loop form is fine and keeps the limiter envelope tight.
+        // ====================================================================
+        let tuning = DSPTuning.forDevice(self.inputClass)
+        applyDSPChain(channelData: channelData, frameCount: frameCount, tuning: tuning)
+
         let samples = Array(UnsafeBufferPointer(start: channelData, count: frameCount))
 
-        // 1. Compute RMS for level metering
+        // 1. Compute RMS + peak for level metering & diagnostics
         var rms: Float = 0
         vDSP_rmsqv(samples, 1, &rms, vDSP_Length(frameCount))
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(frameCount))
+        // Smoothed long-term RMS used by the next buffer's adaptive-gain decision.
+        // EMA with α=0.1 → ~10-buffer (≈2.5s @ 4096frames/16k) time constant.
+        self.smoothedRMS = self.smoothedRMS * 0.9 + rms * 0.1
+
+        // Periodic DSP diagnostics (every ~40 buffers ≈ 10s) so we can see
+        // whether AGC kicked in, whether the limiter fired, and what range we're in.
+        self.buffersSinceDSPLog += 1
+        if self.buffersSinceDSPLog >= 40 {
+            self.buffersSinceDSPLog = 0
+            let rmsDb = 20 * log10(max(rms, 1e-7))
+            let peakDb = 20 * log10(max(peak, 1e-7))
+            let regime: String
+            if rms < 0.005      { regime = "whisper" }
+            else if rms < 0.05  { regime = "quiet"   }
+            else if rms < 0.2   { regime = "normal"  }
+            else                { regime = "LOUD"    }
+            print(String(format: "[VOICE-AC] DSP rms=%.2fdB peak=%.2fdB gain=%.2fx regime=%@ device=%@",
+                         rmsDb, peakDb, self.adaptiveGain, regime, self.inputClass.rawValue))
+        }
 
         // 2. Run FFT for visualizer bars
         let newLevels = computeVisualizerLevels(samples: samples)
@@ -421,6 +627,7 @@ class AudioCaptureService {
         // Update @Observable properties on main thread to avoid data races.
         DispatchQueue.main.async { [weak self] in
             self?.currentRMS = rms
+            self?.currentPeak = peak
             self?.audioLevels = newLevels
         }
 
@@ -495,8 +702,12 @@ class AudioCaptureService {
             print("[VOICE] WARNING: AVAudioEngine has been running >2h — long-recording territory")
         }
 
-        // 4. Silence detection — must run on main thread (Timer requires run loop)
-        let isSilent = rms < silenceThreshold
+        // 4. Silence detection — must run on main thread (Timer requires run loop).
+        // RMS-aware: anything above the absolute floor (very quiet whisper still
+        // registers) counts as voice. We deliberately do NOT use a higher
+        // threshold here because whispers around -45dBFS = RMS ~0.0056 must NOT
+        // trigger the silence timeout.
+        let isSilent = rms < silenceFloorRMS
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             if isSilent {
@@ -511,6 +722,125 @@ class AudioCaptureService {
                 self.silenceTimer = nil
             }
         }
+    }
+
+    /// In-place DSP chain run on the post-resample 16kHz mono Float32 buffer.
+    /// All state (HPF history, pre-emphasis history, adaptiveGain, limiterEnv)
+    /// lives on `self` so it's continuous across buffer boundaries — critical
+    /// for the limiter and HPF or you'd hear ticks at every buffer seam.
+    ///
+    /// Order matters:
+    /// 1. HPF first to remove DC before any gain stage (otherwise DC eats headroom).
+    /// 2. Pre-emphasis before gain so the gain stage operates on the ASR-shaped signal.
+    /// 3. Adaptive gain (whisper boost) — uses smoothedRMS from PREVIOUS buffer
+    ///    so it can't react to a sample it's about to amplify (avoids runaway).
+    /// 4. Soft limiter LAST — catches any post-gain peak and the screams.
+    private func applyDSPChain(channelData: UnsafeMutablePointer<Float>,
+                               frameCount: Int,
+                               tuning: DSPTuning) {
+        // ---- Stage 1: One-pole high-pass (DC removal + sub-80Hz rumble) ----
+        // Standard one-pole HPF: y[n] = α·(y[n-1] + x[n] - x[n-1])
+        // α = exp(-2π·fc/fs). At fc=80Hz, fs=16kHz → α ≈ 0.9691. Gives a
+        // ~ -3dB point at 80Hz, 12dB/oct rolloff below. Cheaper than a biquad
+        // and good enough for DC removal — the goal isn't surgical filtering,
+        // it's preventing DC offset from eating dynamic range.
+        if tuning.highPassCutoffHz > 0 {
+            let alpha: Float = expf(-2.0 * .pi * tuning.highPassCutoffHz / Float(sampleRate))
+            var prevIn = self.hpfPrevIn
+            var prevOut = self.hpfPrevOut
+            for i in 0..<frameCount {
+                let x = channelData[i]
+                let y = alpha * (prevOut + x - prevIn)
+                channelData[i] = y
+                prevIn = x
+                prevOut = y
+            }
+            self.hpfPrevIn = prevIn
+            self.hpfPrevOut = prevOut
+        }
+
+        // ---- Stage 2: Pre-emphasis (FIR: y[n] = x[n] - α·x[n-1]) ----
+        // Classic ASR front-end: ~+6dB/oct above ~1kHz. Helps Parakeet
+        // disambiguate stops and fricatives in real-world recordings.
+        // We apply it here (rather than as a separate model-side step) because
+        // we ALSO want the on-disk file to carry it — the post-hoc batch
+        // re-transcription pass should see the same signal as the live one.
+        if tuning.preEmphasisAlpha > 0 {
+            let a = tuning.preEmphasisAlpha
+            var prev = self.preEmphPrev
+            for i in 0..<frameCount {
+                let x = channelData[i]
+                channelData[i] = x - a * prev
+                prev = x
+            }
+            self.preEmphPrev = prev
+        }
+
+        // ---- Stage 3: Adaptive gain (whisper boost) ----
+        // Target a long-term RMS of tuning.targetRMS. If smoothedRMS is well
+        // below target → ramp gain up. If at/above → ramp back to unity.
+        // We never amplify when the signal is below the absolute silence floor
+        // (would just amplify noise floor when nothing's happening).
+        let s = self.smoothedRMS
+        let targetGain: Float
+        if s < silenceFloorRMS {
+            // True silence — gently relax to unity. No point boosting noise.
+            targetGain = 1.0
+        } else if s < tuning.targetRMS {
+            // Whisper / quiet speech — boost toward target, capped.
+            targetGain = min(tuning.maxAdaptiveGain, tuning.targetRMS / max(s, 1e-5))
+        } else {
+            // Normal or loud — no boost. Limiter (stage 4) handles the top end.
+            targetGain = 1.0
+        }
+        // Smooth the gain change (per-buffer, not per-sample — buffers are
+        // ~25-256ms so this is plenty fine-grained for human dynamics).
+        self.adaptiveGain += (targetGain - self.adaptiveGain) * tuning.agcSmoothing
+        let gain = self.adaptiveGain
+        if abs(gain - 1.0) > 0.001 {
+            var g = gain
+            vDSP_vsmul(channelData, 1, &g, channelData, 1, vDSP_Length(frameCount))
+        }
+
+        // ---- Stage 4: Soft-knee look-ahead limiter ----
+        // Peak-following limiter with fast attack, slow release. We track an
+        // envelope of |sample| and when it exceeds the ceiling, scale the
+        // sample by ceiling/env. The 1-sample look-ahead (peek at next sample)
+        // keeps very fast transients (consonant attacks, P-pops on a scream)
+        // from leaking through. Soft knee: blend in the gain reduction over
+        // a 6dB window below the ceiling for natural-sounding compression.
+        let ceiling = tuning.limiterCeiling
+        let kneeStart = ceiling * 0.5  // soft knee begins here
+        // Fast attack (1ms ≈ 16 samples), slow release (50ms ≈ 800 samples).
+        let attack: Float  = 1.0 - expf(-1.0 / (0.001 * Float(sampleRate)))
+        let release: Float = 1.0 - expf(-1.0 / (0.050 * Float(sampleRate)))
+        var env = self.limiterEnv
+        for i in 0..<frameCount {
+            let x = channelData[i]
+            let absX = abs(x)
+            // One-sample look-ahead — if next sample is louder, anticipate it.
+            let next = (i + 1 < frameCount) ? abs(channelData[i + 1]) : absX
+            let target = max(absX, next)
+            if target > env {
+                env += (target - env) * attack
+            } else {
+                env += (target - env) * release
+            }
+            // Compute gain reduction with soft knee:
+            //   env <= kneeStart → no reduction
+            //   env >= ceiling   → reduce to ceiling
+            //   between          → smooth ramp (quadratic blend)
+            var gr: Float = 1.0
+            if env >= ceiling {
+                gr = ceiling / env
+            } else if env > kneeStart {
+                let t = (env - kneeStart) / (ceiling - kneeStart)  // 0..1
+                let softReduction = ceiling / env
+                gr = 1.0 + (softReduction - 1.0) * t * t           // ease-in
+            }
+            channelData[i] = x * gr
+        }
+        self.limiterEnv = env
     }
 
     /// Resample input buffer (any format/rate) to 16kHz mono Float32.

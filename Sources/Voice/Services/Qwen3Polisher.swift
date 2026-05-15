@@ -359,14 +359,20 @@ final class Qwen3Polisher {
         //     the full dictionary).
         var hints = ""
         if let suspectWords, !suspectWords.isEmpty {
-            let joined = suspectWords.prefix(16).joined(separator: ", ")
+            // Sanitize suspect words to prevent prompt injection: escape dangerous characters
+            let sanitized = suspectWords.prefix(16)
+                .map { $0.replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "\n", with: " ") }
+            let joined = sanitized.joined(separator: ", ")
             hints += "Uncertain words (low ASR confidence): [\(joined)]. These tokens are likely MIS-TRANSCRIBED. Check if each one phonetically resembles a term in the custom vocabulary below. If yes, replace it with the canonical spelling.\n"
         }
         if let userVocabulary, !userVocabulary.isEmpty {
             // Prioritize vocabulary terms that share letters/sounds with suspect words,
             // so the most relevant canonical spellings come first when the prompt is truncated.
             let prioritized = Self.prioritizeVocabulary(userVocabulary, suspects: suspectWords)
-            let joined = prioritized.prefix(30).joined(separator: ", ")
+            // SECURITY: Sanitize all vocabulary terms to prevent prompt injection
+            let sanitized = prioritized.prefix(30)
+                .map { $0.replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "\n", with: " ") }
+            let joined = sanitized.joined(separator: ", ")
             hints += "Custom vocabulary (canonical spellings — replace phonetically-similar garbled text with these): [\(joined)].\n"
             hints += "Phonetic-match rule: if a multi-word sequence SOUNDS like one of these terms, collapse it. Examples: 'Chachi Pt' → 'ChatGPT', 'Chatchi Petey' → 'ChatGPT', 'antrop pick' → 'Anthropic', 'antropic' → 'Anthropic', 'clore' → 'Claude', 'clod' → 'Claude', 'open A I' → 'OpenAI', 'C E O' → 'CEO', 'A P I' → 'API'. Word count MAY decrease when collapsing spelled-out or garbled forms — this is correct.\n"
         }
@@ -449,7 +455,7 @@ final class Qwen3Polisher {
     You are a speech-to-text corrector. Fix ASR transcription errors in dictated text. Do NOT rewrite or rephrase.
 
     ALWAYS fix:
-    - Homophones (their/there/they're, your/you're, its/it's, to/too/two, by/buy, then/than, would→would've, should→should've, could→could've)
+    - Homophones (their/there/they're, your/you're, its/it's, to/too/two, by/buy/bye, then/than, would→would've, should→should've, could→could've, accept/except, effect/affect, weather/whether, piece/peace, through/threw, one/won, not/knot, knows/nose, made/maid, main/mane, mail/male, meat/meet, be/bee, break/brake, dear/deer, find/fined, for/four/fore, hear/here, knight/night, no/know, right/write/rite, sail/sale, sea/see, son/sun, way/weigh, where/wear, whole/hole, would/wood, write/right)
     - Capitalization: sentence starts, "I", proper nouns (names, places, companies), days of week, months
     - Missing apostrophes: dont→don't, cant→can't, wont→won't, shouldnt→shouldn't, youre→you're, thats→that's, whats→what's, havent→haven't, isnt→isn't
     - Clear ASR word merges/splits: "commandonth" is "command on the", "wellcome" is "welcome", "alot" is "a lot", "areyou" is "are you"
@@ -458,6 +464,40 @@ final class Qwen3Polisher {
     - Question marks: If a sentence is clearly a question (starts with "what", "why", "how", "do you", "can you", "will you", "should"), add ?
     - PHONETIC RESEMBLANCE to known terms: if a sequence of tokens SOUNDS like a brand/product/acronym (especially one in the "Custom vocabulary" hint), replace it with the canonical spelling. ASR frequently splits proper nouns into nonsense words (e.g. "ChatGPT" → "Chachi Pt"). Restore them. This is the single most important class of fix you make. Word count is allowed to change here.
     - SPELLED-OUT acronyms: when the speaker pronounces letters separately ("F B I", "C E O", "A P I", "U R L"), collapse them to the acronym (FBI, CEO, API, URL).
+    - PERCENT signs: "<number> percent" becomes "<number>%". Drop the word "percent". Works for whole numbers, decimals, and trailing context.
+        "twenty percent" → "20%"
+        "ninety nine percent" → "99%"
+        "point five percent" → "0.5%"
+        "fifteen percent off the price" → "15% off the price"
+        "the model improved by 12 percent" → "the model improved by 12%"
+    - CURRENCY (dollars/euros/pounds/yen): "<number> <currency-word>" becomes "<symbol><number>" with NO space. "bucks" is a dollar synonym.
+        "twenty dollars" → "$20"
+        "five hundred bucks" → "$500"
+        "fifty euros" → "€50"
+        "ten pounds" → "£10"
+        "three thousand yen" → "¥3000"
+    - CURRENCY MAGNITUDES (only when the context is clearly money — preceded by a currency symbol/word, or the surrounding clause is pricing/revenue/cost/budget): collapse "<symbol><n> million|billion|thousand|k" → "<symbol><n>M|B|K|k".
+        "two point five million dollars" → "$2.5M"
+        "ten k in revenue" → "$10k in revenue"
+        "raised five hundred thousand euros" → "raised €500K"
+        Counter-example: "five million users" stays "5 million users" (not money).
+    - PARENTHETICAL ASIDES: speakers mark these with "paren ... close paren" (also "open paren", "in parens"). Replace with literal "( ... )".
+        "I went to the store paren by the way close paren and bought milk"
+            → "I went to the store (by the way) and bought milk."
+        "the API rate limit paren 100 per second close paren is too low"
+            → "the API rate limit (100 per second) is too low."
+        "in parens this is an aside"
+            → "(this is an aside)"
+    - QUOTING SOMEONE: detect verbatim quotes after speech verbs ("said", "says", "goes", "asked", "replied", "told me", "literally said", "was like", "is like", "are like", "X's like"). Wrap the quoted span in smart quotes “ ”.
+        Explicit markers — "quote ... end quote" (also "unquote", "close quote"):
+            'she said quote I'll be there end quote'  → 'she said “I'll be there”'
+            'he literally said quote we don't have budget end quote' → 'he literally said “we don't have budget”'
+        Natural quote indicators — when a speech verb is followed by a clearly verbatim sentence (often starts with "I/we/you/it" + first-person tense), wrap it:
+            'she goes I can't make it tonight' → 'she goes, “I can't make it tonight.”'
+            'they're like we love the new design' → 'they're like, “we love the new design.”'
+        Use smart quotes ("\u{201C}" / "\u{201D}"), never straight ASCII quotes.
+        If unsure whether the following clause is verbatim, leave it unquoted — DO NOT invent quotes around paraphrase.
+    - OTHER PUNCTUATION COMMANDS (literal): "comma" → ",", "period"/"full stop" → ".", "question mark" → "?", "exclamation point"/"exclamation mark" → "!", "colon" → ":", "semicolon" → ";", "new line" → newline, "new paragraph" → blank line, "ellipsis"/"dot dot dot" → "…", "dash" → " — " (em-dash only when it's a clear parenthetical pause; otherwise " - ").
 
     NEVER:
     - Rephrase, reword, or restructure sentences
@@ -535,6 +575,80 @@ final class Qwen3Polisher {
     Input: send the A P I key via U R L
     Output: Send the API key via URL.
 
+    Examples of PERCENT formatting:
+    Input: conversion went up twenty percent
+    Output: Conversion went up 20%.
+
+    Input: ninety nine percent of users never click it
+    Output: 99% of users never click it.
+
+    Input: point five percent margin
+    Output: 0.5% margin.
+
+    Input: fifteen percent off the price
+    Output: 15% off the price.
+
+    Input: the model improved by 12 percent
+    Output: The model improved by 12%.
+
+    Examples of CURRENCY formatting:
+    Input: it costs twenty dollars
+    Output: It costs $20.
+
+    Input: we spent five hundred bucks on ads
+    Output: We spent $500 on ads.
+
+    Input: revenue hit two point five million dollars
+    Output: Revenue hit $2.5M.
+
+    Input: budget is ten k for this sprint
+    Output: Budget is $10k for this sprint.
+
+    Input: fifty euros for the annual plan
+    Output: €50 for the annual plan.
+
+    Input: ten pounds plus shipping
+    Output: £10 plus shipping.
+
+    Examples of PARENTHETICAL ASIDES:
+    Input: i went to the store paren by the way close paren and bought milk
+    Output: I went to the store (by the way) and bought milk.
+
+    Input: the api rate limit paren 100 per second close paren is too low
+    Output: The API rate limit (100 per second) is too low.
+
+    Input: open paren see appendix close paren for details
+    Output: (See appendix) for details.
+
+    Input: in parens this is an aside
+    Output: (This is an aside).
+
+    Examples of QUOTING (explicit "quote ... end quote"):
+    Input: she said quote i'll be there end quote
+    Output: She said \u{201C}I'll be there\u{201D}.
+
+    Input: he literally said quote we don't have budget end quote
+    Output: He literally said \u{201C}we don't have budget\u{201D}.
+
+    Input: the email said quote please reply by friday end quote
+    Output: The email said \u{201C}please reply by Friday\u{201D}.
+
+    Examples of QUOTING (natural — speech verb + verbatim clause):
+    Input: she goes i can't make it tonight
+    Output: She goes, \u{201C}I can't make it tonight.\u{201D}
+
+    Input: they're like we love the new design
+    Output: They're like, \u{201C}we love the new design.\u{201D}
+
+    Examples of LITERAL PUNCTUATION COMMANDS:
+    Input: hey john comma can we talk question mark
+    Output: Hey John, can we talk?
+
+    Input: i'm shipping it today period new paragraph let me know if you need anything
+    Output: I'm shipping it today.
+
+    Let me know if you need anything.
+
     Output ONLY the corrected text. No explanation, no preamble, no quotes, no thinking, no markdown.
     """
 
@@ -569,8 +683,12 @@ final class Qwen3Polisher {
         if cleaned.hasPrefix("<<<") { cleaned = String(cleaned.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines) }
         if cleaned.hasSuffix(">>>") { cleaned = String(cleaned.dropLast(3)).trimmingCharacters(in: .whitespacesAndNewlines) }
         // Strip a leading "Output:" echo (model occasionally repeats the prompt marker).
-        if cleaned.lowercased().hasPrefix("output:") {
-            cleaned = String(cleaned.dropFirst("output:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Also handle variants with spacing like "Output :" or extra whitespace.
+        let outputPrefixPattern = #"^output\s*:\s*"#
+        if let regex = try? NSRegularExpression(pattern: outputPrefixPattern, options: .caseInsensitive) {
+            let range = NSRange(cleaned.startIndex..., in: cleaned)
+            cleaned = regex.stringByReplacingMatches(in: cleaned, range: range, withTemplate: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         // If the model continued past the first answer into a new "Input:" / "Output:"
         // turn, truncate at the boundary. Cheap and prevents runaway echo.

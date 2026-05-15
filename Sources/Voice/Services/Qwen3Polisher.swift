@@ -221,32 +221,169 @@ final class Qwen3Polisher {
 
     // MARK: - Language detection
 
-    /// Reorder vocabulary so terms sharing letters/sounds with the suspect words
-    /// come first. Keeps the most relevant 30 terms in scope when the prompt is
-    /// truncated. Pure string heuristic — no phonetic library needed.
+    /// Reorder vocabulary so terms phonetically similar to the suspect words come
+    /// first. Keeps the most relevant 30 terms in scope when the prompt is
+    /// truncated. Uses a tiny inline Soundex implementation — set-of-letters
+    /// intersection (the previous approach) is bag-of-letters voodoo: "Anthropic"
+    /// and "antibiotic" score nearly identical, while "ChatGPT" and "Chachi Pt"
+    /// share zero letters once tokenized. Soundex maps both halves of an
+    /// ASR-shattered proper noun onto the same code sequence.
     nonisolated static func prioritizeVocabulary(_ vocab: [String], suspects: [String]?) -> [String] {
         guard let suspects, !suspects.isEmpty else { return vocab }
-        let suspectChars = Set(suspects.joined().lowercased().filter { $0.isLetter })
-        guard !suspectChars.isEmpty else { return vocab }
-        return vocab.sorted { a, b in
-            let aScore = Set(a.lowercased().filter { $0.isLetter }).intersection(suspectChars).count
-            let bScore = Set(b.lowercased().filter { $0.isLetter }).intersection(suspectChars).count
-            return aScore > bScore
+        // Compute soundex codes for every suspect token (whitespace-split so
+        // "Chachi Pt" yields ["C200", "P300"] which together cover ChatGPT's
+        // code by prefix overlap).
+        let suspectCodes: [String] = suspects
+            .flatMap { $0.split(whereSeparator: { !$0.isLetter }).map(String.init) }
+            .map { soundex($0) }
+            .filter { !$0.isEmpty }
+        guard !suspectCodes.isEmpty else { return vocab }
+
+        // Score a vocab term by the best phonetic match across its own tokens
+        // vs. any suspect token. Same-code = 4 points, 3-char prefix = 2,
+        // first-letter match = 1.
+        func score(_ term: String) -> Int {
+            let termCodes = term.split(whereSeparator: { !$0.isLetter })
+                .map { soundex(String($0)) }
+                .filter { !$0.isEmpty }
+            var best = 0
+            for tc in termCodes {
+                for sc in suspectCodes {
+                    if tc == sc { best = max(best, 4) }
+                    else if tc.prefix(3) == sc.prefix(3) && tc.count >= 3 { best = max(best, 2) }
+                    else if tc.first == sc.first { best = max(best, 1) }
+                }
+            }
+            return best
         }
+        return vocab.sorted { score($0) > score($1) }
+    }
+
+    /// Tiny Soundex implementation (standard American Soundex):
+    ///   1. Keep the first letter (uppercase).
+    ///   2. Map consonants: B/F/P/V → 1, C/G/J/K/Q/S/X/Z → 2, D/T → 3,
+    ///      L → 4, M/N → 5, R → 6. Vowels (A/E/I/O/U/Y) drop and reset the
+    ///      adjacency-dedup chain. H/W are silent: skip without emitting,
+    ///      but do not reset dedup (so "Pfister" collapses correctly).
+    ///   3. Collapse runs of the same code.
+    ///   4. Pad/truncate to 4 chars (letter + 3 digits).
+    /// Returns "" for empty/non-alpha input. Examples:
+    ///   "ChatGPT" → "C231", "Chachi" → "C200", "Pt" → "P300",
+    ///   "Anthropic" → "A536", "Claude" → "C430", "Clore" → "C460".
+    nonisolated static func soundex(_ word: String) -> String {
+        let letters = word.uppercased().filter { $0.isLetter }
+        guard let first = letters.first else { return "" }
+
+        func code(_ ch: Character) -> Character? {
+            switch ch {
+            case "B", "F", "P", "V": return "1"
+            case "C", "G", "J", "K", "Q", "S", "X", "Z": return "2"
+            case "D", "T": return "3"
+            case "L": return "4"
+            case "M", "N": return "5"
+            case "R": return "6"
+            case "H", "W": return "_" // silent: skip emission, keep lastCode
+            default: return nil       // vowels reset dedupe
+            }
+        }
+
+        var result: [Character] = [first]
+        var lastCode: Character? = code(first)
+        for ch in letters.dropFirst() {
+            guard let c = code(ch) else {
+                lastCode = nil // vowel: reset dedupe chain
+                continue
+            }
+            if c == "_" { continue } // H/W
+            if c != lastCode {
+                result.append(c)
+                lastCode = c
+                if result.count == 4 { break }
+            }
+        }
+        while result.count < 4 { result.append("0") }
+        return String(result)
+    }
+
+    // MARK: - Language detection
+    //
+    // Strategy: word-boundary stopword frequency per language. ASR often
+    // strips accents, so we match unaccented forms. \b prevents substring
+    // false-positives ("est" inside "best", "der" inside "wonder").
+    // If ANY non-English language scores >=2 unique hits, skip polish —
+    // Qwen3 is English-trained and would otherwise rewrite the dictation
+    // into English-shaped slop. English is the default for ambiguous input.
+
+    nonisolated private static func stopwordHits(_ lower: String, _ words: [String]) -> Int {
+        var hits = 0
+        for w in words {
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: w) + "\\b"
+            if lower.range(of: pattern, options: .regularExpression) != nil { hits += 1 }
+        }
+        return hits
     }
 
     nonisolated private static func isDutch(_ text: String) -> Bool {
         let lower = text.lowercased()
-        // Common Dutch words/particles that rarely appear in English
         let dutchMarkers = ["hoor", "toch", "nou", "zeg", "eens", "even", "maar", "eh", "eigenlijk"]
         let dutchCount = dutchMarkers.filter { lower.contains($0) }.count
         if dutchCount >= 2 { return true }
-
-        // Dutch-specific pattern: "het X is"
         if lower.range(of: #"\bhet\s+(\w+)\s+is\b"#, options: .regularExpression) != nil {
             return true
         }
+        return false
+    }
 
+    nonisolated private static func isFrench(_ text: String) -> Bool {
+        let markers = ["le", "la", "les", "une", "des", "est", "et", "je", "vous", "nous", "pas", "pour", "avec", "mais", "dans", "sur", "qui", "que", "ce", "ces", "mon", "ton", "son"]
+        return stopwordHits(text.lowercased(), markers) >= 2
+    }
+
+    nonisolated private static func isGerman(_ text: String) -> Bool {
+        let markers = ["der", "die", "das", "und", "ist", "ich", "nicht", "ein", "eine", "mit", "auch", "auf", "von", "den", "dem", "sich", "wir", "ihr", "sie", "aber", "wenn", "weil", "nur", "noch", "schon"]
+        return stopwordHits(text.lowercased(), markers) >= 2
+    }
+
+    nonisolated private static func isSpanish(_ text: String) -> Bool {
+        // Avoid "no" (English too) and bare "a" (English article).
+        let markers = ["el", "la", "los", "las", "una", "unos", "unas", "que", "esto", "esta", "esos", "esas", "pero", "porque", "para", "con", "sin", "muy", "tambien", "donde", "cuando", "como", "es", "soy", "eres", "somos"]
+        return stopwordHits(text.lowercased(), markers) >= 2
+    }
+
+    nonisolated private static func isItalian(_ text: String) -> Bool {
+        let markers = ["il", "lo", "la", "gli", "le", "una", "uno", "che", "questo", "questa", "sono", "siamo", "sei", "siete", "non", "anche", "molto", "perche", "quando", "dove", "come", "con", "senza", "del", "della", "dei", "delle", "nel", "nella"]
+        return stopwordHits(text.lowercased(), markers) >= 2
+    }
+
+    nonisolated private static func isPortuguese(_ text: String) -> Bool {
+        let markers = ["nao", "sim", "voce", "esta", "estou", "muito", "obrigado", "obrigada", "por", "para", "com", "sem", "mas", "porque", "quando", "onde", "como", "isto", "isso", "aquele", "aquilo", "tambem", "ainda", "agora", "depois", "antes"]
+        return stopwordHits(text.lowercased(), markers) >= 2
+    }
+
+    /// True iff input is confidently in a non-English language. Used by the
+    /// polish gate to skip Qwen3 (English-trained) entirely for foreign input.
+    nonisolated private static func isNonEnglish(_ text: String) -> Bool {
+        return isDutch(text)
+            || isFrench(text)
+            || isGerman(text)
+            || isSpanish(text)
+            || isItalian(text)
+            || isPortuguese(text)
+    }
+
+    // MARK: - Spoken punctuation detection
+
+    /// Returns true if the original ASR input contains any literal spoken-
+    /// punctuation command. These legitimately compress polished output by
+    /// 5-30 chars per occurrence ("comma" → ",", "new paragraph" → "\n\n"),
+    /// so the length-drift sanitizer must relax when any are present.
+    nonisolated private static func hasSpokenPunctuation(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let tokens = ["comma", "period", "full stop", "exclamation point", "exclamation mark", "question mark", "new line", "newline", "new paragraph", "colon", "semicolon", "dash", "ellipsis", "dot dot dot", "open paren", "close paren", "in parens", "paren", "quote", "end quote", "unquote", "close quote"]
+        for t in tokens {
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: t) + "\\b"
+            if lower.range(of: pattern, options: .regularExpression) != nil { return true }
+        }
         return false
     }
 
@@ -288,9 +425,12 @@ final class Qwen3Polisher {
         // Step 1: Strip fillers (rule-based, ~1ms) — runs ALWAYS, even if we skip model
         let stripped = LLMPolisher.stripFillers(text)
 
-        // Step 2: Skip model if text is Dutch (Qwen3 is English-trained and breaks Dutch)
-        if Self.isDutch(stripped) {
-            print("[VOICE] Qwen3 polish skipped: Dutch detected")
+        // Step 2: Skip model if text is in a non-English language (Qwen3 is
+        // English-trained and rewrites Dutch/French/German/Spanish/Italian/
+        // Portuguese into English-shaped slop). English is the default for
+        // ambiguous short utterances.
+        if Self.isNonEnglish(stripped) {
+            print("[VOICE] Qwen3 polish skipped: non-English detected")
             return stripped
         }
 
@@ -416,11 +556,14 @@ final class Qwen3Polisher {
             // On the first-ever polish call, if inference hasn't returned within
             // 1000ms the Metal JIT warmup is still in progress. Post a one-shot
             // toast so the user knows the paste is coming — not that the app is
-            // stuck. This task cancels immediately once the polish task wins.
+            // stuck. This is fire-and-forget (detached) so it CANNOT short-
+            // circuit the task group's first-result-wins logic. It self-cancels
+            // once the polish task completes via `warmupNotifier`.
+            let warmupNotifier: Task<Void, Never>?
             if isFirstCall {
-                group.addTask {
+                warmupNotifier = Task.detached {
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    guard !Task.isCancelled else { return nil }
+                    if Task.isCancelled { return }
                     print("[VOICE] Qwen3 first-polish warmup >1000ms — posting user notification")
                     await MainActor.run {
                         NotificationCenter.default.post(
@@ -429,16 +572,19 @@ final class Qwen3Polisher {
                             userInfo: ["message": "Polisher warming up — paste coming in a moment…"]
                         )
                     }
-                    return nil
                 }
+            } else {
+                warmupNotifier = nil
             }
             for await result in group {
                 group.cancelAll()
+                warmupNotifier?.cancel()
                 if isFirstCall {
                     await MainActor.run { Qwen3Polisher.shared.hasWarmedUp = true }
                 }
                 return result ?? text
             }
+            warmupNotifier?.cancel()
             return text
         }
     }
@@ -728,6 +874,27 @@ final class Qwen3Polisher {
                 print("[VOICE] Qwen3 sanitizer: vocab terms introduced \(introducedTerms) — wordBudget extended to \(wordBudget)")
             }
         }
+        // Spoken-punctuation expansions ("comma" → ",", "new paragraph" → "\n\n",
+        // "period" → ".") legitimately remove a 4-15 char token per occurrence
+        // without introducing vocab terms. Count the tokens in the original
+        // and widen the word-delta budget accordingly so legitimate compressions
+        // aren't rejected.
+        let spokenPunct = hasSpokenPunctuation(original)
+        if spokenPunct {
+            // Conservative: +2 per likely punctuation expansion, capped at +10.
+            let lower = original.lowercased()
+            let tokens = ["comma", "period", "full stop", "exclamation point", "exclamation mark", "question mark", "new line", "newline", "new paragraph", "colon", "semicolon", "dash", "ellipsis", "dot dot dot", "open paren", "close paren", "in parens", "paren", "quote", "end quote", "unquote", "close quote"]
+            var occurrences = 0
+            for t in tokens {
+                let pattern = "\\b" + NSRegularExpression.escapedPattern(for: t) + "\\b"
+                if let regex = try? NSRegularExpression(pattern: pattern) {
+                    occurrences += regex.numberOfMatches(in: lower, range: NSRange(lower.startIndex..., in: lower))
+                }
+            }
+            let extra = min(occurrences * 2, 10)
+            wordBudget += extra
+            print("[VOICE] Qwen3 sanitizer: spoken-punctuation detected (\(occurrences) tokens) — wordBudget extended by \(extra) to \(wordBudget)")
+        }
         guard wordDelta <= wordBudget else {
             print("[VOICE] Qwen3 polish rejected: word count drift \(originalWords)->\(cleanedWords) (delta \(wordDelta), budget \(wordBudget))")
             return original
@@ -741,6 +908,13 @@ final class Qwen3Polisher {
         var lenThreshold = baseThreshold
         if wordBudget > 3 {
             lenThreshold = max(original.count * 60 / 100, 20)
+        }
+        // Spoken-punctuation expansions can compress more aggressively than
+        // vocab substitutions (a single "new paragraph" → "\n\n" removes 11
+        // chars). Drop the threshold floor to 70% of original so the polish
+        // isn't rejected for legitimate punctuation compression.
+        if spokenPunct {
+            lenThreshold = max(lenThreshold, original.count * 70 / 100, 20)
         }
         guard lenDelta <= lenThreshold else {
             print("[VOICE] Qwen3 polish rejected: length drift \(original.count)->\(cleaned.count) (threshold \(lenThreshold))")

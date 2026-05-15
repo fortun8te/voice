@@ -126,6 +126,33 @@ class CursorPaster {
     func pasteAtCursor(_ text: String, restoreClipboard: Bool = false) {
         guard !text.isEmpty else { return }
 
+        // SECURITY: never paste into a password field. macOS exposes the
+        // subrole `AXSecureTextField` on focused secure inputs (1Password,
+        // Keychain, login forms, sudo prompts). If we'd be pasting into one,
+        // ABORT — write to clipboard only and toast the user. This MUST run
+        // before we touch the system pasteboard so we don't poison it on
+        // accident (we still write the polished text below so the user can
+        // Cmd+V manually if they confirm they actually want it there).
+        if isFocusedElementSecure() {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(text, forType: .string)
+            print("[VOICE] ⚠️ refusing to paste into AXSecureTextField — text copied to clipboard")
+            NotificationCenter.default.post(
+                name: .voiceError,
+                object: nil,
+                userInfo: ["message": "Won't paste into password field — text copied to clipboard."]
+            )
+            return
+        }
+
+        // Snapshot the target before paste so we can verify it stayed put.
+        // If focus moves between snapshot and paste delivery (target app
+        // lost focus, user clicked elsewhere, modal opened) the CGEvent
+        // lands in the wrong window. We detect that after-the-fact and
+        // surface a toast so the user knows their text is on the clipboard.
+        let targetSnapshot = currentPasteTargetSnapshot()
+
         // Check if this is a rapid-fire paste (within 1 second of the last paste).
         // If so, use the cached context from the previous paste to avoid re-reading
         // the field, which would see our own text and misinterpret formatting.
@@ -217,11 +244,13 @@ class CursorPaster {
                 if needsLeadingSpace { self?.simulateSpaceKey() }
                 self?.simulatePaste()
                 print("[VOICE] Pasted via CGEvent (Accessibility granted)")
+                self?.verifyPasteLanded(expected: targetSnapshot)
             }
         } else {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 print("[VOICE] Pasted via AppleScript (no Accessibility)")
                 self?.pasteViaSystemEvents()
+                self?.verifyPasteLanded(expected: targetSnapshot)
             }
         }
 
@@ -587,5 +616,89 @@ class CursorPaster {
     static func requestAccessibilityPermission() {
         let options = [kAXTrustedCheckOptionPrompt.takeRetainedValue(): true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    // MARK: - Paste verification & secure-field detection
+
+    /// Snapshot of (frontmost app bundle id, focused AX element identity)
+    /// taken just before paste, so we can detect mid-flight focus loss.
+    private struct PasteTargetSnapshot {
+        let bundleId: String?
+        let focusedElement: AXUIElement?
+    }
+
+    private func currentPasteTargetSnapshot() -> PasteTargetSnapshot {
+        let bundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        var focused: AXUIElement? = nil
+        if AXIsProcessTrusted() {
+            let sys = AXUIElementCreateSystemWide()
+            var ref: CFTypeRef?
+            if AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
+               let r = ref {
+                focused = (r as! AXUIElement)
+            }
+        }
+        return PasteTargetSnapshot(bundleId: bundleId, focusedElement: focused)
+    }
+
+    /// After CGEvent / AppleScript paste fires, give the OS a tick to deliver
+    /// the event, then check whether the frontmost app and focused element
+    /// are still the snapshot we captured before the paste. If not, the
+    /// paste either landed in the wrong place or didn't land at all — post
+    /// a `voiceError` notification so the user knows the text is still on
+    /// the clipboard.
+    private func verifyPasteLanded(expected: PasteTargetSnapshot) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            let nowBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            if nowBundle != expected.bundleId {
+                print("[VOICE] ⚠️ paste verify FAIL — frontmost changed \(expected.bundleId ?? "nil") → \(nowBundle ?? "nil")")
+                NotificationCenter.default.post(
+                    name: .voiceError,
+                    object: nil,
+                    userInfo: ["message": "Couldn't paste — your text is on the clipboard (Cmd+V to paste manually)"]
+                )
+                return
+            }
+            // Compare focused element identity when AX is available.
+            if AXIsProcessTrusted(), let before = expected.focusedElement {
+                let sys = AXUIElementCreateSystemWide()
+                var ref: CFTypeRef?
+                if AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
+                   let r = ref {
+                    let after = r as! AXUIElement
+                    if !CFEqual(before, after) {
+                        print("[VOICE] ⚠️ paste verify FAIL — focused element changed")
+                        NotificationCenter.default.post(
+                            name: .voiceError,
+                            object: nil,
+                            userInfo: ["message": "Couldn't paste — your text is on the clipboard (Cmd+V to paste manually)"]
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns true when the currently focused AX element is a secure text
+    /// input (password field). Uses kAXSubroleAttribute — value
+    /// `AXSecureTextField` is the standard macOS marker. When AX isn't
+    /// trusted we conservatively return false (can't tell, don't block).
+    private func isFocusedElementSecure() -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+        let sys = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let f = focusedRef else { return false }
+        let element = f as! AXUIElement
+
+        // Check subrole first — that's where AXSecureTextField appears.
+        var subroleRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef) == .success,
+           let subrole = subroleRef as? String,
+           subrole == (kAXSecureTextFieldSubrole as String) {
+            return true
+        }
+        // Some Electron / web apps don't set the subrole; fall through.
+        return false
     }
 }

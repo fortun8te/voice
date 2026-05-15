@@ -11,6 +11,7 @@
 import SwiftUI
 import AppKit
 import AVFoundation
+import CoreAudio
 
 @main
 struct VoiceApp: App {
@@ -313,6 +314,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         aboutItem.target = self
         menu.addItem(aboutItem)
 
+        let diagItem = NSMenuItem(title: "Copy Diagnostics", action: #selector(copyDiagnostics), keyEquivalent: "")
+        diagItem.target = self
+        menu.addItem(diagItem)
+
         menu.addItem(NSMenuItem(title: "Quit VOICE", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
     }
@@ -433,6 +438,82 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .applicationName: "VOICE",
             .applicationVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
         ])
+    }
+
+    /// Gather a self-contained diagnostics blob and copy it to the clipboard.
+    /// Pulls: app version, model state, current input device, recent dictation
+    /// outcomes, and the tail of `events.jsonl` (Telemetry sink — captures the
+    /// [VOICE-FUNNEL] equivalents via Telemetry.log calls). When the events
+    /// file doesn't exist yet we still copy the metadata so the user has
+    /// something useful to paste into a bug report.
+    @objc private func copyDiagnostics() {
+        var lines: [String] = []
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        lines.append("VOICE diagnostics")
+        lines.append("version: \(version) (build \(build))")
+        lines.append("macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        lines.append("model state: \(coordinator.state.modelState)")
+        lines.append("input device: \(currentInputDeviceName())")
+        lines.append("accessibility trusted: \(AXIsProcessTrusted())")
+        lines.append("lifetime dictations: \(recordingState.lifetimeDictations) / words: \(recordingState.lifetimeWords)")
+        lines.append("session: dictations=\(recordingState.sessionDictationCount) words=\(recordingState.sessionTotalWords)")
+
+        // Last 5 recent dictation outcomes (length + age).
+        let recents = RecentDictations.all().prefix(5)
+        lines.append("recent dictations (\(recents.count)):")
+        for r in recents {
+            let age = Int(Date().timeIntervalSince(r.timestamp))
+            lines.append("  - \(r.text.count) chars, \(age)s ago: \(r.text.prefix(40))…")
+        }
+
+        // Tail the Telemetry log file — last 100 lines. This is our best
+        // proxy for [VOICE-FUNNEL] capture without rewiring every `print`.
+        if let url = Telemetry.logURL,
+           let raw = try? String(contentsOf: url, encoding: .utf8) {
+            let all = raw.split(separator: "\n", omittingEmptySubsequences: true)
+            let tail = all.suffix(100)
+            lines.append("--- events.jsonl tail (\(tail.count) lines of \(all.count)) ---")
+            for line in tail { lines.append(String(line)) }
+        } else {
+            lines.append("--- events.jsonl: not present yet ---")
+        }
+
+        let blob = lines.joined(separator: "\n")
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(blob, forType: .string)
+        NotificationCenter.default.post(
+            name: .voiceError,
+            object: nil,
+            userInfo: ["message": "Diagnostics copied (\(blob.count) chars)"]
+        )
+        Telemetry.log("diagnostics.copied", properties: ["chars": blob.count])
+    }
+
+    /// Best-effort name of the current default input device. Returns "unknown"
+    /// when CoreAudio refuses the query (rare).
+    private func currentInputDeviceName() -> String {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size, &deviceID) == noErr,
+              deviceID != 0 else { return "unknown" }
+        var nameRef: Unmanaged<CFString>?
+        var nameSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var nameAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(deviceID, &nameAddr, 0, nil, &nameSize, &nameRef) == noErr,
+              let cf = nameRef?.takeRetainedValue() else {
+            return "unknown"
+        }
+        return cf as String
     }
 
     /// Show (or reuse) the Big Menu window.
@@ -1025,12 +1106,24 @@ extension AppDelegate: NSWindowDelegate {
             )
             let userVocab = CombinedDictionary.terms()
             let polishStart = Date()
-            let finalText = await Qwen3Polisher.shared.polish(
-                formatted,
-                context: polishContext,
-                suspectWords: suspectWords.isEmpty ? nil : suspectWords,
-                userVocabulary: userVocab.isEmpty ? nil : userVocab
-            )
+            // Short-utterance bypass: when RecordingCoordinator flagged the
+            // current clip as 16-36KB ("ok"/"yeah"/"no" territory), skip the
+            // LLM polish pass and keep the rule-based formatted text. Polish
+            // on a single word costs ~100ms and sometimes mangles it.
+            let skipPolish = recordingState.skipPolishForCurrent
+            recordingState.skipPolishForCurrent = false  // consume the flag
+            let finalText: String
+            if skipPolish {
+                print("[VOICE] Short clip — skipping LLM polish (rule-based only)")
+                finalText = formatted
+            } else {
+                finalText = await Qwen3Polisher.shared.polish(
+                    formatted,
+                    context: polishContext,
+                    suspectWords: suspectWords.isEmpty ? nil : suspectWords,
+                    userVocabulary: userVocab.isEmpty ? nil : userVocab
+                )
+            }
             let polishMs = Int(Date().timeIntervalSince(polishStart) * 1000)
             let polishChanged = finalText != formatted
             // Classify the polish outcome from the call-site's perspective.
@@ -1389,6 +1482,12 @@ class RecordingState {
     // The UI shows confirmed text at full opacity; volatile text at 55% opacity.
     var livePartialText: String = ""
     var livePartialIsVolatile: Bool = true
+
+    /// Set by RecordingCoordinator when the captured audio is short (16-36KB
+    /// range). Consumed by finishRecording's polish stage to skip the LLM
+    /// pass for one-word utterances like "ok"/"yeah"/"no" that polish tends
+    /// to mangle. Auto-clears after consumption.
+    var skipPolishForCurrent: Bool = false
 
     // Tick to nudge SwiftUI redraws when persisted recent-dictations list changes.
     var recentDictationsTick: Int = 0

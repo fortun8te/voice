@@ -163,6 +163,11 @@ class AudioCaptureService {
     private var inputClass: InputDeviceClass = .builtIn
     /// Diagnostic counter — buffers processed since last DSP log line.
     private var buffersSinceDSPLog: Int = 0
+    /// Buffers processed since the current recording started. Used by the
+    /// adaptive-gain stage to apply a fast attack for the first ~1s — without
+    /// this, the 2.5s EMA on `smoothedRMS` means the first ~2s of a whisper
+    /// gets unity gain and the user's opening words are too quiet.
+    private var buffersSinceRecordStart: Int = 0
 
     // Internal
     private var audioEngine: AVAudioEngine?
@@ -270,6 +275,7 @@ class AudioCaptureService {
         self.preEmphPrev = 0
         self.smoothedRMS = 0
         self.buffersSinceDSPLog = 0
+        self.buffersSinceRecordStart = 0
 
         // Opt into (or out of) AVAudioEngine voice processing per-device.
         // When enabled: gives us system-level AEC + AGC + NS — big quality
@@ -602,8 +608,17 @@ class AudioCaptureService {
         var peak: Float = 0
         vDSP_maxmgv(samples, 1, &peak, vDSP_Length(frameCount))
         // Smoothed long-term RMS used by the next buffer's adaptive-gain decision.
-        // EMA with α=0.1 → ~10-buffer (≈2.5s @ 4096frames/16k) time constant.
-        self.smoothedRMS = self.smoothedRMS * 0.9 + rms * 0.1
+        // Two-stage attack:
+        //   • First ~1s of audio (≈4 buffers @ 256ms): fast α=0.5 so the
+        //     gain stage locks onto a whisper inside ~200ms instead of
+        //     the steady-state ~2.5s. Otherwise a user who hits the hotkey
+        //     and immediately whispers gets the first 2 seconds at unity
+        //     gain (no boost).
+        //   • Steady state: α=0.1 → ~2.5s time constant. Avoids pumping
+        //     on natural speech-rate dynamics.
+        self.buffersSinceRecordStart &+= 1
+        let alpha: Float = self.buffersSinceRecordStart <= 4 ? 0.5 : 0.1
+        self.smoothedRMS = self.smoothedRMS * (1.0 - alpha) + rms * alpha
 
         // Periodic DSP diagnostics (every ~40 buffers ≈ 10s) so we can see
         // whether AGC kicked in, whether the limiter fired, and what range we're in.

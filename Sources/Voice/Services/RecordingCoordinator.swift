@@ -57,6 +57,11 @@ class RecordingCoordinator {
     private(set) var lastDictationAudioURL: URL?
     private var lastDictationCleanupTask: Task<Void, Never>?
 
+    /// Background task that re-transcribes orphan audio files left over from
+    /// a crash during transcription. Deferred while a recording is active so
+    /// it can't steal model time from the live path. See `recoverOrphanRecordings`.
+    private var orphanRecoveryTask: Task<Void, Never>?
+
     // Live-partials sliding window for lock-mode preview.
     private var slidingWindowManager: SlidingWindowAsrManager?
     private var livePartialsTask: Task<Void, Never>?
@@ -96,6 +101,14 @@ class RecordingCoordinator {
             // Force lazy init of the SoundEffects engine so the first
             // playStart() earcon doesn't pay ~20ms engine.start() cost.
             _ = SoundEffects.self
+
+            // Crashed-recording recovery: scan for orphan dictation audio
+            // (files on disk with no matching Meeting row) and re-transcribe
+            // them in the background. If the user starts a new recording
+            // before this completes, the recovery loop defers itself.
+            orphanRecoveryTask = Task { @MainActor [weak self] in
+                await self?.recoverOrphanRecordings()
+            }
         } catch {
             state.modelState = .error(error.localizedDescription)
             print("[VOICE] Initialization error: \(error.localizedDescription)")
@@ -247,11 +260,30 @@ class RecordingCoordinator {
         audioCapture.stopCapture()
         // Drain in-flight audio I/O callbacks before closing the file.
         // AVAudioEngine.removeTap (inside stopCapture) is not synchronous
-        // with the I/O thread — tap buffers at 48kHz/4096 frames are ~85ms,
-        // so 200ms reliably covers 2+ buffers and prevents clipping the
-        // last syllable. The extra ~100ms on stop is worth never losing
-        // the final word.
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        // with the I/O thread — tap buffers may still land for a short
+        // window. Rather than paying a flat 200ms tax on every dictation,
+        // poll `audioFileBytesWritten` until it goes quiet for two
+        // consecutive samples (or the safety cap fires). On a quiet
+        // system this typically completes in <30ms; the cap is 250ms.
+        do {
+            let pollIntervalNs: UInt64 = 15_000_000   // 15ms
+            let maxWaitNs: UInt64 = 250_000_000       // 250ms safety cap
+            let stableNeeded = 2                      // consecutive stable samples
+            let start = DispatchTime.now().uptimeNanoseconds
+            var lastBytes: Int64 = audioCapture.audioFileBytesWritten
+            var stableCount = 0
+            while DispatchTime.now().uptimeNanoseconds &- start < maxWaitNs {
+                try? await Task.sleep(nanoseconds: pollIntervalNs)
+                let now = audioCapture.audioFileBytesWritten
+                if now == lastBytes {
+                    stableCount += 1
+                    if stableCount >= stableNeeded { break }
+                } else {
+                    stableCount = 0
+                    lastBytes = now
+                }
+            }
+        }
         audioCapture.stopWritingToFile()
 
         // Reset transcription session state (stop() no longer transcribes).
@@ -261,18 +293,21 @@ class RecordingCoordinator {
         // The file is fully written and closed by stopWritingToFile() above.
         // FluidAudio handles format detection and resampling via the URL API.
         var segments: [TranscriptSegment] = []
-        // FluidAudio requires ≥ 300ms of audio (ASRError.invalidAudioData
-        // otherwise). With our 120ms lead-in + 160ms trailing zero pads in
-        // AudioCaptureService that's 280ms of guaranteed silence, so we
-        // need at least ~250ms of real speech on top — gate at 36k bytes
-        // (~560ms of Float32 mono @ 16kHz) to leave a real-speech margin
-        // and route accidental hotkey taps to a friendly "Didn't catch
-        // that" instead of swallowing a real .invalidAudioData throw.
+        // FluidAudio requires ≥ 300ms of audio. With our 120ms lead-in +
+        // 160ms trailing zero pads (280ms guaranteed silence) the hard
+        // floor for "attempt transcription at all" is ~16KB (~250ms of
+        // Float32 mono @ 16kHz on top of the pads). Short utterances like
+        // "ok"/"yeah"/"no" land between 16KB and 36KB — we used to discard
+        // those silently. Now we ALWAYS try transcription above 16KB; the
+        // 36KB threshold only flips `skipPolishForCurrent` so the polish
+        // stage uses rule-based formatting (polish on a single word can
+        // mangle short replies).
+        let fileSize = audioURL.flatMap { (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0 } ?? 0
         if let audioURL = audioURL,
            FileManager.default.fileExists(atPath: audioURL.path),
-           (try? FileManager.default.attributesOfItem(atPath: audioURL.path)[.size] as? Int) ?? 0 > 36_000 {
-            let fileSize = (try? FileManager.default.attributesOfItem(atPath: audioURL.path)[.size] as? Int) ?? 0
-            print("[VOICE-RC] WhisperKit/Parakeet transcribe call: \(audioURL.lastPathComponent) (\(fileSize) bytes)")
+           fileSize > 16_000 {
+            state.skipPolishForCurrent = fileSize < 36_000
+            print("[VOICE-RC] WhisperKit/Parakeet transcribe call: \(audioURL.lastPathComponent) (\(fileSize) bytes) skipPolish=\(state.skipPolishForCurrent)")
             do {
                 let fileSegments = try await transcription.transcribeFile(url: audioURL)
                 print("[VOICE-RC] transcribe returned \(fileSegments.count) segments")
@@ -428,12 +463,112 @@ class RecordingCoordinator {
         return "Meeting \(formatter.string(from: recordingStartTime ?? Date()))"
     }
 
+    // MARK: - Crash Recovery
+
+    /// Scan the audio directory for `dictation-<uuid>.caf` files whose UUID
+    /// has NO matching Meeting row in the database — these are recordings
+    /// that crashed during transcription. Re-transcribe them in the
+    /// background and save as Meeting rows so the user doesn't lose their
+    /// audio. Skips itself while a recording is active so it can't steal
+    /// model time from the live path; re-checks every 2s.
+    private func recoverOrphanRecordings() async {
+        // Defer until any in-flight recording finishes.
+        while state.isRecording || state.isTranscribing {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            if Task.isCancelled { return }
+        }
+
+        // Build the set of audio file paths referenced by existing meetings.
+        let referencedPaths: Set<String> = {
+            let meetings = (try? storage.fetchAllMeetings()) ?? []
+            return Set(meetings.compactMap { $0.audioFilePath })
+        }()
+
+        let audioDir = storage.audioDirectoryURL
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: audioDir,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: .skipsHiddenFiles
+        ) else {
+            return
+        }
+
+        // Orphan = file on disk, named `dictation-<uuid>.caf`, not referenced
+        // by any Meeting row. We deliberately filter on the `dictation-`
+        // prefix so we don't accidentally try to re-transcribe meeting
+        // recordings whose row was deleted intentionally.
+        let orphans: [URL] = entries.filter { url in
+            let name = url.lastPathComponent
+            guard name.hasPrefix("dictation-"),
+                  url.pathExtension.lowercased() == "caf",
+                  !referencedPaths.contains(url.path) else { return false }
+            // Skip tiny files (sub-300ms) — nothing useful to recover.
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+            return size > 16_000
+        }
+
+        guard !orphans.isEmpty else {
+            print("[VOICE-RC] orphan recovery: none found")
+            return
+        }
+        print("[VOICE-RC] orphan recovery: found \(orphans.count) crashed recording(s) — transcribing")
+
+        for url in orphans {
+            // Defer per-file when the user starts using the app.
+            while state.isRecording || state.isTranscribing {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if Task.isCancelled { return }
+            }
+            if Task.isCancelled { return }
+
+            // Parse UUID out of the filename so the recovered Meeting reuses
+            // the original session ID (keeps the audio file's name-to-id
+            // contract intact).
+            let stem = url.deletingPathExtension().lastPathComponent
+            let uuidString = String(stem.dropFirst("dictation-".count))
+            let recoveredId = UUID(uuidString: uuidString) ?? UUID()
+
+            do {
+                let segments = try await transcription.transcribeFile(url: url)
+                guard !segments.isEmpty else {
+                    print("[VOICE-RC] orphan recovery: \(url.lastPathComponent) → empty transcript, leaving on disk")
+                    continue
+                }
+                let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+                let modDate = (attrs?[.modificationDate] as? Date) ?? Date()
+                let firstWords = segments.first?.text.split(separator: " ").prefix(5).joined(separator: " ") ?? "Recovered"
+                let title = firstWords.isEmpty ? "Recovered dictation" : firstWords + "…"
+                let meeting = Meeting(
+                    id: recoveredId,
+                    title: title,
+                    date: modDate,
+                    duration: segments.last?.endTime ?? 0,
+                    segments: segments,
+                    audioFilePath: url.path
+                )
+                try storage.saveMeeting(meeting)
+                print("[VOICE-RC] orphan recovery: saved \(url.lastPathComponent) → '\(title)' (\(segments.count) segments)")
+            } catch {
+                print("[VOICE-RC] orphan recovery: \(url.lastPathComponent) FAILED: \(error.localizedDescription) — leaving on disk")
+            }
+        }
+        print("[VOICE-RC] orphan recovery: pass complete")
+    }
+
     // MARK: - Live Partials (lock mode only)
 
     /// Start the sliding-window ASR manager for live preview during lock mode.
     /// Reuses already-loaded AsrModels from TranscriptionService — zero extra download.
     /// Audio is delivered via AudioCaptureService's onPCMBuffer secondary callback.
     func startLivePartials() {
+        // Idempotent: if a previous sliding-window manager is still alive
+        // (e.g. rapid lock-toggle re-entry), tear it down first. Without
+        // this the prior manager remains subscribed to PCM buffers via a
+        // stale closure capture and leaks until process exit.
+        if slidingWindowManager != nil || livePartialsTask != nil {
+            stopLivePartials()
+        }
+
         // Clear any stale text from a prior session.
         state.livePartialText = ""
         state.livePartialIsVolatile = true

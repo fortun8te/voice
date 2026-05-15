@@ -46,6 +46,10 @@ struct RecentDictation: Codable, Identifiable {
     /// Pre-polish formatted text. Optional so we don't break decoding of older
     /// entries written before this field existed.
     var rawText: String? = nil
+    /// Bundle ID of the app text was pasted into (e.g. "com.tinyspeck.slackmacgap").
+    var pasteTargetBundleID: String? = nil
+    /// Milliseconds the Qwen3 polish stage took. Nil if polish was skipped/disabled.
+    var polishMs: Int? = nil
     var id: String { "\(timestamp.timeIntervalSince1970)-\(text.hashValue)" }
 
     /// True when raw differs meaningfully from polished — i.e. polish actually
@@ -87,7 +91,7 @@ enum RecentDictations {
     /// Add a dictation with both the pre-polish formatted text and the final
     /// polished text. `raw` is optional — pass nil if polish was skipped /
     /// disabled / unchanged, and only the polished version will be stored.
-    static func add(raw: String?, polished: String) {
+    static func add(raw: String?, polished: String, pasteTargetBundleID: String? = nil, polishMs: Int? = nil) {
         let trimmed = polished.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let trimmedRaw = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -102,7 +106,8 @@ enum RecentDictations {
         }()
         var items = all()
         items.insert(
-            RecentDictation(text: trimmed, timestamp: Date(), rawText: rawForStorage),
+            RecentDictation(text: trimmed, timestamp: Date(), rawText: rawForStorage,
+                            pasteTargetBundleID: pasteTargetBundleID, polishMs: polishMs),
             at: 0
         )
         if items.count > limit { items = Array(items.prefix(limit)) }
@@ -514,8 +519,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return cf as String
     }
 
-    /// Show (or reuse) the Big Menu window.
-    @objc private func openBigMenu() {
+    /// Show (or reuse) the Big Menu popup panel.
+    /// Opens as a compact floating panel near the top-right of the screen
+    /// (anchored below the menu bar). Auto-sizes to fit the SwiftUI content.
+    @objc func openBigMenu() {
         if let win = bigMenuWindow {
             NSApp.activate(ignoringOtherApps: true)
             win.makeKeyAndOrderFront(nil)
@@ -523,19 +530,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let view = BigMenuWindow(recordingState: recordingState)
         let host = NSHostingController(rootView: view)
-        let mask: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-        let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 900, height: 640),
-            styleMask: mask,
+        // Let SwiftUI size the window to fit content.
+        host.sizingOptions = .preferredContentSize
+
+        let win = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 480),
+            styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
-        win.title = "VOICE"
-        win.contentViewController = host
+        win.title = ""
         win.titlebarAppearsTransparent = true
+        win.titleVisibility = .hidden
+        win.isFloatingPanel = true
+        win.contentViewController = host
         win.isReleasedWhenClosed = false
-        win.center()
-        win.delegate = self  // listen for windowWillClose
+        win.hasShadow = true
+        win.backgroundColor = .clear
+        win.isOpaque = false
+        win.level = .floating
+        win.delegate = self
+
+        // Position below the menu bar on the primary screen, right-aligned.
+        if let screen = NSScreen.main {
+            let menuBarHeight = screen.frame.height - screen.visibleFrame.height - screen.visibleFrame.origin.y
+            let winH: CGFloat = 480
+            let winW: CGFloat = 380
+            let margin: CGFloat = 8
+            let x = screen.frame.maxX - winW - margin
+            let y = screen.frame.maxY - menuBarHeight - winH - margin
+            win.setFrameOrigin(NSPoint(x: x, y: y))
+        }
+
         bigMenuWindow = win
         NSApp.activate(ignoringOtherApps: true)
         win.makeKeyAndOrderFront(nil as Any?)
@@ -1192,7 +1218,9 @@ extension AppDelegate: NSWindowDelegate {
             // BigMenu's History view can show a before/after compare. When
             // polish was a no-op (disabled / unavailable / didn't change
             // anything) the storage helper drops `raw` to avoid duplication.
-            RecentDictations.add(raw: formatted, polished: finalText)
+            RecentDictations.add(raw: formatted, polished: finalText,
+                                  pasteTargetBundleID: targetAppBundleID,
+                                  polishMs: polishChanged ? polishMs : nil)
             Telemetry.log("dictation.completed", properties: [
                 "chars": formatted.count,
                 "duration_s": durationSeconds,

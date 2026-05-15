@@ -263,7 +263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if recordingState.isRecording || recordingState.isLocked {
             let alert = NSAlert()
             alert.messageText = "Recording in progress"
-            alert.informativeText = "Quit anyway? Your in-progress dictation will be discarded."
+            alert.informativeText = "Quitting will discard this dictation. Continue?"
             alert.addButton(withTitle: "Quit")
             alert.addButton(withTitle: "Cancel")
             alert.alertStyle = .warning
@@ -294,7 +294,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.delegate = self  // rebuild Recent submenu lazily on open
 
-        let openItem = NSMenuItem(title: "Open VOICE…", action: #selector(openBigMenu), keyEquivalent: "")
+        let openItem = NSMenuItem(title: "Recent Dictations…", action: #selector(openBigMenu), keyEquivalent: "")
         openItem.target = self
         menu.addItem(openItem)
 
@@ -423,7 +423,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let next = !LaunchAtLoginService.isEnabled
         let ok = LaunchAtLoginService.setEnabled(next)
         if !ok {
-            showToast("Couldn't change Launch at Login.")
+            showToast("Failed to update Launch at Login")
         }
     }
 
@@ -1333,7 +1333,7 @@ extension AppDelegate: HotkeyServiceDelegate {
             case .loading:
                 showToast("Loading model…")
             case .error(let e):
-                showToast("Model error — restart VOICE")
+                showToast("Model failed. Relaunch to retry.")
                 print("[VOICE] hotkeyDidActivate: model error: \(e)")
             default:
                 showToast("Model loading, please wait…")

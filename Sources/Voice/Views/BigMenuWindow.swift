@@ -32,7 +32,7 @@ struct BigMenuWindow: View {
     @Bindable var recordingState: RecordingState
 
     @State private var showSettings = false
-    // Pipeline section is visible after a dictation lands; auto-hides after 8s of
+    // Pipeline section is visible after a dictation lands; auto-hides after 20s of
     // no new activity. `pipelineVisible` stays true if user manually expanded.
     @State private var pipelineVisible = false
     @State private var pipelineAutoHideTask: Task<Void, Never>? = nil
@@ -114,7 +114,7 @@ struct BigMenuWindow: View {
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, Sp.sm)
-        .padding(.vertical, 4)
+        .padding(.vertical, Sp.xs)
         .background(
             Capsule(style: .continuous)
                 .fill(color.opacity(0.10))
@@ -129,10 +129,10 @@ struct BigMenuWindow: View {
         if recordingState.isRecording {
             let s = recordingState.elapsedSeconds
             let dur = s < 60 ? "\(s)s" : "\(s/60)m \(s%60)s"
-            return ("Recording  \(dur)", .red, "circle.fill")
+            return ("Recording · \(dur)", .red, "circle.fill")
         }
         if recordingState.isLocked {
-            return ("Lock mode", .orange, "lock.fill")
+            return ("Locked", .orange, "lock.fill")
         }
         if recordingState.isTranscribing {
             return ("Transcribing…", .blue, nil)
@@ -143,9 +143,9 @@ struct BigMenuWindow: View {
             let ago = secs < 60 ? "just now"
                     : secs < 3600 ? "\(secs/60)m ago"
                     : "\(secs/3600)h ago"
-            return ("Done  \(ago)", .green, "checkmark")
+            return ("Done · \(ago)", .green, "checkmark")
         }
-        return ("Idle", Color.secondary, nil)
+        return ("Ready", Color.secondary, nil)
     }
 
     // MARK: - Pipeline section
@@ -155,9 +155,11 @@ struct BigMenuWindow: View {
         let raw = recent.rawText
         let polishChanged = recent.hasPolishDiff
         let polishStatus = Qwen3Polisher.availabilityStatus
-        let polishNote: String = !polishEnabled ? "disabled"
-            : !polishStatus.isReady ? "model not ready"
-            : "no changes"
+
+        // Outcome label for the polish stage when no changes were made
+        let polishOutcomeNote: String = !polishEnabled ? "Off"
+            : !polishStatus.isReady ? "Loading…"
+            : "No improvements"
 
         // "Pasted to" app name from bundle ID
         let pasteAppName: String? = recent.pasteTargetBundleID.flatMap { bid in
@@ -168,14 +170,13 @@ struct BigMenuWindow: View {
         VStack(alignment: .leading, spacing: Sp.sm) {
             // Header row
             HStack {
-                Text("LAST DICTATION")
+                Text("Last dictation")
                     .font(.sans(9, weight: .semibold))
-                    .tracking(0.8)
                     .foregroundStyle(.tertiary)
                 Spacer()
                 // Pasted-to badge
                 if let appName = pasteAppName {
-                    HStack(spacing: 3) {
+                    HStack(spacing: Sp.xs) {
                         Image(systemName: "arrow.up.forward.app")
                             .font(.system(size: 8, weight: .medium))
                         Text(appName)
@@ -187,35 +188,37 @@ struct BigMenuWindow: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(.quaternary)
-                        .padding(.leading, 4)
+                        .padding(.leading, Sp.xs)
                 }
                 .buttonStyle(.plain)
             }
 
-            // Stage 1: Parakeet (raw or final if no raw)
+            // Stage 1: Transcribed (raw or final if no raw)
             pipelineRow(
                 icon: "mic.fill",
-                label: "Parakeet",
+                label: "Transcribed",
                 content: raw ?? recent.text,
-                accent: Color.secondary
+                accent: Color.secondary,
+                isMuted: false
             )
 
-            // Stage 2: Polish — with timing if available
+            // Stage 2: Polish — unified template
             if let raw, polishChanged {
-                let timingLabel = recent.polishMs.map { "\($0)ms" }
                 pipelineRow(
                     icon: "wand.and.sparkles",
-                    label: timingLabel.map { "Polish · \($0)" } ?? "Polish",
+                    label: "Polished",
                     content: recent.text,
                     accent: Color.accentColor,
-                    compareRaw: raw
+                    isMuted: false
                 )
             } else {
-                let timingLabel = recent.polishMs.map { " · \($0)ms" } ?? ""
-                pipelineRowNote(
+                pipelineRow(
                     icon: "wand.and.sparkles",
-                    label: "Polish",
-                    note: (raw == nil ? "disabled" : polishNote) + timingLabel
+                    label: "Polished",
+                    content: nil,
+                    accent: Color.secondary,
+                    isMuted: true,
+                    note: (raw == nil ? "Off" : polishOutcomeNote)
                 )
             }
         }
@@ -223,78 +226,60 @@ struct BigMenuWindow: View {
         .padding(.vertical, Sp.md)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.accentColor.opacity(0.03))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            withAnimation(.easeOut(duration: 0.12)) { pipelineExpanded.toggle() }
+            extendPipelineAutoHide()
+        }
     }
 
     @ViewBuilder
     private func pipelineRow(
         icon: String,
         label: String,
-        content: String,
+        content: String?,
         accent: Color,
-        compareRaw: String? = nil
+        isMuted: Bool,
+        note: String? = nil
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: Sp.xs) {
+            // Label row — unified for both muted and active states
             HStack(spacing: 5) {
                 Image(systemName: icon)
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(accent.opacity(0.8))
+                    .foregroundStyle(isMuted ? AnyShapeStyle(.quaternary) : AnyShapeStyle(accent.opacity(0.8)))
                 Text(label)
                     .font(.sans(10, weight: .semibold))
                     .tracking(0.5)
-                    .foregroundStyle(accent.opacity(0.8))
-
-                if let raw = compareRaw {
-                    // Show a compact word-count diff
-                    let rawWords = raw.split(separator: " ").count
-                    let newWords = content.split(separator: " ").count
-                    let delta = newWords - rawWords
-                    if delta != 0 {
-                        Text(delta > 0 ? "+\(delta)w" : "\(delta)w")
-                            .font(.sans(9, weight: .medium))
-                            .foregroundStyle(delta > 0 ? Color.green.opacity(0.7) : Color.orange.opacity(0.7))
-                    }
+                    .foregroundStyle(isMuted ? AnyShapeStyle(.quaternary) : AnyShapeStyle(accent.opacity(0.8)))
+                if let note {
+                    Text("—")
+                        .font(.sans(10))
+                        .foregroundStyle(.quaternary)
+                    Text(note)
+                        .font(.sans(10))
+                        .foregroundStyle(.quaternary)
                 }
             }
 
-            Text(content)
-                .font(.sans(12))
-                .tracking(LetterSpacing.body)
-                .foregroundStyle(.primary)
-                .lineLimit(pipelineExpanded ? nil : 2)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .onTapGesture { withAnimation(.easeOut(duration: 0.12)) { pipelineExpanded.toggle() } }
+            // Content text — only when content is present
+            if let content {
+                Text(content)
+                    .font(.sans(12))
+                    .tracking(LetterSpacing.body)
+                    .foregroundStyle(.primary)
+                    .lineLimit(pipelineExpanded ? nil : 2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(.horizontal, Sp.md)
         .padding(.vertical, Sp.sm)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.5))
-        )
-    }
-
-    @ViewBuilder
-    private func pipelineRowNote(icon: String, label: String, note: String) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon)
-                .font(.system(size: 9))
-                .foregroundStyle(.quaternary)
-            Text(label)
-                .font(.sans(10, weight: .semibold))
-                .tracking(0.5)
-                .foregroundStyle(.quaternary)
-            Text("—")
-                .font(.sans(10))
-                .foregroundStyle(.quaternary)
-            Text(note)
-                .font(.sans(10))
-                .foregroundStyle(.quaternary)
-        }
-        .padding(.horizontal, Sp.md)
-        .padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.25))
+                .fill(isMuted
+                    ? Color(nsColor: .controlBackgroundColor).opacity(0.25)
+                    : Color(nsColor: .controlBackgroundColor).opacity(0.5))
         )
     }
 
@@ -318,11 +303,11 @@ struct BigMenuWindow: View {
             Image(systemName: "waveform")
                 .font(.system(size: 13))
                 .foregroundStyle(.quaternary)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: Sp.xs) {
                 Text("No dictations yet")
                     .font(.sans(13, weight: .medium))
                     .foregroundStyle(.secondary)
-                Text("Hold the hotkey anywhere to start")
+                Text("Hold the hotkey to record")
                     .font(.sans(11))
                     .foregroundStyle(.tertiary)
             }
@@ -336,7 +321,7 @@ struct BigMenuWindow: View {
 
     private var bottomBar: some View {
         HStack(spacing: Sp.md) {
-            // Polish toggle — prominent
+            // Polish toggle — lightweight inline
             polishToggle
 
             Spacer()
@@ -371,13 +356,13 @@ struct BigMenuWindow: View {
     private var polishToggle: some View {
         let status = Qwen3Polisher.availabilityStatus
         let isOn = polishEnabled && status.isReady
-        let label = isOn ? "Polish  ON" : "Polish  OFF"
 
         Button(action: {
             guard status.isReady else { return }
             polishEnabled.toggle()
         }) {
-            HStack(spacing: 5) {
+            HStack(spacing: Sp.sm) {
+                // Animated switch pill — same visual weight as the Launch at Login button
                 ZStack {
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
                         .fill(isOn ? Color.accentColor : Color.secondary.opacity(0.2))
@@ -388,24 +373,11 @@ struct BigMenuWindow: View {
                         .offset(x: isOn ? 6 : -6)
                         .animation(.easeInOut(duration: 0.15), value: isOn)
                 }
-                Text(label)
+                Text("Polish")
                     .font(.sans(12, weight: .semibold))
                     .tracking(0.2)
                     .foregroundStyle(isOn ? Color.primary : Color.secondary)
             }
-            .padding(.horizontal, Sp.sm)
-            .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(isOn ? Color.accentColor.opacity(0.10) : Color(nsColor: .controlBackgroundColor).opacity(0.5))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .strokeBorder(
-                                isOn ? Color.accentColor.opacity(0.3) : Color(nsColor: .separatorColor).opacity(0.4),
-                                lineWidth: 0.5
-                            )
-                    )
-            )
         }
         .buttonStyle(.plain)
         .disabled(!status.isReady)
@@ -424,7 +396,18 @@ struct BigMenuWindow: View {
     private func schedulePipelineAutoHide() {
         pipelineAutoHideTask?.cancel()
         pipelineAutoHideTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.2)) { pipelineVisible = false }
+        }
+    }
+
+    /// Extend the auto-hide timer by 15 more seconds when the user interacts
+    /// with the pipeline section (tap to expand/collapse).
+    private func extendPipelineAutoHide() {
+        pipelineAutoHideTask?.cancel()
+        pipelineAutoHideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.2)) { pipelineVisible = false }
         }
@@ -457,7 +440,8 @@ private struct RecentRow: View {
     var body: some View {
         Button(action: copyText) {
             HStack(spacing: Sp.sm) {
-                VStack(alignment: .leading, spacing: 2) {
+                // Preview + timestamp on same line, timestamp right-aligned
+                HStack(alignment: .firstTextBaseline, spacing: Sp.xs) {
                     Text(preview)
                         .font(.sans(12))
                         .tracking(LetterSpacing.body)
@@ -468,17 +452,18 @@ private struct RecentRow: View {
                         .font(.sans(10))
                         .tracking(LetterSpacing.body)
                         .foregroundStyle(.quaternary)
+                        .fixedSize()
                 }
 
                 // Copy indicator — visible on hover or when just copied
                 Group {
                     if copied {
                         Image(systemName: "checkmark")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.green)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(Color.accentColor)
                     } else {
                         Image(systemName: "doc.on.doc")
-                            .font(.system(size: 11, weight: .light))
+                            .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.tertiary)
                     }
                 }
@@ -498,7 +483,6 @@ private struct RecentRow: View {
                 Rectangle()
                     .fill(Color(nsColor: .separatorColor).opacity(0.3))
                     .frame(height: 0.5)
-                    .padding(.leading, Sp.xl)
             }
         }
         .onHover { hovering = $0 }
@@ -509,7 +493,7 @@ private struct RecentRow: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(item.text, forType: .string)
         copied = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copied = false }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { copied = false }
     }
 }
 
@@ -575,20 +559,20 @@ private struct SettingsSheet: View {
                         }
                     }
 
-                    Divider().padding(.leading, Sp.xl)
+                    Divider()
 
                     section("Output") {
                         VStack(alignment: .leading, spacing: Sp.sm) {
-                            toggle("Auto-paste at cursor", isOn: $autoPaste)
+                            toggle("Paste automatically", isOn: $autoPaste)
                             toggle("Copy to clipboard", isOn: $autoCopy)
                             toggle("Sound effects", isOn: $soundEffects)
-                            VStack(alignment: .leading, spacing: 3) {
-                                toggle("LLM polish (on-device)", isOn: $polishEnabled)
+                            VStack(alignment: .leading, spacing: Sp.xs) {
+                                toggle("Smart corrections", isOn: $polishEnabled)
                                 HStack(spacing: 5) {
                                     Circle()
                                         .fill(polishStatusColor)
                                         .frame(width: 6, height: 6)
-                                    Text("Model: \(Qwen3Polisher.availabilityStatus.displayLabel)")
+                                    Text("Status: \(Qwen3Polisher.availabilityStatus.displayLabel)")
                                         .font(.sans(11))
                                         .foregroundStyle(.secondary)
                                 }
@@ -597,7 +581,7 @@ private struct SettingsSheet: View {
                         }
                     }
 
-                    Divider().padding(.leading, Sp.xl)
+                    Divider()
 
                     section("Permissions") {
                         VStack(alignment: .leading, spacing: Sp.sm) {
@@ -683,7 +667,7 @@ private struct SettingsSheet: View {
                 .foregroundStyle(.primary)
             Spacer()
             if !granted {
-                Button("Enable", action: action)
+                Button("Grant", action: action)
                     .buttonStyle(.borderless)
                     .font(.sans(11, weight: .medium))
                     .foregroundStyle(Color.accentColor)

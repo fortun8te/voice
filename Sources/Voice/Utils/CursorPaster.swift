@@ -141,7 +141,7 @@ class CursorPaster {
             NotificationCenter.default.post(
                 name: .voiceError,
                 object: nil,
-                userInfo: ["message": "Won't paste into password field — text copied to clipboard."]
+                userInfo: ["message": "Skipped password field. Text is on your clipboard."]
             )
             return
         }
@@ -655,7 +655,7 @@ class CursorPaster {
                 NotificationCenter.default.post(
                     name: .voiceError,
                     object: nil,
-                    userInfo: ["message": "Couldn't paste — your text is on the clipboard (Cmd+V to paste manually)"]
+                    userInfo: ["message": "Paste failed. Text copied — press Cmd+V to paste."]
                 )
                 return
             }
@@ -685,7 +685,7 @@ class CursorPaster {
                         NotificationCenter.default.post(
                             name: .voiceError,
                             object: nil,
-                            userInfo: ["message": "Couldn't paste — your text is on the clipboard (Cmd+V to paste manually)"]
+                            userInfo: ["message": "Paste failed. Text copied — press Cmd+V to paste."]
                         )
                     }
                 }

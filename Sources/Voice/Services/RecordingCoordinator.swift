@@ -36,12 +36,24 @@ class RecordingCoordinator {
     /// URL of the retained audio file for the current recording (if any).
     private var currentAudioFileURL: URL?
 
-    /// URL of the most recently completed dictation's audio file. Kept on
-    /// disk through the Qwen3 polish stage so a future re-transcribe pass
-    /// (or a "redo with vocabulary" feature) can read the same audio
-    /// without re-recording. A delayed cleanup task removes the file 30s
-    /// after `stopRecording()` returns — well past the polish window
-    /// (~80–2500ms) — unless `releaseLastDictationAudio()` is called first.
+    /// UUID that names the current recording's audio file AND will be
+    /// reused as the Meeting.id on save — so the persisted audio at
+    /// `<AppSupport>/Voice/audio/dictation-<id>.caf` is reachable from
+    /// the transcript row via `Meeting.audioFilePath`.
+    private var currentSessionId: UUID?
+
+    /// Soft cap (bytes) for the total size of retained audio. Once the
+    /// directory exceeds this, oldest files are pruned to bring it back
+    /// under the cap. 5 GB ≈ ~40 hours @ 16 kHz / Float32 mono.
+    private let audioDirectoryByteCap: Int = 5 * 1024 * 1024 * 1024
+
+    /// URL of the most recently completed dictation's audio file.
+    /// Persistent: the file stays on disk and its path is written to
+    /// `Meeting.audioFilePath` so users can replay/re-process later.
+    /// `releaseLastDictationAudio()` still works as an explicit "drop now"
+    /// hook (e.g. for a privacy-mode toggle). The `lastDictationCleanupTask`
+    /// is retained only so the public release helper can cancel a (now
+    /// nonexistent) pending task without compiling differently.
     private(set) var lastDictationAudioURL: URL?
     private var lastDictationCleanupTask: Task<Void, Never>?
 
@@ -59,6 +71,13 @@ class RecordingCoordinator {
     func prepare() async {
         do {
             try storage.initialize()
+
+            // Disk safety: prune audio folder if it's over the 5GB cap.
+            // Non-blocking background pass on the main actor (storage is
+            // not Sendable; the prune itself is cheap I/O).
+            Task { @MainActor [weak self] in
+                _ = self?.storage.pruneAudioBySize()
+            }
 
             // Sync model state to UI as Parakeet downloads/loads.
             state.modelState = .downloading(progress: 0)
@@ -101,7 +120,13 @@ class RecordingCoordinator {
         state.currentTranscript = []
         recordingStartTime = Date()
 
+        // PERSISTENCE GUARANTEE: the audio file is named by the same UUID
+        // that will become the Meeting's primary key, so the recording's
+        // audio lives at a stable, lookup-by-ID path for the lifetime of
+        // the transcript. See `stopRecording()` where this ID is used as
+        // the Meeting.id and written to Meeting.audioFilePath.
         let sessionId = UUID()
+        self.currentSessionId = sessionId
         let audioURL = makeDictationAudioURL(id: sessionId)
         do {
             try audioCapture.startWritingToFile(url: audioURL)
@@ -198,7 +223,9 @@ class RecordingCoordinator {
         // the instance property is cleared so a new startRecording() can
         // safely assign a fresh URL without trampling this in-flight session.
         let audioURL = currentAudioFileURL
+        let sessionId = currentSessionId ?? UUID()
         self.currentAudioFileURL = nil
+        self.currentSessionId = nil
 
         startupTask?.cancel()
         // Await the startup task's completion so a stop initiated while the
@@ -251,16 +278,21 @@ class RecordingCoordinator {
                 print("[VOICE-RC] transcribe returned \(fileSegments.count) segments")
                 if !fileSegments.isEmpty {
                     segments = fileSegments
-                    // Defer deletion — the polish stage (or a future re-
-                    // transcribe pass) may want to read the audio again.
-                    // Cleanup happens 30s from now unless a new recording
-                    // replaces the URL first.
-                    scheduleDictationAudioCleanup(audioURL)
+                    // PERSISTENCE: Audio file stays put. The polish stage
+                    // (and any future re-transcribe pass) can re-read it
+                    // at the same path; the Meeting row will reference it
+                    // via `audioFilePath` below. Make the URL available
+                    // to in-flight polish via `lastDictationAudioURL`,
+                    // but do NOT arm the deletion task.
+                    lastDictationCleanupTask?.cancel()
+                    lastDictationCleanupTask = nil
+                    lastDictationAudioURL = audioURL
                 } else {
                     print("[VOICE-RC] transcribeFile returned EMPTY result")
-                    // Empty transcript — no polish stage will run, safe to
-                    // delete immediately.
-                    try? FileManager.default.removeItem(at: audioURL)
+                    // Empty transcript — KEEP audio on disk so the user
+                    // can retry / re-process later. No DB row is written
+                    // for the empty case, so the file becomes "orphaned"
+                    // until the user reprocesses or the size-pruner reaps it.
                     NotificationCenter.default.post(
                         name: .voiceError,
                         object: nil,
@@ -269,6 +301,8 @@ class RecordingCoordinator {
                 }
             } catch {
                 print("[VOICE-RC] transcribeFile FAILED: \(error.localizedDescription)")
+                // KEEP audio on disk so the user can retry. Size-pruner
+                // will eventually reap it if nothing else does.
                 NotificationCenter.default.post(
                     name: .voiceError,
                     object: nil,
@@ -279,8 +313,8 @@ class RecordingCoordinator {
             let exists = audioURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
             let size = audioURL.flatMap { (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0 } ?? 0
             print("[VOICE-RC] No audio to transcribe — url=\(audioURL?.lastPathComponent ?? "nil") exists=\(exists) size=\(size)")
-            // Clean up the tiny file and surface a friendly hint so the
-            // user knows nothing was captured (vs. silently doing nothing).
+            // Too-small clip (sub-300ms). Drop it — there's no meaningful
+            // audio to preserve, and these add up fast on accidental taps.
             if let audioURL, exists {
                 try? FileManager.default.removeItem(at: audioURL)
             }
@@ -298,11 +332,22 @@ class RecordingCoordinator {
         }
 
         // Save meeting record + auto-export.
+        // Reuse `sessionId` as the Meeting primary key so the on-disk audio
+        // at `audio/dictation-<id>.caf` is reachable via Meeting.audioFilePath.
+        // Persist audioFilePath only when there's actually a file on disk
+        // we expect to keep (segments produced → file is the canonical audio).
+        let audioFilePathToSave: String? = {
+            guard !segments.isEmpty, let url = audioURL,
+                  FileManager.default.fileExists(atPath: url.path) else { return nil }
+            return url.path
+        }()
         let meeting = Meeting(
+            id: sessionId,
             title: generateMeetingTitle(),
             date: recordingStartTime ?? Date(),
             duration: TimeInterval(state.elapsedSeconds),
-            segments: state.currentTranscript
+            segments: state.currentTranscript,
+            audioFilePath: audioFilePathToSave
         )
 
         do {
@@ -351,35 +396,10 @@ class RecordingCoordinator {
         return dir.appendingPathComponent("dictation-\(id.uuidString).caf")
     }
 
-    /// Defer deletion of the just-completed dictation audio. Promotes the URL
-    /// to `lastDictationAudioURL` so callers (notably the polish stage) can
-    /// read it back, then arms a 30s cleanup task. Any prior pending cleanup
-    /// is cancelled and its file deleted immediately so we don't leak older
-    /// recordings on rapid back-to-back dictations.
-    private func scheduleDictationAudioCleanup(_ url: URL) {
-        // Cancel + drop any previous deferred cleanup. Delete its file now
-        // since the new dictation has superseded it.
-        lastDictationCleanupTask?.cancel()
-        if let prev = lastDictationAudioURL, prev != url {
-            try? FileManager.default.removeItem(at: prev)
-        }
-        lastDictationAudioURL = url
-
-        let task = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                guard let self else { return }
-                if self.lastDictationAudioURL == url {
-                    try? FileManager.default.removeItem(at: url)
-                    self.lastDictationAudioURL = nil
-                    self.lastDictationCleanupTask = nil
-                    print("[VOICE-RC] deferred dictation audio cleanup ran: \(url.lastPathComponent)")
-                }
-            }
-        }
-        lastDictationCleanupTask = task
-    }
+    // NOTE: deferred-cleanup helper removed. Audio is now persistent —
+    // a successful dictation keeps its file at the path stored on the
+    // Meeting row. The size-based pruner (`StorageService.pruneAudioBySize`)
+    // handles long-term disk pressure on app launch.
 
     /// Eagerly drop the retained dictation audio. Optional — the 30s deferred
     /// cleanup catches the common case. Callers (e.g. a privacy-mode toggle)

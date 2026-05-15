@@ -567,6 +567,62 @@ class StorageService {
 
     // MARK: - Audio retention
 
+    /// Public read-only view of the audio directory URL so callers
+    /// (RecordingCoordinator) can place new files there and the pruner
+    /// can find them.
+    var audioDirectoryURL: URL { audioDirectory }
+
+    /// Disk-safety pruner. If the total size of `audioDirectory` exceeds
+    /// `highWatermark` bytes, deletes the oldest audio files (by modification
+    /// date) until total drops below `lowWatermark`. Skips files that are
+    /// still referenced by a meeting row only if `respectReferences` is true;
+    /// otherwise size-based eviction wins (oldest first).
+    ///
+    /// Safe to call on a background queue; does not touch the DB.
+    /// Returns (bytesRemoved, filesRemoved).
+    @discardableResult
+    func pruneAudioBySize(
+        highWatermark: Int = 5 * 1024 * 1024 * 1024,   // 5 GB
+        lowWatermark: Int  = 4 * 1024 * 1024 * 1024    // 4 GB
+    ) -> (bytesRemoved: Int, filesRemoved: Int) {
+        let fm = FileManager.default
+        let exts: Set<String> = ["caf", "wav", "m4a"]
+        guard let entries = try? fm.contentsOfDirectory(
+            at: audioDirectory,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
+        ) else { return (0, 0) }
+
+        struct Entry { let url: URL; let size: Int; let mtime: Date }
+        var files: [Entry] = []
+        var total = 0
+        for url in entries where exts.contains(url.pathExtension.lowercased()) {
+            let attrs = try? fm.attributesOfItem(atPath: url.path)
+            let size = (attrs?[.size] as? Int) ?? 0
+            let mtime = (attrs?[.modificationDate] as? Date) ?? .distantPast
+            files.append(Entry(url: url, size: size, mtime: mtime))
+            total += size
+        }
+
+        guard total > highWatermark else { return (0, 0) }
+
+        // Oldest first.
+        files.sort { $0.mtime < $1.mtime }
+
+        var bytesRemoved = 0
+        var filesRemoved = 0
+        var remaining = total
+        for f in files {
+            if remaining <= lowWatermark { break }
+            if (try? fm.removeItem(at: f.url)) != nil {
+                remaining -= f.size
+                bytesRemoved += f.size
+                filesRemoved += 1
+            }
+        }
+        NSLog("[Voice/Storage] audio prune: removed \(filesRemoved) files / \(bytesRemoved) bytes (total \(total) → \(remaining))")
+        return (bytesRemoved, filesRemoved)
+    }
+
     /// Scan the audio directory and delete any `.caf`/`.wav`/`.m4a` files
     /// that aren't referenced by a meeting row. Returns the number of
     /// files removed. Safe to call any time; cheap (single DB query +

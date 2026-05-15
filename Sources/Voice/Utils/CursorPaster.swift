@@ -3,6 +3,27 @@
 // Pastes transcribed text at the current cursor position,
 // Superwhisper-style. Works in any app that supports Cmd+V.
 //
+// UNDO GUARANTEE
+//   After VOICE pastes, the user can hit Cmd+Z (or the target app's
+//   undo equivalent) to remove the pasted text in one step.
+//
+//   How this works:
+//     * The paste is delivered as a real Cmd+V key event via
+//       CGEvent.post(tap: .cghidEventTap), which target apps register
+//       in their undo stack exactly the same as a user-typed Cmd+V.
+//     * Only ONE paste method fires per call (CGEvent OR AppleScript,
+//       never both) — so the target app sees a single undoable paste.
+//     * Clipboard restoration (when enabled) is deferred 0.6s AFTER
+//       the paste, so it cannot race with the target app reading the
+//       clipboard. The restore only mutates clipboard contents — it
+//       does NOT affect the target app's internal undo stack, which
+//       was recorded the moment Cmd+V was delivered.
+//     * The AppleScript fallback uses `keystroke "v" using command down`
+//       which is also a real synthesized keystroke → also undoable.
+//
+//   If you change paste mechanics, preserve these invariants or the
+//   single-press undo will silently break.
+//
 // Flow:
 //   1. Read cursor context (up to 3 chars before insertion point)
 //   2. Adjust formatted text for context (space, case, trailing period)

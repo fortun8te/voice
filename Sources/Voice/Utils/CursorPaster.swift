@@ -376,7 +376,7 @@ class CursorPaster {
             var t = stripPeriod ? stripTrailingPeriod(text) : text
             if codeEditor { t = lowercaseFirstPreservingI(t) }  // code: "foo.bar" pattern
             // Add space unless text already begins with whitespace (rapid-fire guard).
-            let needsSpace = !t.first?.isWhitespace ?? true
+            let needsSpace = !(t.first?.isWhitespace ?? false)
             return (t, needsSpace)
 
         case .afterTerminalWS:
@@ -396,7 +396,7 @@ class CursorPaster {
         case .midSentence:
             var t = lowercaseFirstPreservingI(stripTrailingPeriod(text))
             // Add space unless text already begins with whitespace (rapid-fire guard).
-            let needsSpace = !t.first?.isWhitespace ?? true
+            let needsSpace = !(t.first?.isWhitespace ?? false)
             return (t, needsSpace)
         }
     }

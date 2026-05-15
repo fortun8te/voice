@@ -206,8 +206,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Update check fires once at launch, debounced internally to 24h.
         UpdateChecker.checkInBackground { [weak self] info in
             guard let self else { return }
-            // Wiring TODO: replace with a real toast once we have a shipped
-            // download URL. For now, surface via the standard error/info toast.
             self.showToast("VOICE \(info.version) is available.")
         }
 

@@ -660,14 +660,28 @@ class CursorPaster {
                 return
             }
             // Compare focused element identity when AX is available.
+            // IMPORTANT: only treat a focus change as a failure when the
+            // frontmost APP also changed. Within the same app, focus shifts
+            // (autocomplete popup, dropdown, suggestion list) are a normal
+            // side effect of accepting text and should NOT surface an error.
+            // We already confirmed `nowBundle == expected.bundleId` above, so
+            // this block only runs when we know the app is still the same one.
             if AXIsProcessTrusted(), let before = expected.focusedElement {
                 let sys = AXUIElementCreateSystemWide()
                 var ref: CFTypeRef?
                 if AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
                    let r = ref {
                     let after = r as! AXUIElement
-                    if !CFEqual(before, after) {
-                        print("[VOICE] ⚠️ paste verify FAIL — focused element changed")
+                    // Only toast when the PID of the focused element also
+                    // changed, which means a different app grabbed the AX
+                    // focus token. Same-app element transitions (autocomplete,
+                    // Spotlight, dropdowns) keep the same PID — not an error.
+                    var beforePID: pid_t = 0
+                    var afterPID: pid_t = 0
+                    AXUIElementGetPid(before, &beforePID)
+                    AXUIElementGetPid(after, &afterPID)
+                    if !CFEqual(before, after) && beforePID != afterPID {
+                        print("[VOICE] ⚠️ paste verify FAIL — focused element changed to different process")
                         NotificationCenter.default.post(
                             name: .voiceError,
                             object: nil,

@@ -293,19 +293,20 @@ class RecordingCoordinator {
         // The file is fully written and closed by stopWritingToFile() above.
         // FluidAudio handles format detection and resampling via the URL API.
         var segments: [TranscriptSegment] = []
-        // FluidAudio requires ≥ 300ms of audio. With our 120ms lead-in +
-        // 160ms trailing zero pads (280ms guaranteed silence) the hard
-        // floor for "attempt transcription at all" is ~16KB (~250ms of
-        // Float32 mono @ 16kHz on top of the pads). Short utterances like
-        // "ok"/"yeah"/"no" land between 16KB and 36KB — we used to discard
-        // those silently. Now we ALWAYS try transcription above 16KB; the
-        // 36KB threshold only flips `skipPolishForCurrent` so the polish
-        // stage uses rule-based formatting (polish on a single word can
-        // mangle short replies).
+        // FluidAudio requires ≥ 300ms of audio. Our silence padding alone is
+        // ~17,920 bytes (1920-frame lead-in + 2560-frame trailing @ 4 bytes each).
+        // A floor of 16KB would pass a file of pure padding with zero real speech
+        // — Parakeet would see nothing but silence. Use 20,000 bytes so there must
+        // be ≥ ~2 KB of real audio (≈ 32ms at 16kHz/Float32) above the padding.
+        // Short replies ("ok"/"yeah"/"no") are ~200–300ms → ~12–19 KB of real
+        // speech, comfortably above this floor.
+        // The 36KB threshold only flips `skipPolishForCurrent` so the polish
+        // stage uses rule-based formatting for very short replies (a single
+        // word can get mangled by the LLM polisher).
         let fileSize = audioURL.flatMap { (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0 } ?? 0
         if let audioURL = audioURL,
            FileManager.default.fileExists(atPath: audioURL.path),
-           fileSize > 16_000 {
+           fileSize > 20_000 {
             state.skipPolishForCurrent = fileSize < 36_000
             print("[VOICE-RC] WhisperKit/Parakeet transcribe call: \(audioURL.lastPathComponent) (\(fileSize) bytes) skipPolish=\(state.skipPolishForCurrent)")
             do {
@@ -449,10 +450,15 @@ class RecordingCoordinator {
         }
     }
 
-    /// TWEAK: Auto-generate meeting title from first few words or calendar event
+    /// Auto-generate a meeting title from the first 5 content words of the
+    /// transcript. Filler words at the start ("um", "uh", "so", "like", "I",
+    /// "you know", "basically", "actually", "okay", "right", "well") are
+    /// stripped before picking the first 5 words so recordings don't end up
+    /// titled "Um so I was thinking".
     private func generateMeetingTitle() -> String {
         if let firstSegment = state.currentTranscript.first {
-            let words = firstSegment.text.split(separator: " ").prefix(5)
+            let contentWords = stripFillerPrefix(firstSegment.text)
+            let words = contentWords.split(separator: " ").prefix(5)
             if !words.isEmpty {
                 return words.joined(separator: " ") + "..."
             }
@@ -461,6 +467,37 @@ class RecordingCoordinator {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d, h:mm a"
         return "Meeting \(formatter.string(from: recordingStartTime ?? Date()))"
+    }
+
+    /// Strip leading filler words from a transcript string, returning the
+    /// remaining text with those words removed. Case-insensitive. Multi-word
+    /// fillers ("you know", "i mean") are matched before single-word ones.
+    private func stripFillerPrefix(_ text: String) -> String {
+        // Ordered longest-first so multi-word phrases match before their subwords.
+        let fillers: [String] = [
+            "you know", "i mean", "you know what",
+            "um", "uh", "uh so", "um so",
+            "so", "like", "basically", "actually",
+            "okay", "ok", "right", "well", "anyway",
+            "i", "and",
+        ]
+
+        var remaining = text.trimmingCharacters(in: .whitespaces)
+        var changed = true
+        while changed {
+            changed = false
+            for filler in fillers {
+                let lower = remaining.lowercased()
+                let prefix = filler + " "
+                if lower.hasPrefix(prefix) {
+                    remaining = String(remaining.dropFirst(prefix.count))
+                        .trimmingCharacters(in: .whitespaces)
+                    changed = true
+                    break
+                }
+            }
+        }
+        return remaining.isEmpty ? text : remaining
     }
 
     // MARK: - Crash Recovery
@@ -502,9 +539,9 @@ class RecordingCoordinator {
             guard name.hasPrefix("dictation-"),
                   url.pathExtension.lowercased() == "caf",
                   !referencedPaths.contains(url.path) else { return false }
-            // Skip tiny files (sub-300ms) — nothing useful to recover.
+            // Skip tiny files — must exceed padding baseline (see stopRecording comment).
             let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-            return size > 16_000
+            return size > 20_000
         }
 
         guard !orphans.isEmpty else {
@@ -536,7 +573,8 @@ class RecordingCoordinator {
                 }
                 let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
                 let modDate = (attrs?[.modificationDate] as? Date) ?? Date()
-                let firstWords = segments.first?.text.split(separator: " ").prefix(5).joined(separator: " ") ?? "Recovered"
+                let rawFirst = segments.first?.text ?? ""
+                let firstWords = stripFillerPrefix(rawFirst).split(separator: " ").prefix(5).joined(separator: " ")
                 let title = firstWords.isEmpty ? "Recovered dictation" : firstWords + "…"
                 let meeting = Meeting(
                     id: recoveredId,

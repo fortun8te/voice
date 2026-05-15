@@ -598,6 +598,19 @@ class AudioCaptureService {
         // that the loop form is fine and keeps the limiter envelope tight.
         // ====================================================================
         let tuning = DSPTuning.forDevice(self.inputClass)
+
+        // Bootstrap smoothedRMS on the very first buffer so the adaptive-gain
+        // stage inside applyDSPChain doesn't see smoothedRMS=0 and fall into
+        // the "true silence" branch, which would suppress boost on a whisper
+        // that starts the moment the hotkey fires.  We compute a raw RMS here
+        // (pre-DSP) so that applyDSPChain gets a real signal level on buffer 1.
+        // The gain is then re-smoothed normally below after the chain runs.
+        if self.buffersSinceRecordStart == 0 {
+            var bootstrapRMS: Float = 0
+            vDSP_rmsqv(channelData, 1, &bootstrapRMS, vDSP_Length(frameCount))
+            self.smoothedRMS = bootstrapRMS
+        }
+
         applyDSPChain(channelData: channelData, frameCount: frameCount, tuning: tuning)
 
         let samples = Array(UnsafeBufferPointer(start: channelData, count: frameCount))

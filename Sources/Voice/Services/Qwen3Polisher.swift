@@ -325,8 +325,14 @@ final class Qwen3Polisher {
 
     nonisolated private static func isDutch(_ text: String) -> Bool {
         let lower = text.lowercased()
-        let dutchMarkers = ["hoor", "toch", "nou", "zeg", "eens", "even", "maar", "eh", "eigenlijk"]
-        let dutchCount = dutchMarkers.filter { lower.contains($0) }.count
+        // Word-boundary matching (same as the other language detectors) prevents
+        // false positives from substring matches: "eh" inside "the"/"when"/"they",
+        // "nou" inside "announce"/"enough", "maar" inside "remark", etc.
+        // "eh" and "even" removed from the list: "eh" is a common English
+        // interjection (Canadian/British), and "even" is a common English word.
+        // "nou" removed: substring of "announce", "enough".
+        let dutchMarkers = ["hoor", "toch", "zeg", "eigenlijk", "gewoon", "jullie", "waarbij", "hiervan", "daarna", "waarom"]
+        let dutchCount = stopwordHits(lower, dutchMarkers)
         if dutchCount >= 2 { return true }
         if lower.range(of: #"\bhet\s+(\w+)\s+is\b"#, options: .regularExpression) != nil {
             return true

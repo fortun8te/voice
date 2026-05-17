@@ -1,11 +1,11 @@
 # VOICE
 
-**The fastest dictation app for macOS.** Press Cmd+Right, speak naturally, watch your words appear instantly. Works offline. No cloud latency. No nonsense.
+**Dictation that actually understands what you say.** Press Cmd+Right, speak naturally, watch your words get rewritten with intelligence—not just transcribed. Works offline. No cloud latency. No nonsense.
 
 ```
-You: "Add this to the agenda for tomorrow's standup"
-VOICE: ✓ Done. (150ms)
-Wispr Flow Cloud: ⏳ Processing... (2-3s)
+You: "add this to the agenda for tomorrow standup"
+VOICE: ✓ "Add this to the agenda for tomorrow's standup." (200ms local)
+Wispr Flow: ✓ Same quality (but 2-3s + cloud dependency)
 ```
 
 ---
@@ -14,7 +14,7 @@ Wispr Flow Cloud: ⏳ Processing... (2-3s)
 
 | Feature | VOICE | Wispr Flow | Other Local Clones |
 |---------|-------|-----------|-------------------|
-| **Latency** | <200ms local | 2-3s cloud | Inconsistent |
+| **Latency** | ~200ms local | 2-3s cloud | Inconsistent |
 | **Works offline** | ✓ | ✗ | ✓ |
 | **Homophones fixed** | Qwen3 LLM + custom vocab (90+ AI models) | Basic dict | Minimal |
 | **Personalities** | 4 styles (neutral/formal/casual/excited) | 3 styles | None |
@@ -87,7 +87,7 @@ Use **Qwen3-235B** via Hugging Face or local Ollama for more sophisticated dicta
          └──────────────────────┘
 ```
 
-**Key insight:** Most "Wispr clones" skip the rewriting step or use a tiny model. VOICE uses **Qwen3** (a 1.7B-235B parameter LLM) to actually *understand* what you said—fixing real errors, not just adding punctuation.
+**The magic:** Most "Wispr clones" skip the rewriting step or use a toy model. VOICE runs **Qwen3** (1.7B-235B LLM) locally to *actually understand* what you said—not just transcribe it. Fixes homophones, adds smart punctuation, catches grammar, formats paragraphs. Wispr-level quality on your Mac, offline, no subscription.
 
 ---
 

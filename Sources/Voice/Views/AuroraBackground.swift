@@ -69,11 +69,12 @@ struct AuroraBackground: View {
             let t = context.date.timeIntervalSinceReferenceDate
             content(t: t)
         }
-        // Composite the mesh into a single offscreen layer so SwiftUI doesn't
-        // re-rasterize the gradient against its parent every frame. Halves
-        // GPU work on the niche skin and prevents the occasional micro-stall
-        // we saw when the pill phase changed mid-animation.
-        .drawingGroup(opaque: false)
+        // NOTE: drawingGroup intentionally removed from here. The caller
+        // (GlassCapsule) applies clipShape AFTER AuroraBackground renders —
+        // if drawingGroup rasterizes first, the clip then operates on a flat
+        // Metal texture whose edges don't anti-alias with the capsule path,
+        // producing the visible gradient clipping glitch. By removing it here,
+        // SwiftUI can apply the clip before compositing, which gives clean edges.
         .onAppear {
             print("[VOICE-AURORA] mounted variant=\(variantIndex) sessionVariant=\(AuroraBackground.sessionVariant)")
         }

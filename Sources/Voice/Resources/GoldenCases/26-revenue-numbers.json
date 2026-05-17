@@ -1,0 +1,9 @@
+{
+  "id": "revenue-numbers",
+  "title": "Revenue / metrics with corrections and currency formatting",
+  "categories": ["numbers", "currency", "self-correction", "percentages"],
+  "raw": "so q three revenue came in at thirty two million no actually thirty three point five million which is up like fourteen percent no twelve point five percent year over year and gross margin was forty two percent no wait forty one and we spent about eight hundred k on marketing and six hundred k no six fifty on r and d so total opex was one point four five million no wait one point four five million yeah that's right",
+  "reference": "Q3 revenue came in at thirty-three point five million, up twelve point five percent year over year. Gross margin was forty-one percent. Spent about eight hundred K on marketing and six fifty on R&D, so total opex was one point four five million.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

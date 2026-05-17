@@ -188,7 +188,10 @@ class RecordingCoordinator {
             // (files on disk with no matching Meeting row) and re-transcribe
             // them in the background. If the user starts a new recording
             // before this completes, the recovery loop defers itself.
-            orphanRecoveryTask = Task { @MainActor [weak self] in
+            // Run at .background priority so it never competes with the hotkey
+            // listener or live transcription. The body still hops to the main
+            // actor for storage/transcription calls, but awaits yield freely.
+            orphanRecoveryTask = Task(priority: .background) { @MainActor [weak self] in
                 await self?.recoverOrphanRecordings()
             }
         } catch {
@@ -823,29 +826,83 @@ class RecordingCoordinator {
         let audioDir = storage.audioDirectoryURL
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: audioDir,
-            includingPropertiesForKeys: [.fileSizeKey],
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
             options: .skipsHiddenFiles
         ) else {
             return
         }
 
+        // Pre-filter bounds (Fix 1):
+        //   minSize: 9 KB  ≈ ~280ms @ 16kHz 16-bit mono — below Parakeet's
+        //   ~300ms minimum; transcribeFile would throw `invalidAudioData`.
+        //   maxSize: 50 MB — anything bigger is likely corrupt/runaway and
+        //   not worth burning model time on at startup.
+        let minSize = 9 * 1024
+        let maxSize = 50 * 1024 * 1024
+        // Quarantine root + age threshold for Fix 2.
+        let quarantineRoot = audioDir.appendingPathComponent("quarantine", isDirectory: true)
+        let staleThreshold: TimeInterval = 7 * 24 * 60 * 60 // 7 days
+        let now = Date()
+
         // Orphan = file on disk, named `dictation-<uuid>.caf`, not referenced
         // by any Meeting row. We deliberately filter on the `dictation-`
         // prefix so we don't accidentally try to re-transcribe meeting
         // recordings whose row was deleted intentionally.
-        let orphans: [URL] = entries.filter { url in
+        struct OrphanCandidate {
+            let url: URL
+            let mtime: Date
+            let size: Int
+        }
+        var candidates: [OrphanCandidate] = []
+        var skippedSize = 0
+        var skippedTooBig = 0
+        for url in entries {
             let name = url.lastPathComponent
             guard name.hasPrefix("dictation-"),
                   url.pathExtension.lowercased() == "caf",
-                  !referencedPaths.contains(url.path) else { return false }
+                  !referencedPaths.contains(url.path) else { continue }
             // Skip writer-rollover siblings like `dictation-<uuid>.part2.caf`.
-            // The orphan scanner only owns the primary file; part-N tails get
-            // re-transcribed alongside it (or stay on disk for the size pruner).
             let stem = url.deletingPathExtension().lastPathComponent
-            if stem.contains(".") { return false }
-            // Skip tiny files — must exceed padding baseline (see stopRecording comment).
-            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
-            return size > 20_000
+            if stem.contains(".") { continue }
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attrs?[.size] as? Int) ?? 0
+            let mtime = (attrs?[.modificationDate] as? Date) ?? .distantPast
+            // Fix 1: pre-filter by size.
+            if size < minSize { skippedSize += 1; continue }
+            if size > maxSize { skippedTooBig += 1; continue }
+            candidates.append(OrphanCandidate(url: url, mtime: mtime, size: size))
+        }
+
+        // Fix 2: sort newest-first, cap at 20. Anything older than 7 days
+        // goes to quarantine/<YYYY-MM-DD>/ instead of being re-processed.
+        candidates.sort { $0.mtime > $1.mtime }
+        let recoveryCap = 20
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+        var quarantinedStale = 0
+        var quarantinedOverflow = 0
+        var orphans: [URL] = []
+        for (idx, candidate) in candidates.enumerated() {
+            let age = now.timeIntervalSince(candidate.mtime)
+            if age > staleThreshold {
+                let dayDir = quarantineRoot.appendingPathComponent(dateFormatter.string(from: candidate.mtime), isDirectory: true)
+                if moveToQuarantine(candidate.url, dest: dayDir) {
+                    quarantinedStale += 1
+                }
+                continue
+            }
+            if idx >= recoveryCap {
+                let dayDir = quarantineRoot.appendingPathComponent(dateFormatter.string(from: candidate.mtime), isDirectory: true)
+                if moveToQuarantine(candidate.url, dest: dayDir) {
+                    quarantinedOverflow += 1
+                }
+                continue
+            }
+            orphans.append(candidate.url)
+        }
+
+        if skippedSize + skippedTooBig + quarantinedStale + quarantinedOverflow > 0 {
+            print("[VOICE-RC] orphan recovery: pre-filter skipped=\(skippedSize) too-small, \(skippedTooBig) too-big; quarantined=\(quarantinedStale) stale, \(quarantinedOverflow) overflow")
         }
 
         guard !orphans.isEmpty else {
@@ -872,7 +929,17 @@ class RecordingCoordinator {
             do {
                 let segments = try await transcription.transcribeFile(url: url)
                 guard !segments.isEmpty else {
-                    print("[VOICE-RC] orphan recovery: \(url.lastPathComponent) → empty transcript, leaving on disk")
+                    // Fix 3: an empty transcript means this file is silence /
+                    // unintelligible. Move it to quarantine/empty/ so it
+                    // doesn't haunt future launches.
+                    let emptyDir = storage.audioDirectoryURL
+                        .appendingPathComponent("quarantine", isDirectory: true)
+                        .appendingPathComponent("empty", isDirectory: true)
+                    if moveToQuarantine(url, dest: emptyDir) {
+                        print("[VOICE-RC] orphan recovery: \(url.lastPathComponent) → empty transcript, moved to quarantine/empty/")
+                    } else {
+                        print("[VOICE-RC] orphan recovery: \(url.lastPathComponent) → empty transcript, quarantine move FAILED")
+                    }
                     continue
                 }
                 let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -895,6 +962,37 @@ class RecordingCoordinator {
             }
         }
         print("[VOICE-RC] orphan recovery: pass complete")
+    }
+
+    /// Move `url` into `dest`, creating `dest` if needed. On filename
+    /// collision, appends a numeric suffix. Returns true on success.
+    /// Used by orphan recovery to retire stale / empty / overflow files
+    /// without deleting them — they remain recoverable from disk.
+    private func moveToQuarantine(_ url: URL, dest: URL) -> Bool {
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+        } catch {
+            print("[VOICE-RC] quarantine: mkdir failed for \(dest.path): \(error.localizedDescription)")
+            return false
+        }
+        var target = dest.appendingPathComponent(url.lastPathComponent)
+        var n = 1
+        let stem = url.deletingPathExtension().lastPathComponent
+        let ext = url.pathExtension
+        while fm.fileExists(atPath: target.path) {
+            let candidateName = ext.isEmpty ? "\(stem)-\(n)" : "\(stem)-\(n).\(ext)"
+            target = dest.appendingPathComponent(candidateName)
+            n += 1
+            if n > 1000 { return false }
+        }
+        do {
+            try fm.moveItem(at: url, to: target)
+            return true
+        } catch {
+            print("[VOICE-RC] quarantine: move \(url.lastPathComponent) → \(target.path) failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     // MARK: - Live Partials (lock mode only)

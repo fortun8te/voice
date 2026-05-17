@@ -1,0 +1,9 @@
+{
+  "id": "moving-checklist",
+  "title": "Moving checklist — two merged lists, timeline, corrections",
+  "categories": ["lists", "multi-topic", "self-correction", "everyday"],
+  "raw": "okay moving checklist so things to do before move out date which is july first no july third okay so before july third i need to cancel the internet with spectrum and schedule the new installation at the new place and call the building super to schedule the freight elevator for moving day and uh return my keys and get the deposit back and forward my mail and update my address everywhere like the dmv and my bank and amazon and stuff and then there's the things i need to do on moving day itself so first hire the movers actually they're already booked it's miguel's moving company and they're coming at eight am so i need to have everything packed by the night before and uh wrap the furniture in moving blankets and label all the boxes by room and make sure the plants are moved separately because the movers won't take them and then once i'm in the new place i need to deep clean before unpacking and set up the bed first so i have somewhere to sleep and call the super at the new building to get the garage remote and change all my locks which the landlord said is allowed",
+  "reference": "**Before July 3 (move-out):**\n- Cancel Spectrum internet; schedule new installation at the new place\n- Book freight elevator with the super for moving day\n- Return keys and get deposit back\n- Forward mail and update address (DMV, bank, Amazon, etc.)\n\n**Moving day (movers: Miguel's Moving Co., 8 AM):**\n- Have everything packed the night before\n- Wrap furniture in moving blankets\n- Label all boxes by room\n- Move plants separately (movers won't take them)\n\n**At the new place:**\n- Deep clean before unpacking\n- Set up bed first\n- Get garage remote from the super\n- Change all locks (landlord approved)",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

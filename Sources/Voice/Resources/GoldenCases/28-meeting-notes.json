@@ -1,0 +1,9 @@
+{
+  "id": "meeting-notes",
+  "title": "Meeting notes — names, action items, multi-topic",
+  "categories": ["multi-topic", "proper-nouns", "action-items"],
+  "raw": "meeting notes from the product sync so first topic was the mobile app launch which is scheduled for september first and alex is the lead on that and he said the main blocker is the app store review which usually takes like five to seven business days so we need to submit by august twenty second at the latest second topic was customer feedback ryan presented the results from the q two survey and the top complaint was slow loading on older devices specifically iphone ten and below and we agreed to do a performance pass before the launch third thing was headcount sarah got approval for two new backend engineers starting in october and she's going to post the job descriptions by end of this week",
+  "reference": "Meeting notes from the product sync:\n\n**Mobile app launch** (September 1): Alex is the lead. Main blocker is App Store review (5-7 business days), so we need to submit by August 22 at the latest.\n\n**Customer feedback**: Ryan presented Q2 survey results. Top complaint is slow loading on older devices, specifically iPhone 10 and below. We agreed to do a performance pass before launch.\n\n**Headcount**: Sarah got approval for two new backend engineers starting in October. She will post the job descriptions by end of this week.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

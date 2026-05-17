@@ -1,0 +1,9 @@
+{
+  "id": "senseless-rant-cleanup",
+  "title": "Mostly incoherent rant — HIGH still cleans structure, preserves content",
+  "categories": ["rant", "filler", "multi-topic"],
+  "raw": "i just like the thing is i don't even know where to start because like everything is fine but also nothing is fine and like i've been staring at this for three hours and the more i look at it the less sense it makes and like honestly i don't even know if the problem is the code or the problem is me at this point because like i read the docs and the docs said one thing and then the code does another thing and then there's a comment in the code that contradicts both the docs and the code itself and like who wrote this and why does it exist and also why does it work because according to everything i know it should not work and yet here we are and it works fine in production and fails in tests which is like the opposite of what should happen and i need someone to explain this to me in simple words because i've clearly lost the ability to understand anything",
+  "reference": "The thing is, I don't even know where to start. Everything is fine but also nothing is fine. I've been staring at this for three hours and the more I look, the less sense it makes.\n\nHonestly, I don't know if the problem is the code or me at this point. I read the docs — the docs said one thing, the code does another, and there's a comment in the code that contradicts both. Who wrote this and why does it exist?\n\nAlso, why does it work? According to everything I know, it should not work. And yet it works fine in production and fails in tests, which is the opposite of what should happen. I need someone to explain this in simple words, because I've clearly lost the ability to understand anything.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

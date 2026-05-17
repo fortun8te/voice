@@ -1,0 +1,9 @@
+{
+  "id": "recipe-steps",
+  "title": "Recipe dictation — numbered steps, quantities, corrections",
+  "categories": ["lists", "numbers", "self-correction", "everyday"],
+  "raw": "okay so pasta arrabbiata recipe uh for four people so first you need three hundred no four hundred grams of spaghetti and uh heat up like three tablespoons of olive oil in a pan on medium heat then add four no five cloves of garlic thinly sliced and uh one teaspoon no make it two of red pepper flakes and let that cook for like two minutes until the garlic is golden not burnt be careful because it goes from golden to burnt really fast then add two cans of crushed tomatoes like four hundred gram cans and uh season with salt and let it simmer for fifteen minutes and meanwhile cook the pasta in salted water until al dente and save like half a cup of pasta water before you drain it then toss the pasta in the sauce and add a bit of the pasta water if it's too thick and finish with a handful of fresh parsley and some parmesan if you want but technically arrabbiata is vegan so you don't have to",
+  "reference": "Pasta arrabbiata, serves 4. Heat 3 tablespoons of olive oil in a pan on medium heat. Add 5 cloves of garlic, thinly sliced, and 2 teaspoons of red pepper flakes. Cook for about 2 minutes until the garlic is golden — be careful, it goes from golden to burnt really fast. Add 2 cans of crushed tomatoes (400g each), season with salt, and simmer for 15 minutes. Meanwhile, cook 400g spaghetti in salted water until al dente. Save about half a cup of pasta water before draining. Toss the pasta into the sauce and add a splash of pasta water if it's too thick. Finish with fresh parsley and parmesan if you like — though technically arrabbiata is vegan so you don't have to.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

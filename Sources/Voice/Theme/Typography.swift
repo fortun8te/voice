@@ -43,7 +43,7 @@ extension Font {
     // SERIF family (Tiempos / fallback chain)
     static let serifHero    = serif(40, weight: .regular)   // hero titles
     static let serifTitle   = serif(28, weight: .regular)   // sheet titles
-    static let serifValue   = serif(32, weight: .medium)    // stat card numbers
+    static let serifValue   = serif(40, weight: .medium)    // stat card numbers
     static let serifSection = serif(22, weight: .regular)   // card titles
     static let serifLabel   = serif(16, weight: .regular)   // muted serif captions
 

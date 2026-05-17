@@ -13,12 +13,41 @@ import AppKit
 import AVFoundation
 import CoreAudio
 
-@main
 struct VoiceApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
         Settings { EmptyView() }
+    }
+}
+
+/// Top-level entry point. Branches on CLI args:
+///   --polish-harness [dir]   → run the headless golden-case polish harness
+///   (anything else)          → boot the SwiftUI app as normal
+///
+/// Lives here (rather than as a separate target) because the polish pipeline
+/// (`Qwen3Polisher`, `RestartCorrectionPreprocessor`, `PolishPostprocessor`,
+/// `LLMPolisher`) uses internal access across `Sources/Voice/Services/` and
+/// is referenced extensively from the rest of the Voice target. Splitting it
+/// out would mean making dozens of types public — too invasive for what is
+/// a read-only test harness. See PolishHarness.swift.
+@main
+struct VoiceEntryPoint {
+    static func main() {
+        let args = CommandLine.arguments
+        if args.dropFirst().first == "--polish-harness" {
+            let dir = args.count > 2 ? args[2] : "Sources/Voice/Resources/GoldenCases"
+            // Use RunLoop.main so the @MainActor task actually gets to run.
+            // sema.wait() would deadlock because it blocks the very thread
+            // the main actor needs to schedule work on.
+            Task { @MainActor in
+                await PolishHarness.run(goldenCasesDir: dir)
+                exit(0)
+            }
+            RunLoop.main.run()   // spins until exit(0) above fires
+            return
+        }
+        VoiceApp.main()
     }
 }
 
@@ -35,6 +64,10 @@ extension Notification.Name {
     /// view observes this and flips its `showSettings` state to present the
     /// sheet, since AppKit can't reach SwiftUI @State directly.
     static let voiceOpenBigMenuSettings = Notification.Name("voice.openBigMenuSettings")
+    /// Posted when the cloud polish path failed (timeout / rate-limit / network)
+    /// and we silently fell back to the local model. `userInfo["reason"]`
+    /// carries a short human-readable cause.
+    static let voiceCloudFellBackToLocal = Notification.Name("voice.cloudFellBackToLocal")
 }
 
 /// Persisted history of the last dictations. Capped at 100 (see
@@ -86,6 +119,11 @@ struct RecentDictation: Codable, Identifiable {
     var cleanupLevelUsed: String? = nil
     /// Personality preset in effect when the polish ran. "Neutral" / "Formal" / "Casual" / "Excited".
     var personalityStyleUsed: String? = nil
+    /// Engine that actually polished this dictation. Tagged by Qwen3Polisher
+    /// during polish so the history view can show "Cloud (Qwen 235B)" vs
+    /// "Local (Qwen3 4B)". Optional for back-compat with older entries.
+    /// Format: "cloud:qwen-3-235b" / "local:qwen3-4b" / "local:qwen3-1.7b" / "rules-only"
+    var polishEngine: String? = nil
     var id: String { "\(timestamp.timeIntervalSince1970)-\(text.hashValue)" }
 
     /// True when raw differs meaningfully from polished — i.e. polish actually
@@ -145,7 +183,8 @@ enum RecentDictations {
                     durationSeconds: Int? = nil, voiceCommandCount: Int? = nil,
                     cleanupLevelUsed: String? = nil,
                     personalityStyleUsed: String? = nil,
-                    polishFixCount: Int? = nil) {
+                    polishFixCount: Int? = nil,
+                    polishEngine: String? = nil) {
         let trimmed = polished.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let trimmedRaw = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -170,7 +209,8 @@ enum RecentDictations {
                             voiceCommandCount: voiceCommandCount,
                             polishFixCount: polishFixCount,
                             cleanupLevelUsed: cleanupLevelUsed,
-                            personalityStyleUsed: personalityStyleUsed),
+                            personalityStyleUsed: personalityStyleUsed,
+                            polishEngine: polishEngine),
             at: 0
         )
         if items.count > limit { items = Array(items.prefix(limit)) }
@@ -474,6 +514,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.assertAppIcon(context: "didBecomeActive")
         }
         notificationTokens.append(didBecomeActiveToken)
+
+        // Surface cloud polish failures (timeout / rate-limit / network) so the
+        // user knows when we silently fell back to the local model. Toast is
+        // throttled inside Qwen3Polisher to avoid spamming on rate-limit bursts.
+        let cloudFallbackToken = NotificationCenter.default.addObserver(
+            forName: .voiceCloudFellBackToLocal,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            let reason = (note.userInfo?["reason"] as? String) ?? "network issue"
+            self?.showToast("Cloud unreachable (\(reason)) — using local model.")
+        }
+        notificationTokens.append(cloudFallbackToken)
 
         // Belt-and-suspenders: re-assert at 0.1 s (before Dock finishes its first
         // cache write) and again at 1.5 s (after any post-launch Dock refresh).
@@ -2021,7 +2074,10 @@ extension AppDelegate: NSWindowDelegate {
             let parakeetSuspectsAgg = segments.compactMap { $0.suspectWords }.flatMap { $0 }
             let formatterSuspects = TextFormatter.suspectsForPolish(formatted)
             let suspectWords = Array(Set(parakeetSuspectsAgg + formatterSuspects))
-            let userVocab = CombinedDictionary.terms()
+            // Merge built-in dictionary terms with the user's auto-learned
+            // proper nouns (brand names, frequent contacts). Auto-learned
+            // first so they take priority in any de-duplication.
+            let userVocab = Array(Set(ProperNounVocabulary.current() + CombinedDictionary.terms()))
             let polishStart = Date()
             // Short-utterance bypass: when RecordingCoordinator flagged the
             // current clip as 16-36KB ("ok"/"yeah"/"no" territory), skip the
@@ -2420,7 +2476,16 @@ extension AppDelegate: NSWindowDelegate {
                                   voiceCommandCount: commandCount,
                                   cleanupLevelUsed: CleanupLevel.current.displayName,
                                   personalityStyleUsed: PersonalityStyle.current.displayName,
-                                  polishFixCount: fixCount)
+                                  polishFixCount: fixCount,
+                                  polishEngine: PolishStatus.shared.lastEngine)
+
+            // Auto-learn proper nouns from the polished text. Looks at the
+            // user's last 50 dictations and promotes capitalized terms that
+            // appear ≥2 times into the proper-noun vocabulary — so the next
+            // polish pass treats them as fixed brand/contact names instead
+            // of "correcting" their spelling.
+            let priorDictations = RecentDictations.all().prefix(50).map(\.text)
+            ProperNounVocabulary.learnFrom(finalText, previousDictations: Array(priorDictations))
             Telemetry.log("dictation.completed", properties: [
                 "chars": formatted.count,
                 "duration_s": durationSeconds,

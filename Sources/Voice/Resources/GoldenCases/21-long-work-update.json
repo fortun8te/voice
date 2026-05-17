@@ -1,0 +1,9 @@
+{
+  "id": "long-work-update",
+  "title": "Long work status update — 3 topics, numbers, corrections",
+  "categories": ["multi-topic", "numbers", "self-correction", "proper-nouns"],
+  "raw": "okay so quick update on the project uh we finished the backend migration last thursday no wait it was friday and we're now on postgres fourteen no thirteen point four and performance is way better like query times dropped from like eight hundred milliseconds to uh about two hundred which is a four x improvement also the frontend team is blocked on the design review maya and jake are waiting on approval from sarah and that's been sitting for like five days now so someone needs to push on that and then the last thing uh we had a bug in the payment flow where transactions over ten thousand dollars were getting rejected silently no error shown to the user and we fixed that yesterday it was a missing null check in the stripe webhook handler",
+  "reference": "Quick update on the project:\n\nWe finished the backend migration last Friday and we're now on PostgreSQL 13.4. Performance is way better — query times dropped from about 800ms to 200ms, which is a 4x improvement.\n\nThe frontend team is blocked on the design review. Maya and Jake are waiting on approval from Sarah, and that's been sitting for five days. Someone needs to push on that.\n\nWe had a bug in the payment flow where transactions over $10,000 were being rejected silently with no error shown to the user. Fixed yesterday — it was a missing null check in the Stripe webhook handler.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

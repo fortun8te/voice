@@ -140,30 +140,47 @@ final class PermissionsService {
 
     private var monitorTimer: Timer?
 
-    /// Installs a 2-second repeating Timer that calls `refresh()`. Views
-    /// presenting onboarding should call this in `.task` so out-of-app
-    /// grants (made in System Settings) propagate back without manual
-    /// re-checking.
+    /// Installs a 0.7-second repeating Timer that calls `refresh()`, plus
+    /// a NSApplication.didBecomeActive observer that refreshes immediately
+    /// when the user returns from System Settings. Views presenting onboarding
+    /// should call this in `.task` so out-of-app grants propagate back
+    /// without lag.
     func startMonitoring() {
         stopMonitoring()
-        // Do one immediate refresh so the UI is correct on first paint.
+        // Immediate refresh — UI is correct on first paint.
         refresh()
-        let timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.7, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.refresh()
             }
         }
-        // .common keeps the timer firing while the user is scrolling or
-        // dragging; without this the timer pauses during tracking runloop
-        // modes, which would be confusing during onboarding.
         RunLoop.main.add(timer, forMode: .common)
         monitorTimer = timer
+
+        // Refresh immediately when the app comes back to focus — the user
+        // just granted in System Settings and switched back. Without this,
+        // there's up to 0.7s of stale "not granted" before the timer fires.
+        if didBecomeActiveObserver == nil {
+            didBecomeActiveObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.refresh()
+            }
+        }
     }
 
     func stopMonitoring() {
         monitorTimer?.invalidate()
         monitorTimer = nil
+        if let token = didBecomeActiveObserver {
+            NotificationCenter.default.removeObserver(token)
+            didBecomeActiveObserver = nil
+        }
     }
+
+    private var didBecomeActiveObserver: NSObjectProtocol?
 
     // MARK: Refresh
 
@@ -179,26 +196,39 @@ final class PermissionsService {
         // AXIsProcessTrusted is the read-only check. The options-dict
         // variant (AXIsProcessTrustedWithOptions with prompt=true) is
         // reserved for explicit user-driven request.
-        if AXIsProcessTrusted() {
+        let granted = AXIsProcessTrusted()
+        // Remember the granted state across launches. We use this to detect
+        // "permission was granted before, isn't now" — which happens when
+        // the unsigned binary's hash changes (every rebuild) and macOS
+        // invalidates the TCC binding. The UI uses this signal to show a
+        // "permissions reset after update" banner instead of looking like
+        // the user never granted in the first place.
+        if granted {
+            UserDefaults.standard.set(true, forKey: "voice.everGrantedAccessibility")
             return .granted
         }
-        // macOS does not distinguish "denied" from "not determined" for
-        // accessibility before a prompt has been issued. We treat the
-        // first-launch case as notDetermined so the UI can offer
-        // "Request" rather than "Open Settings". Once the prompt has
-        // been shown the user has a row in System Settings and our
-        // status flips to denied on subsequent reads if they declined,
-        // but visually we render both the same way (the button is
-        // "Open Settings" either way). The notDetermined branch only
-        // matters for the initial label.
+        let everGranted = UserDefaults.standard.bool(forKey: "voice.everGrantedAccessibility")
+        if everGranted {
+            return .denied   // treat as "needs re-grant"
+        }
         return hasPromptedAccessibility ? .denied : .notDetermined
+    }
+
+    /// True when Accessibility was previously granted but currently isn't —
+    /// the typical "TCC binding invalidated after update" case. UI uses this
+    /// to surface a clearer "re-grant after update" message.
+    var accessibilityNeedsReGrant: Bool {
+        accessibility != .granted
+            && UserDefaults.standard.bool(forKey: "voice.everGrantedAccessibility")
     }
 
     private var hasPromptedAccessibility = false
 
     private func currentMicrophoneStatus() -> Status {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized: return .granted
+        case .authorized:
+            UserDefaults.standard.set(true, forKey: "voice.everGrantedMicrophone")
+            return .granted
         case .denied, .restricted: return .denied
         case .notDetermined: return .notDetermined
         @unknown default: return .notDetermined
@@ -225,9 +255,11 @@ final class PermissionsService {
 
         guard let tap else {
             // The first time we probe before the user has been prompted,
-            // we cannot distinguish "denied" from "not determined". The
-            // VOICE UI only offers "Open Settings" for this row anyway,
-            // so notDetermined is a safe initial label.
+            // we cannot distinguish "denied" from "not determined". Once
+            // we've ever seen it granted (persisted across launches), a
+            // current "not granted" is the stale-TCC-after-update case.
+            let everGranted = UserDefaults.standard.bool(forKey: "voice.everGrantedInputMonitoring")
+            if everGranted { return .denied }
             return hasProbedInputMonitoringDenied ? .denied : .notDetermined
         }
 
@@ -236,7 +268,15 @@ final class PermissionsService {
         // start receiving events; we only wanted the creation result.
         CFMachPortInvalidate(tap)
         hasProbedInputMonitoringDenied = true
+        UserDefaults.standard.set(true, forKey: "voice.everGrantedInputMonitoring")
         return .granted
+    }
+
+    /// True if any required permission was once granted but currently isn't.
+    var anyPermissionNeedsReGrant: Bool {
+        let mic = microphone != .granted && UserDefaults.standard.bool(forKey: "voice.everGrantedMicrophone")
+        let ax = accessibilityNeedsReGrant
+        return ax || mic
     }
 
     private var hasProbedInputMonitoringDenied = false

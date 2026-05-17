@@ -47,7 +47,7 @@ final class Qwen3Polisher {
     /// model preserves them verbatim instead of "correcting" them. Add new
     /// entries here whenever a user-reported brand gets mangled by the
     /// polish pass.
-    static let knownProductNames: [String] = [
+    nonisolated static let knownProductNames: [String] = [
         "Wispr Flow", "Whisper", "Parakeet", "Moonshine", "Granite",
         "ChatGPT", "Claude", "Anthropic", "OpenAI", "Gemini",
         "VOICE", "macOS", "iOS", "iPhone", "iPad",
@@ -67,7 +67,7 @@ final class Qwen3Polisher {
     /// Routed to for longer / structurally-richer dictations where the 1.7B
     /// model under-restructures or fails to follow nested formatting rules.
     /// Loaded lazily behind the small model so first launch isn't blocked.
-    private static let largeModelID = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+    private static let largeModelID = "mlx-community/Qwen3-4B-Instruct-2507-4bit-DWQ-2510"
 
     // Reuse the existing PolishContext enum so we don't have to migrate
     // CursorPaster and every other call site.
@@ -703,6 +703,17 @@ final class Qwen3Polisher {
                                 cleanupLevel: cleanupLevel, personalityStyle: personalityStyle)
         }
 
+        // When cloud is the active engine, skip the local 3-way merge entirely.
+        // The 235B model fixing errors from a single high-quality parakeet
+        // transcript beats a 4B doing 3-way voting. Route straight through
+        // polish() which handles cloud + fallback.
+        if CerebrasPolisher.isAvailable {
+            return await polish(parakeet, context: context, timeoutMs: timeoutMs,
+                                suspectWords: suspectWords, userVocabulary: userVocabulary,
+                                fieldContext: fieldContext,
+                                cleanupLevel: cleanupLevel, personalityStyle: personalityStyle)
+        }
+
         guard Self.isEnabled, Self.isAvailable else {
             return await polish(parakeet, context: context, timeoutMs: timeoutMs,
                                 suspectWords: suspectWords, userVocabulary: userVocabulary,
@@ -804,12 +815,7 @@ final class Qwen3Polisher {
             let s = Self.sanitizeUntrustedField(priorCtx, maxChars: 400)
             hints += "Prior dictation in this session (DO NOT OUTPUT, use only to resolve ambiguity): \"\(s)\"\n"
         }
-        if let sw = suspectWords, !sw.isEmpty {
-            let s = sw.prefix(16)
-                .map { Self.sanitizeUntrustedField($0, maxChars: 60) }
-                .joined(separator: ", ")
-            hints += "Uncertain words (low ASR confidence): [\(s)]. Likely mis-transcribed, check against vocabulary.\n"
-        }
+        hints += Self.buildSuspectHints(suspectWords ?? [], userVocabulary: userVocabulary)
         if let vocab = userVocabulary, !vocab.isEmpty {
             let prioritized = Self.prioritizeVocabulary(vocab, suspects: suspectWords)
             let s = prioritized.prefix(60)
@@ -826,13 +832,15 @@ final class Qwen3Polisher {
         // markers are present in any of the transcripts. HIGH cleanup gets
         // 3x headroom (vs 2x) so aggressive restructuring isn't truncated.
         // Section E: same profile-tightened budget as the single-model polish.
-        // 2× input + 60 buffer — merge output length tracks input length more
-        // tightly than polish, so this is even safer here.
+        // 2× input + 60 buffer for medium/light; 3× + 80 for HIGH (aggressive
+        // restructuring) and list hints. Mirrors polishWithMLX budget logic.
         let approxTokens = max(8, parakeet.count / 3)
         let mergeHasListHint = [parakeet, granite ?? "", moonshine ?? ""].joined(separator: " ")
             .range(of: #"(?i)\b(first|second|third|point\s+one|point\s+two|number\s+one|step\s+one|action\s+items?)\b"#, options: .regularExpression) != nil
-        let mergeCleanupMultiplier: Int = (cleanupLevel.lowercased() == "high") ? 2 : 2
-        let cap = approxTokens * mergeCleanupMultiplier + (mergeHasListHint ? 60 : 60)
+        // Mirror polishWithMLX: HIGH gets 3× for aggressive restructuring headroom.
+        // List hint gets 80 to cover "1.\n2.\n3." prefix overhead.
+        let mergeCleanupMultiplier: Int = (cleanupLevel.lowercased() == "high") ? 3 : 2
+        let cap = approxTokens * mergeCleanupMultiplier + (mergeHasListHint ? 80 : 60)
         let params = GenerateParameters(temperature: 0.0, topP: 1.0).with(maxTokens: cap)
 
         // Build transcript lines — always include A (Parakeet), include B and C when available.
@@ -880,8 +888,8 @@ final class Qwen3Polisher {
         // dictations should be allowed to produce lists, paragraphs, inline
         // code, and quoted message blocks.
         var mergeStructureHint = """
-        If the input describes a list (e.g., "with X, Y, Z" or "save comments about X, Y, Z"), output as a bulleted list.
-        If it describes multiple distinct topics or steps, use paragraph breaks between topics.
+        Use bullets when the speaker enumerates 3+ short items (each 1-4 words) following a cue phrase like "I need", "I have to get", "I want", "make a list", "the list is", "things to do", "grocery list", or a colon. Example: "I have to get monster energy, sea salt spray, curry, and a phone" → bullet list with 4 items. Items in lists should each be a single short noun phrase. For 2 or fewer items, keep as inline prose.
+        PARAGRAPH BREAKS (important): If the output is longer than ~50 words, split into 2+ paragraphs at natural topic boundaries. Use a BLANK LINE (\n\n) between paragraphs. Topic boundary signals: change of subject, switch from describing to listing, switch from question to answer, "also", "anyway", "by the way", "okay so", "moving on", "let's say", "speaking of", or any moment the speaker pivots. Default to MORE breaks rather than fewer — a wall of text is the wrong output.
         If it mentions snake_case field names, code identifiers, URLs, file paths, passwords, or version numbers, wrap them in backticks.
         If it dictates a message to someone (e.g., "send Alex running late" or "text Mia saying..."), output the message body in quotation marks. Any qualifying instruction ("except maybe less formal") goes OUTSIDE the quote on its own line in parentheses.
         Email addresses, serial numbers, and tracking numbers MUST be in backticks: `admin-temp@northgate-help.net`, `A9-Q2-7B-44`, `Q479B662`.
@@ -893,12 +901,16 @@ final class Qwen3Polisher {
             MULTI-TOPIC: If the dictation covers 3+ independent topics signaled by "also", "and then", "oh and", separate them with a BLANK LINE between paragraphs. Do NOT use numbered lists or bullet points unless the speaker is enumerating discrete items (like a list of fields, a list of comments to save, a list of names). Use bullets ONLY for genuine list content.
 
             GENUINE LIST signals (use bullets):
-            - "fields should be X, Y, Z" (schema/struct fields)
-            - "save the comments about A, B, C" (explicit list-of-things)
-            - "the list of X is..." (explicit list)
+            - Schema/struct fields explicitly enumerated: "fields should be X, Y, Z"
+            - Explicit save/filter criteria: "save the comments about A, B, C"
+            - Speaker says "the list is..." or "bullet point X, bullet point Y"
+            - Shopping/grocery/to-do enumeration with 3+ short items: "I need monster energy, sea salt spray, curry, and a phone" → bullet list with 4 items, each on its own line
+            - Cue phrases: "I have to get", "I need", "things to do", "make a list", "grocery list"
 
-            NOT GENUINE LIST (use paragraphs):
-            - Multiple unrelated topics, even if speaker says "also" or "and then"
+            NOT GENUINE LIST (use prose):
+            - 2 or fewer items: "I need milk and eggs" → stays prose
+            - Long items (5+ words each) — keep as prose flow
+            - Multiple unrelated topics (use paragraph breaks, not bullets)
             - Self-corrections, sub-clauses, asides
             - Causal explanations ("because X, then Y")
 
@@ -906,19 +918,7 @@ final class Qwen3Polisher {
         }
         if mergeHasSchemaSignal {
             mergeStructureHint += """
-            SCHEMA: The speaker is dictating a database table or struct. Format the field list as a BULLET LIST with each field in backticks on its own line. "X underscore Y" \u{2192} `x_y`. Any "except/unless" caveat after the list goes as a SEPARATE PROSE PARAGRAPH. Example:
-            "make invoices table invoice underscore id customer underscore id subtotal tax total paid underscore at status except refunded invoices keep original totals"
-            \u{2192}
-            Make table `invoices`. Fields:
-            - `invoice_id`
-            - `customer_id`
-            - `subtotal`
-            - `tax`
-            - `total`
-            - `paid_at`
-            - `status`
-
-            Refunded invoices keep original totals for reporting.
+            SCHEMA: The speaker is dictating a database table or struct. Convert spoken field names to snake_case wrapped in backticks. ≤8 fields → inline comma-separated after a colon. ≥9 fields → bullet list. Any "except/unless/where" caveat stays as prose. "X underscore Y" → `x_y`. SHORT EXAMPLE: "create users table user id email password hash created at" → "Create users table: `user_id`, `email`, `password_hash`, `created_at`".
 
             """
         }
@@ -1022,7 +1022,18 @@ final class Qwen3Polisher {
         }
 
         // Step 1: Strip fillers (rule-based, ~1ms) — runs ALWAYS, even if we skip model
-        let stripped = LLMPolisher.stripFillers(text)
+        let filtered = LLMPolisher.stripFillers(text)
+
+        // Step 1b: Restart-correction pre-processor (rule-based, <1ms).
+        // Resolves stutters, explicit "no wait" corrections, and near-duplicate
+        // clause restarts BEFORE the LLM sees the text. The 4B model has been
+        // observed to keep both versions of a restart in long inputs; doing this
+        // deterministically in Swift is more reliable than asking the model.
+        let preResult = RestartCorrectionPreprocessor.process(filtered)
+        let stripped = preResult.cleaned
+        if !preResult.appliedRules.isEmpty {
+            print("[VOICE-PRE] restart-correction applied: \(preResult.appliedRules.joined(separator: ",")), dropped \(preResult.droppedSpans.count) spans")
+        }
 
         // Step 2: Skip model if text is in a non-English language (Qwen3 is
         // English-trained and rewrites Dutch/French/German/Spanish/Italian/
@@ -1030,7 +1041,7 @@ final class Qwen3Polisher {
         // ambiguous short utterances.
         if Self.isNonEnglish(stripped) {
             print("[VOICE] Qwen3 polish skipped: non-English detected")
-            return stripped
+            return Self.applyPostprocessor(stripped, userVocabulary: userVocabulary)
         }
 
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
@@ -1045,38 +1056,160 @@ final class Qwen3Polisher {
         }
         print("[VOICE] Qwen3 polish START (input chars=\(stripped.count))")
 
-        // --- Goal-first polish (experimental scaffolding) ---
-        //
-        // Behind the `useGoalFirstPolish` UserDefaults flag (defaults to false).
-        // When ON, we split the dictation into topic chunks, classify each
-        // chunk's intent, and log the result. The polish path itself is
-        // UNCHANGED — this pass only emits [VOICE-INTENT] log lines so we can
-        // verify routing decisions before turning on intent-specific prompts.
-        //
-        // TODO: once the real classifier is in, dispatch to intent-specific
-        // polish prompts here instead of falling through to polishWithMLX.
-        if UserDefaults.standard.bool(forKey: "useGoalFirstPolish") {
-            let chunks = TopicSplitter.split(stripped)
-            let intents = await IntentClassifier.shared.classifyAll(chunks)
-            for (i, intent) in intents.enumerated() {
-                let recipient = intent.recipient ?? "-"
-                print("[VOICE-INTENT] chunk \(i): kind=\(intent.kind.rawValue) register=\(intent.register.rawValue) recipient=\(recipient)")
+        // Step 2b: Freeze fragile spans (emails, URLs, contractions, code,
+        // domains) behind sentinel tokens BEFORE the model sees them. The
+        // model polishes the surrounding prose but cannot accidentally split
+        // "michael@gmail.com" → "michael@gmail. Com" or mangle "let's say"
+        // → "let'say". Sentinels look like ⟦E0⟧ ⟦E1⟧ etc — mathematical
+        // white square brackets, opaque to Qwen3's tokenizer.
+        let frozen = EntityFreezer.freeze(stripped)
+        if !frozen.isEmpty {
+            print("[VOICE-FREEZE] froze \(frozen.entities.count) entities")
+        }
+
+        // Step 2c: Decide between local 4B and Cerebras cloud. Cloud only
+        // fires when the user has opted in AND the input is long enough to
+        // benefit (short messages don't need a 70B). Cerebras failure falls
+        // back to local — never blocks polish.
+        let wordCount = frozen.text.split(separator: " ").count
+        let useCloud = CerebrasPolisher.isAvailable && wordCount >= CerebrasPolisher.minWordCount
+
+        var polishedFrozen: String?
+        if useCloud {
+            print("[VOICE-POLISH] routing to Cerebras (wordCount=\(wordCount))")
+            // Use the same soundex-prioritized vocab the local path uses, so
+            // the top 60 sent to the cloud are phonetically related to suspect
+            // tokens. Keeps the prompt budget sane while maximizing relevance.
+            let prioritizedVocab = userVocabulary.map {
+                Self.prioritizeVocabulary($0, suspects: suspectWords)
+            }
+            let cloudPrompt = Self.buildCloudSystemPrompt(
+                cleanupLevel: cleanupLevel,
+                personalityStyle: personalityStyle,
+                userVocabulary: prioritizedVocab
+            )
+            polishedFrozen = await CerebrasPolisher.shared.polish(
+                frozen.text,
+                systemPrompt: cloudPrompt
+            )
+            if polishedFrozen == nil {
+                let reason = await CerebrasPolisher.shared.lastFailureReason ?? "unknown"
+                print("[VOICE-POLISH] Cerebras failed (\(reason)), falling back to local")
+                await MainActor.run { Self.maybePostCloudFallbackToast(reason: reason) }
+            } else {
+                await MainActor.run { PolishStatus.shared.lastEngine = "cloud:qwen-3-235b" }
             }
         }
 
-        return await polishWithMLX(
-            stripped,
-            context: context,
-            timeoutMs: timeoutMs,
-            suspectWords: suspectWords,
-            userVocabulary: userVocabulary,
-            fieldContext: fieldContext,
-            cleanupLevel: cleanupLevel,
-            personalityStyle: personalityStyle
-        )
+        if polishedFrozen == nil {
+            polishedFrozen = await polishWithMLX(
+                frozen.text,
+                context: context,
+                timeoutMs: timeoutMs,
+                suspectWords: suspectWords,
+                userVocabulary: userVocabulary,
+                fieldContext: fieldContext,
+                cleanupLevel: cleanupLevel,
+                personalityStyle: personalityStyle
+            )
+            // Tag engine label based on routing the local path actually took.
+            let usedLarge = wordCount > 20 && self.isLargeModelReady
+            await MainActor.run {
+                PolishStatus.shared.lastEngine = usedLarge ? "local:qwen3-4b" : "local:qwen3-1.7b"
+            }
+        }
+        let polishedFrozenFinal = polishedFrozen ?? frozen.text
+
+        // Hallucination guard: if the model lost or invented frozen
+        // sentinels, fall back to the raw frozen input rather than ship
+        // garbage. Same safety the critic provided, deterministic.
+        let inputSentinels = countSentinels(in: frozen.text)
+        let outputSentinels = countSentinels(in: polishedFrozenFinal)
+        let safePolished: String = (inputSentinels == outputSentinels) ? polishedFrozenFinal : {
+            print("[VOICE-GUARD] sentinel mismatch: in=\(inputSentinels) out=\(outputSentinels), falling back")
+            return frozen.text
+        }()
+
+        // Unfreeze BEFORE postprocessor so its rules see real text again.
+        let polished = EntityFreezer.unfreeze(safePolished, entities: frozen.entities)
+
+        // Step N: Post-processor (rule-based, <1ms). Enforces capitalization,
+        // hyphenates known compounds, trims trailing cutoff periods. Runs
+        // even on fail-open paths to keep the output consistent.
+        return Self.applyPostprocessor(polished, userVocabulary: userVocabulary)
         #else
-        return stripped
+        return Self.applyPostprocessor(stripped, userVocabulary: userVocabulary)
         #endif
+    }
+
+    /// Apply the deterministic post-processor with the current user
+    /// vocabulary as proper-noun safelist. Centralizes the call so every
+    /// return path goes through the same cleanup.
+    nonisolated static func applyPostprocessor(_ text: String, userVocabulary: [String]?) -> String {
+        let userNouns: Set<String> = Set((userVocabulary ?? []).map { $0.lowercased() })
+        let options = PolishPostprocessor.Options(userProperNouns: userNouns)
+        let result = PolishPostprocessor.process(text, options: options)
+        if !result.changes.isEmpty {
+            let ruleNames = result.changes.map { $0.rule }.joined(separator: ",")
+            print("[VOICE-POST] post-processor applied: \(ruleNames)")
+        }
+        return result.cleaned
+    }
+
+    /// Count ⟦E…⟧ sentinels in a string. Used by the hallucination guard
+    /// to verify the LLM preserved all frozen entities (and didn't invent any).
+    private nonisolated func countSentinels(in s: String) -> Int {
+        guard let regex = try? NSRegularExpression(pattern: #"⟦E\d+⟧"#) else { return 0 }
+        let ns = s as NSString
+        return regex.numberOfMatches(in: s, range: NSRange(location: 0, length: ns.length))
+    }
+
+    /// Throttle for the cloud-fallback toast — at most one toast every 30s.
+    @MainActor private static var lastCloudFallbackToastAt: Date?
+
+    @MainActor
+    fileprivate static func maybePostCloudFallbackToast(reason: String) {
+        let now = Date()
+        if let last = lastCloudFallbackToastAt, now.timeIntervalSince(last) < 30 {
+            return
+        }
+        lastCloudFallbackToastAt = now
+        NotificationCenter.default.post(
+            name: .voiceCloudFellBackToLocal,
+            object: nil,
+            userInfo: ["reason": reason]
+        )
+    }
+
+    /// System prompt for the Cerebras cloud path. Uses the same comprehensive
+    /// `systemInstructions` as the local model — Qwen 235B is from the same
+    /// family as our local Qwen3-4B, so the same rule format applies, and
+    /// the bigger model can fully leverage all the rules + few-shot examples
+    /// without getting confused by them.
+    nonisolated static func buildCloudSystemPrompt(
+        cleanupLevel: String,
+        personalityStyle: String,
+        userVocabulary: [String]?
+    ) -> String {
+        // Full base instructions — same as local. Same rules, same examples.
+        var prompt = systemInstructions
+
+        // Per-call OVERRIDE block: cleanup level + personality.
+        prompt += "\n\n=== OVERRIDE: CLEANUP MODE (highest priority) ===\n"
+        prompt += Self.cleanupInstruction(cleanupLevel)
+
+        prompt += "\n\n=== OVERRIDE: PERSONALITY (highest priority) ===\n"
+        prompt += Self.personalityInstruction(personalityStyle)
+
+        // Known proper nouns (preserve casing). Top 60 prioritized terms.
+        if let vocab = userVocabulary, !vocab.isEmpty {
+            let top = vocab.prefix(60).joined(separator: ", ")
+            prompt += "\n\nKnown proper nouns (preserve EXACTLY as written, do not 'correct' them): \(top)."
+        }
+        // Bundled product names (always-on safelist).
+        prompt += "\n\nAlso preserve these product names verbatim: \(Self.knownProductNames.joined(separator: ", "))."
+
+        return prompt
     }
 
     #if canImport(MLXLLM) && canImport(MLXLMCommon)
@@ -1103,12 +1236,18 @@ final class Qwen3Polisher {
         let cleanedInput = text
         let wordCount = cleanedInput.split(separator: " ").count
 
-        // Short-utterance fast-path: under 8 words, the LLM cannot improve
-        // "I just had an idea." but it CAN break it (swap "just had" → "have",
-        // etc). Run TextFormatter only (capitalization + terminal punctuation)
-        // and return. Skips the LLM entirely.
-        if wordCount < 8 {
-            print("[VOICE-LP] short utterance fast-path, skipping LLM (wordCount=\(wordCount))")
+        // Short-utterance fast-path: under 4 words, the LLM truly can't help
+        // (and is more likely to mess it up than improve it). Above that,
+        // even short utterances get polished — "hey can u send maya a msg"
+        // should become "Hey, can you send Maya a message" instead of just
+        // the rule-based capitalization.
+        // BUGFIX: threshold raised from 4 to 6 words. Ultra-short messages (3-5 words)
+        // like "github slash repo slash readme" need LLM polish to convert "slash"→"/".
+        // The old 4-word floor was causing "slash" to stay literal in command-like
+        // short utterances. 6 words still skips polish for truly trivial messages
+        // ("ok" / "yeah" / "got it") while capturing path/URL commands.
+        if wordCount < 6 {
+            print("[VOICE-LP] ultra-short fast-path, skipping LLM (wordCount=\(wordCount))")
             let formatted = TextFormatter().format(cleanedInput)
             return formatted
         }
@@ -1186,8 +1325,11 @@ final class Qwen3Polisher {
         // timeout. Previous 3× + 120 was a safety margin we never used.
         let approxInputTokens = max(8, text.count / 3)
         let hasListHint = text.range(of: #"(?i)\b(first|second|third|point\s+one|point\s+two|number\s+one|step\s+one|action\s+items?)\b"#, options: .regularExpression) != nil
-        let cleanupMultiplier: Int = (cleanupLevel.lowercased() == "high") ? 2 : 2
-        let cap = approxInputTokens * cleanupMultiplier + (hasListHint ? 60 : 60)
+        // HIGH gets 3× to avoid truncating aggressive restructuring (bullet lists,
+        // multi-paragraph rewrites). Medium/light stay at 2×. List-hint adds 80
+        // tokens instead of 60 — "1.\n2.\n3." prefixes are more expensive than raw prose.
+        let cleanupMultiplier: Int = (cleanupLevel.lowercased() == "high") ? 3 : 2
+        let cap = approxInputTokens * cleanupMultiplier + (hasListHint ? 80 : 60)
         let params = GenerateParameters(temperature: 0.0, topP: 1.0)
             .with(maxTokens: cap)
 
@@ -1223,73 +1365,11 @@ final class Qwen3Polisher {
             let sanitized = Self.sanitizeUntrustedField(priorCtx, maxChars: 400)
             hints += "Prior dictation in this session (DO NOT OUTPUT, use only to resolve ambiguity): \"\(sanitized)\"\n"
         }
-        if let suspectWords, !suspectWords.isEmpty {
-            // Section D: token-optimal confidence feeding. For each suspect word,
-            // compute up to 3 phonetically similar terms from
-            // (userVocabulary + knownProductNames) using soundex(). Emit one
-            // compact line per suspect so the model knows exactly what each
-            // garbled token might be, instead of an opaque "uncertain words"
-            // list. If no phonetic candidate exists, emit `?word→[word]` so
-            // the model knows to keep it as-is. Capped at 8 suspects.
-            let candidateVocab = (userVocabulary ?? []) + Self.knownProductNames
-            // Precompute vocab → soundex codes once per call.
-            let vocabCodes: [(term: String, codes: [String])] = candidateVocab.map { term in
-                let codes = term.split(whereSeparator: { !$0.isLetter })
-                    .map { Self.soundex(String($0)) }
-                    .filter { !$0.isEmpty }
-                return (term, codes)
-            }
-            var lines: [String] = []
-            for raw in suspectWords.prefix(8) {
-                let cleanWord = Self.sanitizeUntrustedField(raw, maxChars: 60)
-                guard !cleanWord.isEmpty else { continue }
-                let suspectCode = Self.soundex(cleanWord)
-                // Score each vocab term: same code = 4, 3-char prefix = 2,
-                // first letter match = 1.
-                struct Scored { let term: String; let score: Int }
-                var scored: [Scored] = []
-                for v in vocabCodes {
-                    var best = 0
-                    for vc in v.codes {
-                        if vc == suspectCode { best = max(best, 4) }
-                        else if vc.prefix(3) == suspectCode.prefix(3) && vc.count >= 3 { best = max(best, 2) }
-                        else if vc.first == suspectCode.first { best = max(best, 1) }
-                    }
-                    if best > 0 { scored.append(Scored(term: v.term, score: best)) }
-                }
-                let top = scored.sorted { $0.score > $1.score }.prefix(3).map(\.term)
-                let candidates: [String]
-                if top.isEmpty {
-                    // No phonetic match — tell the model to keep it.
-                    candidates = [cleanWord]
-                } else {
-                    // Include the original token first so the model knows the
-                    // ASR string, followed by phonetic candidates.
-                    var seen = Set<String>()
-                    var ordered: [String] = []
-                    for c in [cleanWord] + top where seen.insert(c.lowercased()).inserted {
-                        ordered.append(c)
-                    }
-                    candidates = Array(ordered.prefix(3))
-                }
-                lines.append("?\(cleanWord)→[\(candidates.joined(separator: ", "))]")
-            }
-            if !lines.isEmpty {
-                hints += "Uncertain words (low ASR confidence. first is what was heard, brackets list phonetically similar canonical spellings, pick the right one or keep as-is):\n"
-                hints += lines.joined(separator: "\n") + "\n"
-                // Phase 11: mumble tolerance. When 3+ suspect tokens land in
-                // one dictation the speaker is almost certainly mumbling or
-                // speaking softly. Tell the model to prefer semantic
-                // coherence over verbatim preservation in that regime: if a
-                // candidate from the bracket list makes the sentence parse
-                // cleanly, swap it in even when the heard token is also a
-                // real word. Without this nudge the 1.7B tends to lock onto
-                // the original ASR string and produce parse-broken output.
-                if lines.count >= 3 {
-                    hints += "NOTE: This dictation has multiple low-confidence words. The speaker may be mumbling or speaking softly. Prioritize semantic coherence over verbatim preservation when a suspect word does not fit the sentence. If a candidate from the [alt1, alt2, alt3] list makes the sentence parse cleanly, prefer it.\n"
-                }
-            }
-        }
+        // Section D: token-optimal confidence feeding — phonetic alternatives
+        // for every low-confidence ASR token. Shared with the merge path via
+        // buildSuspectHints() so both paths emit the same ?word→[alt1, alt2]
+        // format. Capped at 8 suspects per call.
+        hints += Self.buildSuspectHints(suspectWords ?? [], userVocabulary: userVocabulary)
         if let userVocabulary, !userVocabulary.isEmpty {
             // Prioritize vocabulary terms that share letters/sounds with suspect words,
             // so the most relevant canonical spellings come first when the prompt is truncated.
@@ -1330,8 +1410,8 @@ final class Qwen3Polisher {
         // quoted message blocks. Applied per-call so it's always in scope
         // for long/complex dictations.
         var structureHint = """
-        If the input describes a list (e.g., "with X, Y, Z" or "save comments about X, Y, Z"), output as a bulleted list.
-        If it describes multiple distinct topics or steps, use paragraph breaks between topics.
+        Use bullets when the speaker enumerates 3+ short items (each 1-4 words) following a cue phrase like "I need", "I have to get", "I want", "make a list", "the list is", "things to do", "grocery list", or a colon. Example: "I have to get monster energy, sea salt spray, curry, and a phone" → bullet list with 4 items. Items in lists should each be a single short noun phrase. For 2 or fewer items, keep as inline prose.
+        PARAGRAPH BREAKS (important): If the output is longer than ~50 words, split into 2+ paragraphs at natural topic boundaries. Use a BLANK LINE (\n\n) between paragraphs. Topic boundary signals: change of subject, switch from describing to listing, switch from question to answer, "also", "anyway", "by the way", "okay so", "moving on", "let's say", "speaking of", or any moment the speaker pivots. Default to MORE breaks rather than fewer — a wall of text is the wrong output.
         If it mentions snake_case field names, code identifiers, URLs, file paths, passwords, or version numbers, wrap them in backticks.
         If it dictates a message to someone (e.g., "send Alex running late" or "text Mia saying..."), output the message body in quotation marks. Any qualifying instruction ("except maybe less formal") goes OUTSIDE the quote on its own line in parentheses.
         Email addresses, serial numbers, and tracking numbers MUST be in backticks: `admin-temp@northgate-help.net`, `A9-Q2-7B-44`, `Q479B662`.
@@ -1343,12 +1423,16 @@ final class Qwen3Polisher {
             MULTI-TOPIC: If the dictation covers 3+ independent topics signaled by "also", "and then", "oh and", separate them with a BLANK LINE between paragraphs. Do NOT use numbered lists or bullet points unless the speaker is enumerating discrete items (like a list of fields, a list of comments to save, a list of names). Use bullets ONLY for genuine list content.
 
             GENUINE LIST signals (use bullets):
-            - "fields should be X, Y, Z" (schema/struct fields)
-            - "save the comments about A, B, C" (explicit list-of-things)
-            - "the list of X is..." (explicit list)
+            - Schema/struct fields explicitly enumerated: "fields should be X, Y, Z"
+            - Explicit save/filter criteria: "save the comments about A, B, C"
+            - Speaker says "the list is..." or "bullet point X, bullet point Y"
+            - Shopping/grocery/to-do enumeration with 3+ short items: "I need monster energy, sea salt spray, curry, and a phone" → bullet list with 4 items, each on its own line
+            - Cue phrases: "I have to get", "I need", "things to do", "make a list", "grocery list"
 
-            NOT GENUINE LIST (use paragraphs):
-            - Multiple unrelated topics, even if speaker says "also" or "and then"
+            NOT GENUINE LIST (use prose):
+            - 2 or fewer items: "I need milk and eggs" → stays prose
+            - Long items (5+ words each) — keep as prose flow
+            - Multiple unrelated topics (use paragraph breaks, not bullets)
             - Self-corrections, sub-clauses, asides
             - Causal explanations ("because X, then Y")
 
@@ -1356,7 +1440,16 @@ final class Qwen3Polisher {
         }
         if hasSchemaSignal {
             structureHint += """
-            SCHEMA: The speaker is dictating a database table or struct definition. Format the field list as a BULLET LIST with each field name in backticks on its own line. "X underscore Y" \u{2192} `x_y`. Any "except / unless" caveat after the field list goes as a SEPARATE PROSE PARAGRAPH (not a bullet). Example:
+            SCHEMA: The speaker is dictating a database table or struct definition. Convert spoken field names to snake_case wrapped in backticks. Format rules:
+            - 8 or fewer fields → INLINE comma-separated list after a colon. Space-separated words → snake_case: "user id" → `user_id`, "created at" → `created_at`, "last login at" → `last_login_at`.
+            - 9 or more fields → BULLET LIST, one field per line.
+            - Any "except/unless/where" caveat stays as prose (not a bullet).
+            - "X underscore Y" \u{2192} `x_y` (spoken underscore → snake_case separator).
+            SHORT LIST EXAMPLE (≤8 fields, inline):
+            "create users table user id email password hash created at updated at last login at where deleted is null"
+            \u{2192}
+            Create users table: `user_id`, `email`, `password_hash`, `created_at`, `updated_at`, `last_login_at` where `deleted` is null.
+            LONG LIST EXAMPLE (9+ fields, bullets):
             "make invoices table invoice underscore id customer underscore id subtotal tax total paid underscore at status except refunded invoices keep original totals"
             \u{2192}
             Make table `invoices`. Fields:
@@ -1478,12 +1571,87 @@ final class Qwen3Polisher {
     /no_think
     You are a speech-to-text formatter. Fix ASR errors and convert spoken commands to formatted text. Output ONLY the corrected text.
 
+    == FEW-SHOT EXAMPLES (the kind of output we want) ==
+    These show the target style on hard cases. Match this register: clean prose, paragraph breaks at topic shifts, bullet lists when the speaker enumerates short items, no filler words.
+
+    Example 1 (long rant with filler + list):
+    Input: "okay so wispr flow versus voice which one is actually better i'm using a microphone which probably should already help a lot i do very much like the app but i've built it it's just not really there i hope it is there but like yeah let's say you can do my email michael at gmail dot com or make a little grocery list like i have to get monster energy sea salt spray curry and a phone"
+    Output: "Wispr Flow versus Voice. Which one is actually better? I'm using a microphone, which probably should already help a lot. I do very much like the app, but I've built it; it's just not really there. I hope it is there.
+
+    Let's say you can do my email, michael@gmail.com. Or make a little grocery list, like I have to get:
+    - Monster Energy
+    - sea salt spray
+    - curry
+    - a phone"
+
+    Example 2 (short message, light cleanup):
+    Input: "hey can u send maya a msg saying we're running a bit late"
+    Output: "Hey, can you send Maya a message saying we're running a bit late?"
+
+    Example 3 (technical with numbers + units):
+    Input: "the model is around four billion parameters and inference takes like five hundred milliseconds on the laptop"
+    Output: "The model is around 4B parameters and inference takes about 500ms on the laptop."
+
+    Example 4 (correction collapse):
+    Input: "remind me to buy milk no wait eggs no actually both milk and eggs no scratch that i just need bread and butter for tomorrow"
+    Output: "Remind me to buy bread and butter for tomorrow."
+
+    Example 5 (paragraph break at topic shift):
+    Input: "the deploy went fine today no issues with the database migration also we should probably bump the cache TTL it's been stale on the staging environment"
+    Output: "The deploy went fine today, no issues with the database migration.
+
+    Also, we should probably bump the cache TTL. It's been stale on the staging environment."
+
+    Example 6 (file paths and extensions):
+    Input: "open the readme dot md in the project folder then save the output to downloads slash report dot pdf"
+    Output: "Open the `readme.md` in the project folder, then save the output to `Downloads/report.pdf`."
+
+    Example 7 (quotation handling):
+    Input: "she said quote we're shipping on friday end quote and i told her quote okay sounds good end quote"
+    Output: "She said, "We're shipping on Friday," and I told her, "Okay, sounds good.""
+
+    Example 8 (units and measurements):
+    Input: "the laptop has thirty two gigs of ram a two terabyte ssd and runs at three point five gigahertz the battery lasts about twelve hours"
+    Output: "The laptop has 32 GB of RAM, a 2 TB SSD, and runs at 3.5 GHz. The battery lasts about 12h."
+
+    Example 9 (currency and percentages):
+    Input: "revenue was up twenty three percent year over year hitting forty two point eight million in q three"
+    Output: "Revenue was up 23% year over year, hitting $42.8M in Q3."
+
+    Example 10 (date and time):
+    Input: "let's meet on march fifteenth at five thirty PM the deadline is march thirty first twenty twenty six"
+    Output: "Let's meet on March 15 at 5:30 PM. The deadline is March 31, 2026."
+
+    == ABSOLUTE RULE: FROZEN TOKENS (highest priority, overrides everything) ==
+    Tokens of the form ⟦E0⟧ ⟦E1⟧ ⟦E2⟧ ⟦E3⟧ etc. (with mathematical white square brackets) are FROZEN. They represent emails, URLs, code, file paths, domains, and contractions that have been protected from polishing. RULES:
+    1. Copy them VERBATIM to your output, character for character.
+    2. Do NOT translate, split, capitalize, lowercase, punctuate, or modify them in any way.
+    3. Do NOT insert a period, comma, or space INSIDE a frozen token.
+    4. Treat each frozen token as a single opaque word — punctuation around it is fine, punctuation INSIDE it is forbidden.
+    5. Do NOT invent new ⟦E…⟧ tokens that weren't in the input.
+    These tokens will be expanded back to real content after your output is produced; if you damage them, the result is broken.
+
     == ABSOLUTE RULE: NO DASHES (highest priority, overrides all other formatting instructions) ==
-    NEVER use em-dashes (\u{2014}) or en-dashes (\u{2013}) in your output. Use periods, commas, or parentheses instead. Convert any em-dash in the source to a period or comma. This rule is absolute and overrides all other formatting instructions.
-    EM-DASH PARENTHETICAL CONVERSION: when the source has "X — clarification — rest of sentence", convert to "X (clarification) rest of sentence":
-    - "$400 — four hundred before tax not after — then..." \u{2192} "$400 (before tax, not after), then..."
-    - "june 30th — or maybe june thirtieth twenty-twenty-six — but..." \u{2192} "June 30, 2026, but..."
-    The em-dash pair wraps a clarification; the natural replacement is parentheses or a comma phrase.
+    NEVER use em-dashes (\u{2014}), en-dashes (\u{2013}), or horizontal bars (\u{2015}/\u{2012}) in your output. UNDER ANY CIRCUMSTANCES. They are BANNED. Use a comma for an aside, a period for a sentence break, or restructure the sentence. NEVER use a dash to add dramatic emphasis. NEVER use a dash to connect clauses.
+
+    Wrong: "I'm tired — I've been working all day."
+    Right: "I'm tired. I've been working all day."
+
+    Wrong: "The model — which I just installed — is fast."
+    Right: "The model, which I just installed, is fast."
+
+    Wrong: "$400 — before tax — then..."
+    Right: "$400 (before tax), then..."
+
+    If you find yourself reaching for an em-dash, USE A COMMA. If a comma feels weak, USE A PERIOD. The dash is never the right answer. This rule is absolute and overrides everything else.
+
+    == NUMBER FORMATTING (US English) ==
+    Use US English number conventions:
+    - Comma as thousands separator: 2,300 (not 2.300)
+    - Period as decimal point: 2.50 (not 2,50)
+    - Currency formatting: $2,300 / €2,300 / £2,300 (NEVER €2.300 — that's European decimal style which Americans misread as 2.3)
+    - "twenty three hundred euros" → "€2,300"
+    - "two point five thousand" → "2,500" or "2.5K" depending on context
 
     == PRESERVE THE SPEAKER'S WORDS (READ FIRST, OVERRIDES EVERYTHING BELOW EXCEPT THE NO DASHES RULE) ==
     DEFAULT IS DO NOTHING. Your job is punctuation, capitalization, paragraph structure, and obvious-error fixes. NOT rewriting.
@@ -1504,7 +1672,7 @@ final class Qwen3Polisher {
     If unsure whether to change a word: DON'T.
 
     == SPOKEN PUNCTUATION (convert when spoken as commands, not as part of a sentence) ==
-    "period"/"full stop"\u{2192}. "comma"\u{2192}, "question mark"\u{2192}? "exclamation point"/"exclamation mark"/"bang"\u{2192}! "colon"\u{2192}: "semicolon"\u{2192}; "dash"/"hyphen"\u{2192}- "em dash"\u{2192}\u{2014} "ellipsis"/"dot dot dot"\u{2192}\u{2026} "open paren"/"close paren"\u{2192}() "open bracket"/"close bracket"\u{2192}[] "open brace"/"close brace"\u{2192}{} "open quote"/"close quote"/"quote unquote"\u{2192}\u{201C}\u{201D} "apostrophe"\u{2192}' "ampersand"\u{2192}& "at sign"/"at symbol"\u{2192}@ "hashtag"/"hash"/"pound sign"\u{2192}# "dollar sign"\u{2192}$ "percent sign"\u{2192}% "asterisk"/"star"\u{2192}* "underscore"\u{2192}_ "slash"/"forward slash"\u{2192}/ "backslash"\u{2192}\\ "pipe"\u{2192}| "tilde"\u{2192}~ "equals"/"equals sign"\u{2192}= "plus"/"plus sign"\u{2192}+ "less than"\u{2192}< "greater than"\u{2192}>
+    "period"/"full stop"\u{2192}. "comma"\u{2192}, "question mark"\u{2192}? "exclamation point"/"exclamation mark"/"bang"\u{2192}! "colon"\u{2192}: "semicolon"\u{2192}; "dash"/"hyphen"\u{2192}- "em dash"\u{2192}, (em-dashes are BANNED; convert spoken "em dash" to a comma instead) "ellipsis"/"dot dot dot"\u{2192}\u{2026} "open paren"/"close paren"\u{2192}() "open bracket"/"close bracket"\u{2192}[] "open brace"/"close brace"\u{2192}{} "open quote"/"close quote"/"quote unquote"\u{2192}\u{201C}\u{201D} "apostrophe"\u{2192}' "ampersand"\u{2192}& "at sign"/"at symbol"\u{2192}@ "hashtag"/"hash"/"pound sign"\u{2192}# "dollar sign"\u{2192}$ "percent sign"\u{2192}% "asterisk"/"star"\u{2192}* "underscore"\u{2192}_ "slash"/"forward slash"\u{2192}/ "backslash"\u{2192}\\ "pipe"\u{2192}| "tilde"\u{2192}~ "equals"/"equals sign"\u{2192}= "plus"/"plus sign"\u{2192}+ "less than"\u{2192}< "greater than"\u{2192}>
 
     == STRUCTURE & PARAGRAPH BREAKS ==
     "new line"/"next line"/"line break"\u{2192}insert \n. "new paragraph"/"next paragraph"\u{2192}insert \n\n. Clear topic shift\u{2192}paragraph break.
@@ -1600,12 +1768,16 @@ final class Qwen3Polisher {
     Rule: when a clause is restarted within 8 words and the second attempt covers the same idea, drop the first attempt without exception.
 
     HEDGE vs CORRECTION (do not confuse these):
-    - HEDGING markers ("maybe", "actually", "or", "kind of") signal the speaker is ranging or refining, NOT contradicting. KEEP BOTH options.
-      - "supposed to start at 7:30, actually maybe 8" \u{2192} "supposed to start at 7:30, actually maybe 8" (HEDGE, keep both)
+    - HEDGING markers ("maybe", "or", "kind of") signal the speaker is ranging or refining, NOT contradicting. KEEP BOTH options.
+      - "supposed to start at 7:30, actually maybe 8" \u{2192} "supposed to start at 7:30, actually maybe 8" (HEDGE — "maybe" present, keep both)
       - "june 30th, or maybe june thirtieth twenty-twenty-six" \u{2192} "June 30, 2026" (CLARIFICATION, keep the more specific)
-    - CORRECTION markers ("no wait", "I mean", "scratch that") signal the speaker is overriding. KEEP ONLY the final attempt.
+    - CORRECTION markers ("no wait", "I mean", "scratch that", "no actually") signal the speaker is overriding. KEEP ONLY the final attempt.
       - "right side somehow, no wait left" \u{2192} "the left side" (CORRECTION, drop right)
       - "or maybe right side? no wait left" \u{2192} "the left side" (CORRECTION via process of elimination)
+    - NUMBER/TIME CORRECTION: "actually" between two numbers or times is ALWAYS a correction, not a hedge — the second value wins.
+      - "three thirty actually four" \u{2192} "4" (CORRECTION — first time abandoned, keep "four")
+      - "twenty percent actually thirty" \u{2192} "30%" (CORRECTION — first number abandoned)
+      - Contrast: "7:30, actually maybe 8" \u{2192} HEDGE because "maybe" is present alongside "actually"
 
     GENUINE TWO-OPTION UNCERTAINTY — keep both when the speaker doesn't resolve:
     - "6:15 a.m. or 6:50" (flight time, speaker doesn't know which) \u{2192} "6:15 a.m. or 6:50" (keep both, the speaker is genuinely uncertain)
@@ -1649,6 +1821,7 @@ final class Qwen3Polisher {
 
     == FILLERS (EXPANDED) ==
     Remove ALL of the following at sentence start and mid-sentence when used as pure hesitation/padding:
+    Body noise / interruptions: "[cough]", "[clears throat]", "[sniff]", "[laugh]", "haha", "*cough*", "*laugh*". Also remove apologetic follow-ups like "sorry" or "excuse me" that directly follow a cough or throat-clear with no other content.
     Hesitation sounds: um, uh, umm, uhh, er, hmm.
     Padding phrases (remove when meaningless): "so basically", "like basically", "I mean like", "you know what I mean", "right so", "okay so", "yeah so", "so like", "like so", "I guess", "sort of like", "kind of like", "let's see", "what was I saying", "where was I".
     Discourse markers (remove at sentence START only): "so", "well", "right", "alright", "anyway", "anyways" \u{2014} ONLY when they start a clause with no content value. Keep mid-sentence when they carry meaning ("it went well", "do it right", "well-designed").
@@ -1902,7 +2075,7 @@ final class Qwen3Polisher {
     - Change formats already in digit form (3pm stays 3pm)
     - Expand contractions
     - Pad short utterances
-    - Rephrase or restructure
+    - Paraphrase or summarize for stylistic flourish (NOTE: HIGH cleanup mode may explicitly authorize sentence-boundary cleanup, paragraph breaks at topic shifts, and disfluency-cluster collapse via the OVERRIDE block — those are not paraphrasing)
     - Remove "I think", "maybe", "probably", "I'm not sure" or other uncertainty markers
     - Formalize casual speech ("gonna"\u{2192}"going to", "wanna"\u{2192}"want to")
     - Invent paragraph breaks where the speaker continued their thought
@@ -1929,6 +2102,22 @@ final class Qwen3Polisher {
     2. Second item.
     3. Third item.
     Each item gets its own line with "N. " prefix. NEVER use a bare "-" with prose for an enumeration. NEVER collapse enumerated items into one paragraph. If items are short and parallel (parallel structure, repeated phrasing), trust that it's a list.
+
+    EXPLICIT ITEM ENUMERATION (4+ short parallel items, HIGH cleanup): when the speaker pauses or says "comma" between 4+ short noun-phrase items, each 1-3 words, with similar grammatical structure (no verb in any item, no full sentence between them), format as a bulleted Markdown list (one "- " per line). Heuristic: 4+ comma-separated items, each ≤3 words, no verb in any item → bulleted list. Applies even WITHOUT explicit "first/second/third" markers.
+    Example:
+    Input: "ROAS, LTV, Slack, Spotify, System Settings, macOS Tahoe, 14 degrees Celsius, 100%, 1.5K, 321"
+    Output:
+    - ROAS
+    - LTV
+    - Slack
+    - Spotify
+    - System Settings
+    - macOS Tahoe
+    - 14 degrees Celsius
+    - 100%
+    - 1.5K
+    - 321
+    DO NOT trigger this for grocery/shopping list items spoken as casual prose (handled by the prose-stays-prose rule). DO NOT trigger when items contain verbs or form full clauses.
 
     If text is already correct: output UNCHANGED.
 
@@ -2249,16 +2438,16 @@ final class Qwen3Polisher {
 
         switch style?.lowercased() {
         case "neutral", nil:
-            return "Style: NEUTRAL. Match the speaker's register exactly. Preserve word choices, tone, contractions. Do not formalize or casualize. Read like a careful human transcription, not an assistant rewrite." + antiAI + absoluteTail
+            return "Style: NEUTRAL. Copy the speaker's register exactly — same word choices, same contractions, same energy. Fix errors silently. Do not formalize, casualize, or editorialize. Output reads like the speaker typed it themselves. Preserve `!` exclamation marks when the speaker's energy clearly warranted them in the raw input (e.g., \"Ew!\", \"It's annoying!\")." + antiAI + absoluteTail
 
         case "formal":
-            return "Style: FORMAL. Default to professional email or document register: expand contractions ('don't' to 'do not'), drop slang ('yeah' to 'yes', 'gonna' to 'going to'), full sentences. CONTEXT CHECK: if the content is clearly a quick personal note (text to a friend, casual reminder), keep essential character, formality is the goal but not at the cost of sounding robotic." + antiAI + absoluteTail
+            return "Style: FORMAL. Professional register throughout. Expand every contraction (don't→do not, I'm→I am, we'll→we will). Replace slang (yeah→yes, gonna→going to, wanna→want to, kinda→rather). Full grammatical sentences. No exclamation marks unless quoting someone. If content is clearly a casual text to a friend, keep full sentences but drop the stiffest formality." + antiAI + absoluteTail
 
         case "casual":
-            return "Style: CASUAL. Keep the speaker's natural voice. Preserve contractions and slang they used ('yo', 'yeah', 'gonna', 'kinda'). Short rhythmic clauses are fine. Do not capitalize compulsively. CONTEXT CHECK: if the content is serious or professional (time off, a concern, bad news), keep casual rhythm but drop street slang ('yo' to 'hey', drop 'lit'/'fire'/'sus'). Voice stays consistent, register adapts." + antiAI + absoluteTail
+            return "Style: CASUAL. Keep the speaker's raw voice. Preserve their contractions, slang, short sentences. 'yo', 'yeah', 'gonna', 'kinda', 'tbh', 'ngl' are fine — keep them if the speaker used them. Short punchy clauses over long compound ones. Drop 'um/uh' but keep the rhythm. If content is serious (medical, professional, bad news), soften slang ('yo'→'hey') but keep the casual structure." + antiAI + absoluteTail
 
         case "excited":
-            return "Style: EXCITED. Punchy energy when the topic supports it. Keep contractions, word choices alive. CONTEXT CHECK (critical): if content is somber, factual, sad, medical, or emotionally heavy (hospital, layoff, funeral, bug report), dial excitement all the way down: no exclamation marks, no amplification. Only amplify on good news, plans, ideas, achievements, launches, wins. Never fabricate energy." + antiAI + absoluteTail
+            return "Style: EXCITED. Bring energy to good news, plans, ideas, wins. Punchy sentences. Keep exclamation marks where they fit. HARD STOP: if content is somber, factual, medical, or emotionally heavy — no exclamation marks, no amplification, flat professional tone. Never fake excitement. Never add energy that wasn't in the source." + antiAI + absoluteTail
 
         default:
             return "Style: NEUTRAL. Match the speaker's register exactly." + antiAI + absoluteTail
@@ -2280,25 +2469,57 @@ final class Qwen3Polisher {
 
         case "high":
             return """
-            Cleanup mode: HIGH (aggressive rewrite).
-            You are EXPECTED to:
-            - Restructure run-on sentences into clean, separate sentences
-            - Replace weak word choices with sharper alternatives
-            - Fix grammar drift mid-sentence
-            - Drop filler clauses entirely if they add no content
-            - Reorder clauses for clarity
-            You MUST NOT:
-            - Add new factual claims
-            - Change the speaker's intent or opinion
-            - Add information not in the source
-            - Use em-dashes or en-dashes (use periods or commas)
-            Preserve all numbers, names, URLs, emails, and quoted phrases verbatim.
-            Output should be measurably shorter and clearer than the input.
+            Cleanup mode: HIGH (deep rewrite, prose-grade output).
+            Target: reads like the speaker wrote it down deliberately, not dictated.
+
+            REQUIRED transformations:
+            - OPENER FILLERS: Strip ONLY these exact discourse openers at the very start: "okay so", "okay hey", "hey so", "alright so", "so basically", "i mean", "you know". Do NOT strip "I think", "I want", "I need", "We should", "maybe", "probably" — those are content. Example: "okay hey i mean send john a message" → "Send John a message." NEVER: "i think we should push the deadline" → keep as is (not an opener, it's the content).
+            - CHAINED SELF-CORRECTIONS: Follow the ENTIRE correction chain to the final intent. Each "no wait", "no actually", "no he knows", "scratch that", "never mind", "forget that", "I meant", "actually" replaces everything before it ONLY WHEN it is a clear restatement, not mere doubt. The LAST thing the speaker says is the ONLY thing that counts — ALL prior attempts are discarded completely. EXAMPLE: "send maya a message no wait actually message john saying we're running late no he already knows say we're already at the restaurant" → "Send John a message saying we're already at the restaurant." (three layers, only final kept). EXAMPLE: "call sarah no wait email sarah no actually slack sarah" → "Slack Sarah." EXAMPLE: "remind me to buy milk no wait eggs no actually both milk and eggs no scratch that i just need to buy bread and butter for tomorrow morning" → "Remind me to buy bread and butter for tomorrow morning." (four layers — 'scratch that' resets to bread and butter, ALL earlier items gone). CRITICAL: even if an intermediate step adds something ("both milk and eggs"), a subsequent "scratch that" or "no" wipes the entire slate clean and ONLY the final intent survives.
+              CRITICAL EXCEPTION — UNCERTAINTY LANGUAGE IS NOT A CORRECTION: "I'm not sure", "I think", "maybe", "probably", "I'm not confident" express doubt — they do NOT override or erase the statement they follow. "push the deadline, I'm not sure" → "push the deadline. I'm not sure." (BOTH preserved, not collapsed to either one). "we should go left, I think" → "We should go left, I think." NEVER strip uncertainty markers.
+            - NUMBER CORRECTIONS: When the speaker gives a number/quantity then corrects it with "actually", "no wait", "no", or "I mean" + a DIFFERENT number, ALWAYS collapse to the final value. The second number wins. Apply to inline corrections too — not just at clause boundaries.
+              Examples: "three thirty actually four" → "4". "eighty kilos no wait seventy five" → "75 kg". "four hundred milligrams no six hundred milligrams" → "600mg". "two thousand four hundred no two thousand three hundred and fifty" → "$2,350". "at eighty, no wait seventy-five" → "75". "fourteen percent no twelve point five percent" → "12.5%". "sixty no sixty-five kilos" → "65 kg". Drop the abandoned value entirely — do not keep both or write "X to Y".
+            - NUMERIC FORMATTING: Convert ALL spoken numbers to digits. This includes workout stats, currency, measurements, counts, percentages. "four sets of eight" → "4 sets of 8". "seventy-five kilos" → "75 kg". "thirty three point five million" → "$33.5 million". "eight hundred k" → "$800K". "twelve thousand" → "12,000". "one thirty to one forty-five" → "130–145". Never leave a measurement or quantity as a spelled-out word when it could be a digit.
+            - TECHNICAL IDENTIFIERS (URL/EMAIL/PATH RECONSTRUCTION): When the speaker spells out a URL, email address, or file path verbally, reconstruct the proper format. Signals: "slash slash"→"//", "colon slash slash"→"://", "dot" between domain parts→".", "at" between username and domain→"@", "underscore" in identifiers→"_", "dash"→"-". Examples: "postgres slash slash admin at db dot staging dot example dot com slash myapp underscore staging" → "postgres://admin@db.staging.example.com/myapp_staging". "admin at example dot com" → "admin@example.com". "https colon slash slash api dot example dot com slash v two" → "https://api.example.com/v2". Output each reconstructed identifier in backticks.
+            - LIST RECOGNITION: When the speaker enumerates items in two or more categories (e.g. groceries then errands, pros then cons, work items then personal items), format as labeled bullet lists with each category as a plain label ("Groceries:" not "**Groceries:**"). Within each bullet, collapse any corrections ("milk no wait oat milk" → "oat milk"). Each item is a single clean bullet — no correction markers, no "no wait" visible in the output.
+            - PARAGRAPHS: Insert a blank line between every topic shift. Topic markers include "but at some point", "and also", "one more thing", "anyway", "speaking of", "on a related note", or any pivot to a new subject. Each paragraph is one coherent thought. Typical multi-topic dictation produces 3-5 paragraphs.
+            - STUTTERS & ABANDONED RESTARTS: Collapse all restarts and false starts. "I need to pick up d the dro I need to pick up the" becomes "I need to pick up the". Drop abandoned word fragments entirely. If the speaker re-states a clause, keep only the final attempt.
+            - DISFLUENCY CLUSTERS: Collapse repeated/uncertain spans into the final intent. "it's already up? Yeah? Already yeah it's already past that" becomes "it's already past that". Pick the speaker's last clear formulation.
+            - TENSE CONSISTENCY: If the speaker is narrating past events ("I woke up", "I forgot"), keep the entire narrative in past tense. Fix accidental tense drift ("I just make coffee" becomes "I just made coffee").
+            - SENTENCE BOUNDARIES: Break run-ons at natural clause boundaries. No sentence should exceed ~25 words unless inside a quote. Two independent clauses joined by ZERO punctuation MUST receive a period or comma between them. Example: "like some clipping happening we probably have to fix that" → "like some clipping happening. We probably have to fix that." "X happening we probably" → "X happening. We probably".
+            - WEAK CONNECTORS: Replace dangling "and"/"so"/"like" between independent clauses with proper punctuation (period, comma, or paragraph break).
+            - COMPOUND WORDS: "cam site" becomes "campsite", "noise cancelling" becomes "noise-cancelling".
+            - PROPER NOUNS: Capitalize names, places, months, days, brands (Jake, August, Monday, Apple).
+            - SCHEMA FIELDS: When the speaker says "create/make [a] table/schema X [with fields] field1 field2 field3", format each spoken field name as a snake_case identifier wrapped in backticks, listed inline comma-separated after a colon. "create users table user id email password hash created at" → "Create users table: `user_id`, `email`, `password_hash`, `created_at`". Words become snake_case: "user id" → `user_id`, "created at" → `created_at`, "last login at" → `last_login_at`. This overrides word-preservation for field names in schema context.
+            - QUARTER ABBREVIATIONS: "q one" → "Q1", "q two" → "Q2", "q three" → "Q3", "q four" → "Q4".
+
+            PROHIBITED:
+            - Adding factual claims, opinions, or information not in the source
+            - Changing the speaker's intent, conclusion, or emotional register
+            - Paraphrasing or summarizing — every concrete detail and qualifier must survive
+            - Em-dashes or en-dashes (use periods, commas, or paragraph breaks)
+            - Emojis or decorative punctuation
+            - Bullet points unless the speaker is explicitly enumerating discrete items
+
+            Preserve verbatim: numbers, names, URLs, emails, quoted phrases.
+            Output is measurably tighter than the input, but every meaningful clause survives.
             """
 
         default:
-            // "medium" / nil / unrecognized → standard medium polish.
-            return "Cleanup mode: MEDIUM. Strip fillers, normalize capitalization and punctuation, fix obvious grammar errors, fix proper nouns and homophones. Do not restructure sentences."
+            // "medium" / nil / unrecognized → moderate cleanup with light restructuring.
+            return """
+            Cleanup mode: MEDIUM.
+            REQUIRED:
+            - Strip fillers (um, uh, like, you know) at clause boundaries
+            - Normalize capitalization and punctuation
+            - Fix obvious grammar errors, proper nouns, and homophones from context
+            - Break run-on sentences into separate sentences
+            - Drop filler clauses that add no content
+            PROHIBITED:
+            - Adding factual claims or changing speaker intent
+            - Em-dashes or en-dashes (use periods or commas)
+            - Paraphrasing — every meaningful clause survives
+            Output is cleaner than the input but preserves the speaker's voice and rhythm.
+            """
         }
     }
 
@@ -2724,7 +2945,7 @@ final class Qwen3Polisher {
         switch cleanupLevel?.lowercased() {
         case "none":   basePct = 5
         case "light":  basePct = 15
-        case "high":   basePct = 60
+        case "high":   basePct = 75  // aggressive correction-chain collapsing can cut text by 70%+
         default:       basePct = 35  // medium or nil — preserves previous behavior
         }
         let baseThreshold = max(original.count * basePct / 100, 10)
@@ -2949,6 +3170,51 @@ final class Qwen3Polisher {
         }
 
         return cleaned
+    }
+
+    // MARK: - Confidence hint builder (shared by polish and merge paths)
+
+    /// Build the `?word→[alt1, alt2, alt3]` confidence block from a list of
+    /// low-confidence ASR tokens. Called by both `polishWithMLX` and the merge
+    /// path so both use the same phonetic-alternatives format.
+    nonisolated static func buildSuspectHints(_ suspects: [String], userVocabulary: [String]?) -> String {
+        guard !suspects.isEmpty else { return "" }
+        let candidateVocab = (userVocabulary ?? []) + Self.knownProductNames
+        let vocabCodes: [(term: String, codes: [String])] = candidateVocab.map { term in
+            let codes = term.split(whereSeparator: { !$0.isLetter })
+                .map { Self.soundex(String($0)) }
+                .filter { !$0.isEmpty }
+            return (term, codes)
+        }
+        struct Scored { let term: String; let score: Int }
+        var lines: [String] = []
+        for raw in suspects.prefix(8) {
+            let cleanWord = Self.sanitizeUntrustedField(raw, maxChars: 60)
+            guard !cleanWord.isEmpty else { continue }
+            let suspectCode = Self.soundex(cleanWord)
+            var scored: [Scored] = []
+            for v in vocabCodes {
+                var best = 0
+                for vc in v.codes {
+                    if vc == suspectCode { best = max(best, 4) }
+                    else if vc.prefix(3) == suspectCode.prefix(3) && vc.count >= 3 { best = max(best, 2) }
+                    else if vc.first == suspectCode.first { best = max(best, 1) }
+                }
+                if best > 0 { scored.append(Scored(term: v.term, score: best)) }
+            }
+            let top = scored.sorted { $0.score > $1.score }.prefix(3).map(\.term)
+            var seen = Set<String>()
+            var ordered: [String] = []
+            for c in ([cleanWord] + top) where seen.insert(c.lowercased()).inserted { ordered.append(c) }
+            lines.append("?\(cleanWord)→[\(Array(ordered.prefix(3)).joined(separator: ", "))]")
+        }
+        guard !lines.isEmpty else { return "" }
+        var out = "Uncertain words (low ASR confidence. first is what was heard, brackets list phonetically similar canonical spellings, pick the right one or keep as-is):\n"
+        out += lines.joined(separator: "\n") + "\n"
+        if lines.count >= 3 {
+            out += "NOTE: This dictation has multiple low-confidence words. The speaker may be mumbling or speaking softly. Prioritize semantic coherence over verbatim preservation when a suspect word does not fit the sentence. If a candidate from the [alt1, alt2, alt3] list makes the sentence parse cleanly, prefer it.\n"
+        }
+        return out
     }
 }
 

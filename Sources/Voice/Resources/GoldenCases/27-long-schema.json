@@ -1,0 +1,9 @@
+{
+  "id": "long-schema",
+  "title": "Long schema dictation — 10 fields → bullet list, with constraint",
+  "categories": ["schema"],
+  "raw": "create orders table order id customer id product id quantity unit price total price discount code payment method shipping address created at updated at fulfilled at where cancelled orders should keep the original total for reporting",
+  "reference": "Create orders table. Fields:\n- `order_id`\n- `customer_id`\n- `product_id`\n- `quantity`\n- `unit_price`\n- `total_price`\n- `discount_code`\n- `payment_method`\n- `shipping_address`\n- `created_at`\n- `updated_at`\n- `fulfilled_at`\n\nCancelled orders should keep the original total for reporting.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

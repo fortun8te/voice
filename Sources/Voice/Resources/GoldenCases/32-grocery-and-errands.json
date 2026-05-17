@@ -1,0 +1,9 @@
+{
+  "id": "grocery-and-errands",
+  "title": "Grocery list + errand list merged — multiple lists, corrections",
+  "categories": ["lists", "self-correction", "everyday"],
+  "raw": "okay so i need to remember a few things for today uh groceries first i need milk no wait oat milk the one from oatly not the barista edition uh eggs like a dozen or maybe two dozen if they have the good ones from that farm brand and uh bread sourdough specifically not the sliced one the whole loaf and then uh avocados like four of them and some limes and also cilantro and actually get two bunches because i always run out and then for errands i need to pick up the dry cleaning on fifth no wait it moved to ninth avenue and uh drop off the amazon return the label is already in the box and i need to go to the post office to mail that thing to grandma and also i should stop by the pharmacy to pick up the prescription for mom it should be ready by noon and one more thing i need to get cash from the atm like two hundred dollars because the farmer's market only takes cash",
+  "reference": "Groceries:\n- Oat milk (Oatly, not barista edition)\n- Eggs — 1 or 2 dozen if they have the good farm brand\n- Sourdough bread (whole loaf, not sliced)\n- 4 avocados\n- Limes\n- Cilantro (2 bunches)\n\nErrands:\n- Dry cleaning on Ninth Avenue (moved from Fifth)\n- Drop off Amazon return (label is already in the box)\n- Post office — mail the package to grandma\n- Pharmacy — pick up mom's prescription, should be ready by noon\n- ATM — $200 cash for the farmer's market",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

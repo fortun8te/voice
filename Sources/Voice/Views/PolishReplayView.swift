@@ -393,32 +393,36 @@ struct PolishReplayView: View {
     // when a case loads, and on a NotificationCenter ping from the live
     // dictation path (see `.tripleASRCaptured` in VoiceApp).
     @State private var tripleASR: TripleASRCapture? = nil
-    @State private var showTripleASRPanel: Bool = true
+    @State private var showTripleASRPanel: Bool = false
+
+    @State private var caseSearch: String = ""
+    @State private var caseResults: [String: Double] = [:]
+    @State private var showTripleASRSection: Bool = false
+
+    private var filteredCases: [GoldenCase] {
+        guard !caseSearch.isEmpty else { return cases }
+        let q = caseSearch.lowercased()
+        return cases.filter {
+            $0.id.lowercased().contains(q) ||
+            $0.title.lowercased().contains(q) ||
+            $0.categories.joined(separator: " ").lowercased().contains(q)
+        }
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-
-            Divider()
-
-            controlsBar
-
-            Divider()
-
-            HStack(spacing: 0) {
-                pane(title: "Raw input", editable: true)
+        NavigationSplitView {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
+        } detail: {
+            VStack(spacing: 0) {
+                header
                 Divider()
-                pane(title: "Polished output", editable: false)
+                controlsBar
                 Divider()
-                pane(title: "Reference", editable: false)
-                if showTripleASRPanel {
-                    Divider()
-                    tripleASRPanel
-                        .frame(minWidth: 320, idealWidth: 360, maxWidth: 420)
-                }
+                mainPanes
             }
         }
-        .frame(minWidth: showTripleASRPanel ? 1420 : 1100, minHeight: 700)
+        .frame(minWidth: 820, minHeight: 560)
         .onAppear {
             cases = GoldenCaseLoader.loadAll()
             if selectedCaseID == nil, let first = cases.first {
@@ -434,6 +438,158 @@ struct PolishReplayView: View {
         }
         .sheet(isPresented: $showSaveSheet) {
             saveCaseSheet
+        }
+    }
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.tertiary)
+                TextField("Filter cases", text: $caseSearch)
+                    .textFieldStyle(.plain)
+                    .font(.callout)
+                if !caseSearch.isEmpty {
+                    Button { caseSearch = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color.gray.opacity(0.08))
+
+            Divider()
+
+            List(selection: Binding(
+                get: { selectedCaseID },
+                set: { newID in
+                    if let id = newID, let c = cases.first(where: { $0.id == id }) {
+                        load(case: c)
+                    }
+                }
+            )) {
+                ForEach(filteredCases) { c in
+                    caseRow(c)
+                        .tag(c.id)
+                }
+            }
+            .listStyle(.sidebar)
+
+            Divider()
+            sidebarFooter
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+        }
+    }
+
+    private func caseRow(_ c: GoldenCase) -> some View {
+        let score = caseResults[c.id]
+        return HStack(spacing: 8) {
+            statusDot(for: score)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(c.id)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text(c.title)
+                    .font(.callout)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+            if let s = score {
+                Text(String(format: "%.0f", s * 100))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(similarityTint(s))
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func statusDot(for score: Double?) -> some View {
+        Circle()
+            .fill(score.map(similarityTint) ?? Color.gray.opacity(0.35))
+            .frame(width: 8, height: 8)
+    }
+
+    private var sidebarFooter: some View {
+        let pass = caseResults.values.filter { $0 >= 0.80 }.count
+        let run = caseResults.count
+        return HStack {
+            Text("\(cases.count) cases")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            if run > 0 {
+                Text("\(pass)/\(run) passing")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(pass == run ? .green : .secondary)
+            }
+        }
+    }
+
+    private var mainPanes: some View {
+        GeometryReader { geo in
+            let isWide = geo.size.width >= 1080
+            ScrollView {
+                if isWide {
+                    HStack(alignment: .top, spacing: 0) {
+                        pane(title: "Raw input", editable: true)
+                            .frame(minHeight: 260)
+                        Divider()
+                        pane(title: "Polished output", editable: false)
+                            .frame(minHeight: 260)
+                        Divider()
+                        pane(title: "Reference", editable: false)
+                            .frame(minHeight: 260)
+                    }
+                    .frame(height: max(280, geo.size.height - (showTripleASRSection ? 240 : 0)))
+                } else {
+                    VStack(spacing: 0) {
+                        pane(title: "Raw input", editable: true)
+                            .frame(minHeight: 200)
+                        Divider()
+                        pane(title: "Polished output", editable: false)
+                            .frame(minHeight: 200)
+                        Divider()
+                        pane(title: "Reference", editable: false)
+                            .frame(minHeight: 200)
+                    }
+                }
+
+                if showTripleASRSection {
+                    Divider()
+                    tripleASRSection
+                        .frame(minHeight: 200)
+                }
+            }
+        }
+    }
+
+    private var tripleASRSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "waveform.path.ecg")
+                    .foregroundStyle(.secondary)
+                Text("Triple ASR")
+                    .font(.headline)
+                Spacer()
+                Button { refreshTripleASR() } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                Button { showTripleASRSection = false } label: {
+                    Image(systemName: "chevron.down.circle")
+                }
+                .buttonStyle(.plain)
+                .help("Hide triple-ASR section")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            Divider()
+            tripleASRPanel
         }
     }
 
@@ -586,81 +742,42 @@ struct PolishReplayView: View {
     // MARK: Subviews
 
     private var header: some View {
-        HStack {
+        HStack(spacing: 10) {
             Image(systemName: "wand.and.stars")
                 .foregroundStyle(.secondary)
             Text("Polish Replay")
-                .font(.title2.weight(.semibold))
+                .font(.title3.weight(.semibold))
             Spacer()
-            Text("Model status: \(Qwen3Polisher.availabilityStatus.displayLabel) · large ready: \(Qwen3Polisher.isLargeModelReady ? "yes" : "no")")
-                .font(.caption)
+            Text("\(Qwen3Polisher.availabilityStatus.displayLabel) · 4B: \(Qwen3Polisher.isLargeModelReady ? "ready" : "loading")")
+                .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
-            if !showTripleASRPanel {
-                Button {
-                    showTripleASRPanel = true
-                    refreshTripleASR()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "waveform.path.ecg")
-                        Text("Triple ASR")
-                    }
-                }
-                .help("Show the triple-ASR panel")
+                .lineLimit(1)
+            Button {
+                showTripleASRSection.toggle()
+                if showTripleASRSection { refreshTripleASR() }
+            } label: {
+                Image(systemName: showTripleASRSection ? "waveform.path.ecg.rectangle.fill" : "waveform.path.ecg")
             }
+            .buttonStyle(.plain)
+            .help("Toggle triple-ASR section")
             Button(action: { dismiss() }) {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.system(size: 16))
+                    .font(.system(size: 15))
                     .foregroundStyle(.tertiary)
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 
     private var controlsBar: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 12) {
-                Picker("Case", selection: Binding(
-                    get: { selectedCaseID ?? "" },
-                    set: { newID in
-                        if let c = cases.first(where: { $0.id == newID }) {
-                            load(case: c)
-                        }
-                    })
-                ) {
-                    ForEach(cases) { c in
-                        Text(c.title).tag(c.id)
-                    }
-                }
-                .frame(maxWidth: 320)
-
-                Picker("Cleanup", selection: $cleanupLevel) {
-                    ForEach(CleanupOption.allCases) { o in
-                        Text(o.label).tag(o)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 240)
-
-                Picker("Personality", selection: $personality) {
-                    ForEach(PersonalityOption.allCases) { o in
-                        Text(o.label).tag(o)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 320)
-
-                Toggle("Force 4B", isOn: $forceLarge)
-                    .toggleStyle(.switch)
-                    .help("Appends a paragraph-break marker to trigger the 4B routing predicate. Does not refactor polish().")
-
-                Spacer()
-
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
                 Button(action: { runPolish() }) {
                     HStack(spacing: 4) {
                         Image(systemName: isRunning ? "hourglass" : "play.fill")
-                        Text(isRunning ? "Running…" : "Run polish")
+                        Text(isRunning ? "Running…" : "Run")
                     }
                 }
                 .keyboardShortcut(.return, modifiers: [.command])
@@ -674,31 +791,56 @@ struct PolishReplayView: View {
                 }
                 .disabled(isRunning || cases.isEmpty)
 
-                Button(action: {
+                Divider().frame(height: 18)
+
+                Picker("Cleanup", selection: $cleanupLevel) {
+                    ForEach(CleanupOption.allCases) { o in
+                        Text(o.label).tag(o)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 220)
+
+                Picker("Personality", selection: $personality) {
+                    ForEach(PersonalityOption.allCases) { o in
+                        Text(o.label).tag(o)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 260)
+
+                Toggle("Force 4B", isOn: $forceLarge)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+
+                Spacer()
+
+                Button {
                     saveID = ""
                     saveTitle = ""
                     showSaveSheet = true
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "square.and.arrow.down")
-                        Text("Save as new case…")
-                    }
+                } label: {
+                    Image(systemName: "square.and.arrow.down")
                 }
+                .help("Save current as new case")
+                .buttonStyle(.borderless)
             }
 
-            HStack(spacing: 16) {
+            HStack(spacing: 10) {
                 statusChip(label: "Route", value: actualRoute)
-                statusChip(label: "Elapsed", value: "\(elapsedMs) ms")
-                statusChip(label: "Multi-topic", value: detectedMultiTopic ? "yes" : "no")
-                statusChip(label: "Schema", value: detectedSchema ? "yes" : "no")
+                statusChip(label: "Elapsed", value: "\(elapsedMs)ms")
+                if detectedMultiTopic { statusChip(label: "Multi", value: "yes") }
+                if detectedSchema { statusChip(label: "Schema", value: "yes") }
                 if let s = similarity {
-                    statusChip(label: "Similarity", value: String(format: "%.2f", s), tint: similarityTint(s))
+                    statusChip(label: "Match", value: String(format: "%.0f%%", s * 100), tint: similarityTint(s))
                 }
                 Spacer()
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
     }
 
     private func statusChip(label: String, value: String, tint: Color? = nil) -> some View {
@@ -918,6 +1060,7 @@ struct PolishReplayView: View {
 
     private func runAll() {
         isRunning = true
+        caseResults = [:]
         batchOutput = "Running \(cases.count) cases…\n"
         Task { @MainActor in
             var lines: [String] = []
@@ -935,6 +1078,7 @@ struct PolishReplayView: View {
                     forceLarge: false
                 )
                 let sim = Similarity.score(out, c.reference)
+                caseResults[c.id] = sim
                 let status: String
                 if sim >= 0.80 { status = "ok" }
                 else if sim >= 0.60 { status = "warn" }

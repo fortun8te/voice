@@ -927,6 +927,12 @@ private struct GlassCapsule: View {
                             .padding(-8)
                             .scaleEffect(1.35)
                             .clipShape(Capsule(style: .continuous))
+                            // drawingGroup AFTER clipShape — rasterizes the
+                            // already-clipped gradient into a Metal layer.
+                            // If it ran before the clip (inside AuroraBackground),
+                            // the flat texture's edges didn't anti-alias with
+                            // the capsule path, causing the clipping glitch.
+                            .drawingGroup(opaque: false)
                             .allowsHitTesting(false)
                     } else {
                         Capsule(style: .continuous)
@@ -1269,28 +1275,60 @@ private struct TranscribingPill: View {
         Color.clear
             .frame(width: 40, height: 22)
             .overlay(
-                SweepingRing()
+                TranscribingGlyph()
                     .frame(width: 22, height: 22)
                     .shadow(color: .black.opacity(0.22), radius: 4, x: 0, y: 1)
             )
     }
 }
 
-/// Gentle dot pulse — replaces the previous fast sweeping arc.
-/// The dot just breathes (scale 0.92 ↔ 1.08, opacity 0.55 ↔ 0.85) over 1.6s.
-/// Reads as "thinking" without the chaotic spinning ring vibe.
-private struct SweepingRing: View {
+/// The glyph inside the transcribing pill. Has two modes:
+///
+///   - Local mode: a single breathing circle stroke (scale 0.92 ↔ 1.08,
+///     opacity 0.52 ↔ 0.88 over 1.6s). Reads as "thinking" without spinning.
+///
+///   - Cloud mode (`CerebrasPolisher.isAvailable == true`): crossfades
+///     between the breathing circle and an SF Symbol cloud over a 3.2s
+///     cycle. Both shapes share the same center; opacity interpolates
+///     symmetrically so neither ever fully disappears, just trades
+///     emphasis. Reads as "this is the cloud engine working".
+private struct TranscribingGlyph: View {
+    /// Live polish-status observable. The cloud glyph appears ONLY while
+    /// `isCloudPolishing == true` — meaning a Cerebras request is currently
+    /// in flight, not just because the user has cloud mode enabled. During
+    /// ASR (which always runs locally) or local polish, only the breathing
+    /// circle shows.
+    private let status = PolishStatus.shared
+
     var body: some View {
         TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
             let phase = context.date.timeIntervalSinceReferenceDate
-            // 1.6s cycle, smooth sine
-            let t = (phase.truncatingRemainder(dividingBy: 1.6)) / 1.6
-            let s = sin(t * 2 * .pi)
-            let scale = 1.0 + 0.08 * s        // 0.92 … 1.08
-            let opacity = 0.70 + 0.18 * s     // 0.52 … 0.88
-            Circle()
-                .stroke(Color.white.opacity(opacity), lineWidth: 1.5)
-                .scaleEffect(scale)
+
+            // Breathing cycle for the circle (1.6s).
+            let breathT = (phase.truncatingRemainder(dividingBy: 1.6)) / 1.6
+            let breathS = sin(breathT * 2 * .pi)
+            let circleScale = 1.0 + 0.08 * breathS
+            let circleOpacityBase = 0.70 + 0.18 * breathS
+
+            // Crossfade only when cloud polish is actually happening.
+            let cloudActive = status.isCloudPolishing
+            let xfadeT = (phase.truncatingRemainder(dividingBy: 3.2)) / 3.2
+            let xfade = 0.5 + 0.5 * cos(xfadeT * 2 * .pi)
+
+            ZStack {
+                Circle()
+                    .stroke(Color.white.opacity(circleOpacityBase * (cloudActive ? xfade : 1.0)), lineWidth: 1.5)
+                    .scaleEffect(circleScale)
+
+                if cloudActive {
+                    Image(systemName: "cloud.fill")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(Color.white.opacity(0.85 * (1.0 - xfade)))
+                        .scaleEffect(0.92 + 0.08 * (1.0 - xfade))
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeOut(duration: 0.18), value: cloudActive)
         }
     }
 }
@@ -1299,20 +1337,23 @@ private struct SweepingRing: View {
 
 /// Shown during the Opt+1 flow while a selected text region is being polished.
 /// Click-through (user cannot interact) — same visual weight as TranscribingPill
-/// but with a sparkles glyph + label to signal a distinct AI-rewrite action.
+/// Minimal polishing indicator: rotating gear icon, no text. Reads as clean
+/// "processing in progress" without clutter.
 private struct PolishingSelectionPill: View {
+    @State private var isSpinning = false
+
     var body: some View {
-        HStack(spacing: 6) {
-            SparklesBreath()
-                .frame(width: 16, height: 16)
-            Text("Polishing\u{2026}")
-                .font(.sans(13, weight: .medium))
-                .foregroundStyle(.primary.opacity(0.85))
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-        .background(GlassCapsule(fillOpacity: 0.80))
-        .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
+        Image(systemName: "gearshape.fill")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.primary.opacity(0.85))
+            .frame(width: 22, height: 22)
+            .rotationEffect(.degrees(isSpinning ? 360 : 0))
+            .animation(.linear(duration: 1.0).repeatForever(autoreverses: false), value: isSpinning)
+            .onAppear { isSpinning = true }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(GlassCapsule(fillOpacity: 0.80))
+            .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
     }
 }
 

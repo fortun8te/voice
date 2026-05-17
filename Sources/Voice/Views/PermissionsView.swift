@@ -42,7 +42,6 @@ struct PermissionsView: View {
     // MARK: State
 
     @State private var service = PermissionsService.shared
-    @State private var isDropTargeted = false
     @State private var lastCompletionNotified = false
 
     // MARK: Layout constants
@@ -97,21 +96,98 @@ struct PermissionsView: View {
 
     @ViewBuilder
     private var heroSection: some View {
-        VStack(alignment: .leading, spacing: Sp.sm) {
+        VStack(alignment: .leading, spacing: Sp.md) {
             HStack(alignment: .center, spacing: Sp.lg) {
                 appIcon
                     .frame(width: appIconSize, height: appIconSize)
 
                 VStack(alignment: .leading, spacing: Sp.xs) {
-                    Text("Set up VOICE")
+                    Text(heroTitle)
                         .font(.serifTitle)
                         .foregroundStyle(.primary)
-                    Text("Grant a few permissions so VOICE can listen and paste.")
+                    Text(heroSubtitle)
                         .font(.bodyLarge)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                Spacer()
             }
+
+            // Stale-grant banner: shown only when a permission was previously
+            // granted but currently isn't. Means the macOS TCC binding was
+            // invalidated (typical after an unsigned-app rebuild). Plain
+            // language: "permissions reset, re-grant once".
+            if service.anyPermissionNeedsReGrant {
+                staleGrantBanner
+            }
+
+            progressStrip
+        }
+    }
+
+    private var heroTitle: String {
+        if service.allGranted { return "You're all set" }
+        if service.anyPermissionNeedsReGrant { return "Re-grant after update" }
+        return "Set up VOICE"
+    }
+
+    private var heroSubtitle: String {
+        if service.allGranted { return "Hit your hotkey and start dictating." }
+        if service.anyPermissionNeedsReGrant {
+            return "macOS reset VOICE's permissions after an app update. Drag VOICE back into each list below."
+        }
+        return "Grant a few permissions so VOICE can listen and paste."
+    }
+
+    @ViewBuilder
+    private var staleGrantBanner: some View {
+        HStack(alignment: .top, spacing: Sp.sm) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.orange)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Permissions reset after update")
+                    .font(.bodyMedium)
+                    .foregroundStyle(.primary)
+                Text("If VOICE is already in the System Settings list, remove it (click −) then drag the icon back in.")
+                    .font(.bodySmall)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(Sp.md)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.orange.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private var progressStrip: some View {
+        let required = PermissionsService.Kind.allCases.filter { $0.isRequired }
+        let granted = required.filter { service.status(for: $0) == .granted }.count
+        let total = required.count
+
+        HStack(spacing: Sp.sm) {
+            HStack(spacing: 4) {
+                ForEach(0..<total, id: \.self) { i in
+                    Capsule()
+                        .fill(i < granted ? Color.accentColor : Color.primary.opacity(0.10))
+                        .frame(width: 32, height: 4)
+                        .animation(.easeOut(duration: 0.25), value: granted)
+                }
+            }
+            Text("\(granted) of \(total) granted")
+                .font(.bodySmall)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Spacer()
         }
     }
 
@@ -151,103 +227,145 @@ struct PermissionsView: View {
 
     @ViewBuilder
     private var dragAffordanceSection: some View {
-        HStack(spacing: Sp.lg) {
-            voiceDragSourceTile
-            Image(systemName: "arrow.right")
-                .font(.system(size: 18, weight: .semibold))
+        VStack(alignment: .leading, spacing: Sp.md) {
+            HStack(spacing: Sp.xs) {
+                Image(systemName: "hand.draw.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text("FAST SETUP")
+                    .font(.label)
+                    .tracking(0.8)
+                    .foregroundStyle(.secondary)
+            }
+            Text("Drag VOICE into the System Settings list")
+                .font(.serifSection)
+                .foregroundStyle(.primary)
+            Text("Open Privacy & Security → Accessibility (or Input Monitoring), then drop the icon below into the list. Faster than tapping the + button.")
+                .font(.bodyBase)
                 .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-            systemSettingsDropTile
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: Sp.lg) {
+                voiceDragSourceTile
+                AnimatedArrow()
+                    .frame(width: 32, height: 22)
+                    .foregroundStyle(.secondary)
+                systemSettingsDropTile
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.top, Sp.xs)
         }
-        .frame(maxWidth: .infinity)
         .padding(Sp.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: cardCorner, style: .continuous)
-                .fill(Color.primary.opacity(0.025))
+                .fill(Color.accentColor.opacity(service.allGranted ? 0.03 : 0.07))
         )
         .overlay(
             RoundedRectangle(cornerRadius: cardCorner, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.06), lineWidth: cardBorderUnselected)
+                .strokeBorder(
+                    service.allGranted ? Color.primary.opacity(0.06) : Color.accentColor.opacity(0.35),
+                    lineWidth: cardBorderUnselected
+                )
         )
+        .animation(.easeOut(duration: 0.25), value: service.allGranted)
     }
 
     @ViewBuilder
     private var voiceDragSourceTile: some View {
+        // The bundle URL of Voice.app — what gets dragged out when the
+        // user picks up this tile. Dropping it onto System Settings'
+        // Accessibility / Input Monitoring lists is the modern macOS
+        // shortcut for adding an app.
+        let appURL = Bundle.main.bundleURL
+        let needsAttention = !service.allGranted
+
         VStack(spacing: Sp.sm) {
             appIcon
                 .frame(width: dragTileSize - Sp.xl, height: dragTileSize - Sp.xl)
-            Text("VOICE")
-                .font(.label)
-                .tracking(0.8)
-                .foregroundStyle(.secondary)
+            HStack(spacing: 4) {
+                Image(systemName: "hand.draw.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(needsAttention ? Color.accentColor : .secondary)
+                Text("Drag")
+                    .font(.bodySmall)
+                    .foregroundStyle(needsAttention ? Color.accentColor : .secondary)
+            }
         }
         .frame(width: dragTileSize + Sp.xl, height: dragTileSize + Sp.sm)
         .padding(Sp.sm)
         .background(
             RoundedRectangle(cornerRadius: cardCorner, style: .continuous)
-                .fill(Color.primary.opacity(0.04))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: cardCorner, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.06), lineWidth: cardBorderUnselected)
-        )
-    }
-
-    @ViewBuilder
-    private var systemSettingsDropTile: some View {
-        VStack(spacing: Sp.sm) {
-            Image(systemName: "gearshape.fill")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text("System Settings")
-                .font(.bodyMedium)
-                .foregroundStyle(.primary)
-            Text("Privacy & Security")
-                .font(.bodySmall)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: dragTileSize + Sp.sm)
-        .padding(Sp.sm)
-        .background(
-            RoundedRectangle(cornerRadius: cardCorner, style: .continuous)
-                .fill(isDropTargeted
-                      ? Color.accentColor.opacity(0.10)
-                      : Color.primary.opacity(0.04))
+                .fill(Color.primary.opacity(0.06))
         )
         .overlay(
             RoundedRectangle(cornerRadius: cardCorner, style: .continuous)
                 .strokeBorder(
-                    isDropTargeted ? Color.accentColor.opacity(0.55) : Color.primary.opacity(0.06),
-                    style: StrokeStyle(
-                        lineWidth: isDropTargeted ? cardBorderSelected : cardBorderUnselected,
-                        dash: isDropTargeted ? [] : [4, 4]
-                    )
+                    needsAttention ? Color.accentColor.opacity(0.55) : Color.primary.opacity(0.06),
+                    lineWidth: needsAttention ? cardBorderSelected : cardBorderUnselected
                 )
         )
-        .contentShape(Rectangle())
-        .onTapGesture {
-            openSettingsForFirstUnresolved()
+        // SwiftUI's .draggable hands a transferable to the OS drag session.
+        .draggable(appURL) {
+            appIcon
+                .frame(width: 48, height: 48)
         }
-        .onDrop(of: [UTType.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleDrop(providers: providers)
+        .help("Drag into the System Settings accessibility list")
+    }
+
+    // MARK: - Animated arrow
+
+    /// Right-pointing arrow that subtly drifts on the X axis to suggest
+    /// "drag this way". Pure visual — no other state.
+    private struct AnimatedArrow: View {
+        var body: some View {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+                let phase = context.date.timeIntervalSinceReferenceDate
+                let t = phase.truncatingRemainder(dividingBy: 1.4) / 1.4
+                let s = sin(t * 2 * .pi)
+                let offset = s * 3       // ±3pt drift
+                let opacity = 0.55 + 0.30 * (0.5 + 0.5 * s)
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 18, weight: .semibold))
+                    .offset(x: offset)
+                    .opacity(opacity)
+            }
         }
     }
 
-    private func handleDrop(providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first else { return false }
-        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-            // The drop payload is a file URL; could be the Voice.app
-            // bundle the user dragged from /Applications, or any other
-            // file. Either way the intent is "take me to the right
-            // System Settings pane", so we route to the first
-            // unresolved permission. We never read the URL contents.
-            Task { @MainActor in
-                openSettingsForFirstUnresolved()
+    @ViewBuilder
+    private var systemSettingsDropTile: some View {
+        // No more in-app drop target — the drag is meant to land on the REAL
+        // System Settings list. This tile is just a tap-target that opens
+        // System Settings to the right pane so the user can see the list
+        // they need to drop the icon into.
+        Button(action: openSettingsForFirstUnresolved) {
+            VStack(spacing: Sp.sm) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Text("System Settings")
+                    .font(.bodyMedium)
+                    .foregroundStyle(.primary)
+                Text("Tap to open the right pane")
+                    .font(.bodySmall)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            _ = item
+            .frame(maxWidth: .infinity)
+            .frame(height: dragTileSize + Sp.sm)
+            .padding(Sp.sm)
+            .background(
+                RoundedRectangle(cornerRadius: cardCorner, style: .continuous)
+                    .fill(Color.primary.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: cardCorner, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.06), lineWidth: cardBorderUnselected)
+            )
         }
-        return true
+        .buttonStyle(.plain)
     }
 
     private func openSettingsForFirstUnresolved() {
@@ -319,6 +437,31 @@ struct PermissionsView: View {
 
     @ViewBuilder
     private var footer: some View {
+        VStack(alignment: .leading, spacing: Sp.sm) {
+            // Troubleshooting affordance: shown only when at least one
+            // required permission is missing. Catches the "stale TCC after
+            // app rebuild" case — Settings shows VOICE in the list but
+            // the API still returns false. Removing and re-adding fixes it.
+            if !service.allGranted {
+                HStack(alignment: .top, spacing: Sp.xs) {
+                    Image(systemName: "exclamationmark.circle")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 1)
+                    Text("If VOICE is already in the System Settings list but a permission still shows red, remove the entry (click the −) and drag VOICE back in.")
+                        .font(.bodySmall)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.bottom, Sp.xs)
+            }
+
+            footerButtons
+        }
+    }
+
+    @ViewBuilder
+    private var footerButtons: some View {
         HStack {
             Button {
                 service.refresh()

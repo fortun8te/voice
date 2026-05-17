@@ -1,0 +1,9 @@
+{
+  "id": "deep-correction-chain",
+  "title": "4-layer correction chain + opener filler",
+  "categories": ["self-correction"],
+  "raw": "so uh remind me to buy milk no wait eggs no actually both milk and eggs no scratch that i just need to buy bread and butter for tomorrow morning",
+  "reference": "Remind me to buy bread and butter for tomorrow morning.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

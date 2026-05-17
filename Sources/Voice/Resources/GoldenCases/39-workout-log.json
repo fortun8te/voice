@@ -1,0 +1,9 @@
+{
+  "id": "workout-log",
+  "title": "Workout log — sets/reps/weights, self-corrections collapsed",
+  "categories": ["numbers", "self-correction", "everyday"],
+  "raw": "okay workout log for today so bench press i did four sets of eight at eighty kilos no wait seventy five because i failed the last rep at eighty so put seventy five then uh squats four sets of five at a hundred kilos and those felt good actually really solid then romanian deadlifts three sets of ten at sixty no sixty five kilos and then uh pull ups three sets to failure got twelve ten and nine reps and then cable rows four sets of twelve at the whole stack no that's too much i had it at like eighty percent of the stack and then tricep pushdowns three sets of fifteen and i don't know the weight because i used the rope attachment and the numbers were worn off and then i did twenty minutes on the bike at like zone two heart rate which for me is around one thirty to one forty five beats per minute",
+  "reference": "Workout log: bench press, four sets of eight at seventy-five kilos (failed the last rep at eighty). Squats, four sets of five at a hundred kilos, felt solid. Romanian deadlifts, three sets of ten at sixty-five kilos. Pull-ups, three sets to failure: twelve, ten, and nine reps. Cable rows, four sets of twelve at about 80% of the stack. Tricep pushdowns, three sets of fifteen (weight unknown, numbers worn off the rope attachment). Bike, twenty minutes at zone two heart rate, around one thirty to one forty-five beats per minute.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

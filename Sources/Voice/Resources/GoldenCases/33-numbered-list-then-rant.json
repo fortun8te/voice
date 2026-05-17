@@ -1,0 +1,9 @@
+{
+  "id": "numbered-list-then-rant",
+  "title": "Numbered to-do list followed by a rant",
+  "categories": ["lists", "multi-topic", "filler", "rant"],
+  "raw": "okay things i need to do before the end of the day one send the invoice to claire for the april work two review the pull request from ahmed three schedule the one on one with the new designer uh i forget her name starts with a v four reply to the slack thread about the staging deployment and five actually no five is just remind me to eat lunch because i keep skipping it and that is a problem anyway separate from all of that i just want to say that whoever decided to put the weekly all hands at eight am is genuinely the worst and i know it works for people on the east coast but like some of us are in california and eight am here is like five am there no wait that's backwards eight am here is eleven am there which means they scheduled it at the absolute worst time for californians not east coasters and i've been saying this for three months and nothing has changed okay that's my rant done",
+  "reference": "**To do before end of day:**\n1. Send the invoice to Claire for the April work\n2. Review Ahmed's pull request\n3. Schedule a 1:1 with the new designer (name starts with V)\n4. Reply to the Slack thread about the staging deployment\n5. Eat lunch — stop skipping it\n\nSeparate note: whoever decided to put the weekly all-hands at 8 AM is genuinely the worst. It's 11 AM on the East Coast, which means it's at the absolute worst time for people in California. Been saying this for three months, nothing has changed.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

@@ -1,0 +1,9 @@
+{
+  "id": "quote-embedded",
+  "title": "Quote embedded in narrative — preserve quoted speech",
+  "categories": ["quotes", "proper-nouns"],
+  "raw": "so i talked to lisa about the deadline and she said and i quote we are absolutely not shipping this before the security audit is done end quote and i agree with her honestly the last thing we need is a breach right after launch so we're pushing to november",
+  "reference": "I talked to Lisa about the deadline and she said, \"We are absolutely not shipping this before the security audit is done.\" I agree — the last thing we need is a breach right after launch. We're pushing to November.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

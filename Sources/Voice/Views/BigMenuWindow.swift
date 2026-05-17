@@ -291,17 +291,17 @@ struct BigMenuWindow: View {
             StatCard(
                 icon: "waveform",
                 value: "\(stats.wordsPerMinute)",
-                label: "words per minute"
+                label: "Words per Minute"
             )
             StatCard(
                 icon: "sparkles",
                 value: "\(stats.fixesByVoice)",
-                label: "fixes made by voice"
+                label: "Fixes by Voice"
             )
             StatCard(
                 icon: "doc.text",
                 value: "\(stats.totalWords)",
-                label: "total words dictated"
+                label: "Total Words Dictated"
             )
         }
     }
@@ -496,6 +496,7 @@ private struct StatCard: View {
     let label: String
 
     @Environment(\.colorScheme) private var scheme
+    @State private var displayValue: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: Sp.sm) {
@@ -503,11 +504,13 @@ private struct StatCard: View {
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
-            Text(value)
+            Text(displayValue.isEmpty ? value : displayValue)
                 .font(.serifValue)
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
+                .contentTransition(.numericText())
+                .animation(.spring(duration: 0.4), value: displayValue)
             Text(label)
                 .font(.bodyBase)
                 .foregroundStyle(.secondary)
@@ -516,11 +519,15 @@ private struct StatCard: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(Sp.lg)
+        .onAppear { displayValue = value }
+        .onChange(of: value) { _, newVal in
+            withAnimation(.spring(duration: 0.4)) { displayValue = newVal }
+        }
         // Equal width via maxWidth and a shared baseline height so the three
         // cards stay consistent regardless of value length. minHeight tuned
-        // for the 32pt serifValue (icon + value + 2-line label fits without
+        // for the 40pt serifValue (icon + value + 2-line label fits without
         // wasted space). .topLeading keeps the icon pinned during reflow.
-        .frame(maxWidth: .infinity, minHeight: 108, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 120, alignment: .topLeading)
         // Solid (not translucent) surface. Sits on AppShellBackground at a
         // slightly different tint so the cards read as real surfaces, not
         // glassy overlays. Hairline border anchors the edge without shouting.
@@ -569,6 +576,20 @@ struct DictationRow: View {
         return m.children.first(where: { $0.label == field })?.value as? String
     }
 
+    /// Convert "cloud:qwen-3-235b" / "local:qwen3-4b" / "local:qwen3-1.7b" /
+    /// "rules-only" into a human label for the metadata badge.
+    static func engineDisplayLabel(_ raw: String) -> String {
+        switch raw {
+        case "cloud:qwen-3-235b":  return "Cloud · Qwen 235B"
+        case "local:qwen3-4b":     return "Local · Qwen3 4B"
+        case "local:qwen3-1.7b":   return "Local · Qwen3 1.7B"
+        case "rules-only":         return "Rules only"
+        default:
+            // Fallback: just strip the colon, show as is.
+            return raw.replacingOccurrences(of: ":", with: " · ")
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: Sp.md) {
@@ -595,7 +616,12 @@ struct DictationRow: View {
                         // legacy entries that have no polish metadata.
                         let levelUsed   = optString("cleanupLevelUsed")
                         let styleUsed   = optString("personalityStyleUsed")
+                        let engineUsed  = optString("polishEngine")
                         HStack(spacing: Sp.xs) {
+                            if let engine = engineUsed {
+                                MetaBadge(icon: engine.hasPrefix("cloud") ? "cloud" : "laptopcomputer",
+                                          label: Self.engineDisplayLabel(engine))
+                            }
                             if let level = levelUsed {
                                 MetaBadge(icon: "sparkles", label: level)
                             }
@@ -775,18 +801,17 @@ private struct SettingsSheet: View {
     @AppStorage("autoCopy")         private var autoCopy: Bool = true
     @AppStorage("soundEffectsEnabled") private var soundEffects: Bool = true
     @AppStorage("llmPolishEnabled") private var llmPolishEnabled: Bool = LLMPolisher.isAvailable
+    // Engine choice: cloud is default for better quality + faster latency
+    // on long inputs. User can switch to local for privacy or offline use.
+    @AppStorage("cerebrasEnabled")  private var cerebrasEnabled: Bool = true
+    @AppStorage("cerebrasAPIKey")   private var cerebrasAPIKey: String = ""
     /// Latency kill switch for the Qwen3 polish stage. Distinct key from
     /// `llmPolishEnabled` (which the polisher itself reads) — this is the
     /// UI-facing fast-paste toggle the latency agent reads in finishRecording.
     @AppStorage("polishEnabled")    private var polishEnabled: Bool = true
     @AppStorage("cleanupLevel")     private var cleanupLevel: String = "medium"
     @AppStorage("personalityStyle") private var personality: String = "neutral"
-    /// Experimental: 2-pass goal-first polish. Splits dictation into topic
-    /// chunks, classifies each intent, then routes. Currently logs only;
-    /// intent-specific polish prompts are not wired yet.
-    @AppStorage("useGoalFirstPolish") private var useGoalFirstPolish: Bool = false
-
-    @State private var micGranted: Bool = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+@State private var micGranted: Bool = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     @State private var axGranted: Bool = AXIsProcessTrusted()
     @State private var refreshTimer: Timer?
 
@@ -807,12 +832,24 @@ private struct SettingsSheet: View {
     @State private var lockBindings: [CapturedHotkey] = HotkeyRole.handsFree.loadBindings()
 
     private var polishStatusColor: Color {
+        // Cloud takes precedence — green when cloud is reachable, otherwise
+        // reflect the local model's readiness.
+        if cerebrasEnabled && !cerebrasAPIKey.isEmpty { return .green }
         switch Qwen3Polisher.availabilityStatus {
         case .available:             return .green
         case .downloading, .loading: return .orange
         case .notDownloaded:         return .yellow
         case .error:                 return .red
         }
+    }
+
+    private var polishStatusLabel: String {
+        if cerebrasEnabled {
+            return cerebrasAPIKey.isEmpty
+                ? "Cloud selected, no API key set"
+                : "Cloud ready (Cerebras Qwen 235B)"
+        }
+        return "Local: \(Qwen3Polisher.availabilityStatus.displayLabel)"
     }
 
     var body: some View {
@@ -836,39 +873,52 @@ private struct SettingsSheet: View {
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
-                    // 1. Hotkeys (inlined, replaces the old nested sheet).
-                    // Two role cards stacked vertically so each gets the full
-                    // width for binding chips and the editing controls.
-                    // Visual density matches the cleanup/personality cards.
-                    section("Hotkeys") {
-                        VStack(spacing: Sp.md) {
-                            HotkeyRoleCard(role: .pushToTalk, bindings: $pttBindings)
-                            HotkeyRoleCard(role: .handsFree,  bindings: $lockBindings)
-                        }
-                    }
-
-                    Divider()
-
-                    // 2. AI Cleanup (horizontal row of cards).
-                    section("AI cleanup") {
+                    // 1. ENGINE — local vs cloud. Top of settings so the user
+                    // sees this first. Cloud is default for better quality
+                    // on long inputs; local is the privacy/offline mode.
+                    section("Engine") {
                         VStack(alignment: .leading, spacing: Sp.md) {
-                            HStack(alignment: .top, spacing: Sp.md) {
-                                ForEach(CleanupLevel.allCases) { level in
-                                    CleanupCard(
-                                        level: level,
-                                        tagline: taglineFor(level),
-                                        isSelected: cleanupLevel == level.rawValue,
-                                        onTap: { cleanupLevel = level.rawValue }
-                                    )
+                            HStack(spacing: Sp.md) {
+                                EngineCard(
+                                    icon: "cloud",
+                                    title: "Cloud",
+                                    tagline: "Smartest, fastest. Free Cerebras Qwen 235B.",
+                                    example: "Polished in ~400ms with near-frontier quality. Long rants, bullet lists, complex structure — all handled.",
+                                    isSelected: cerebrasEnabled,
+                                    onTap: { cerebrasEnabled = true }
+                                )
+                                EngineCard(
+                                    icon: "laptopcomputer",
+                                    title: "Local",
+                                    tagline: "On-device, private, works offline.",
+                                    example: "Qwen3-4B running on your Mac. Slower on long inputs but never leaves the device.",
+                                    isSelected: !cerebrasEnabled,
+                                    onTap: { cerebrasEnabled = false }
+                                )
+                            }
+                            if cerebrasEnabled {
+                                VStack(alignment: .leading, spacing: Sp.xs) {
+                                    HStack(spacing: Sp.xs) {
+                                        Image(systemName: "key.fill")
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                        SecureField("Cerebras API key", text: $cerebrasAPIKey)
+                                            .textFieldStyle(.roundedBorder)
+                                            .font(.bodySmall)
+                                        Link("Get key", destination: URL(string: "https://cloud.cerebras.ai")!)
+                                            .font(.bodySmall)
+                                    }
+                                    Text("Free at cloud.cerebras.ai. Long dictations route to cloud for higher quality. Falls back to local automatically if the cloud is unreachable.")
+                                        .font(.bodySmall)
+                                        .foregroundStyle(.secondary)
                                 }
                             }
-                            toggle("Goal-first polish (experimental)", isOn: $useGoalFirstPolish)
                         }
                     }
 
                     Divider()
 
-                    // 3. Writing personality (horizontal row of cards).
+                    // 2. Writing personality (horizontal row of cards).
                     section("Writing personality") {
                         HStack(alignment: .top, spacing: Sp.md) {
                             ForEach(PersonalityStyle.allCases) { style in
@@ -887,6 +937,34 @@ private struct SettingsSheet: View {
 
                     Divider()
 
+                    // 3. AI Cleanup (horizontal row of cards).
+                    section("Rewrite intensity") {
+                        VStack(alignment: .leading, spacing: Sp.md) {
+                            HStack(alignment: .top, spacing: Sp.md) {
+                                ForEach(CleanupLevel.allCases) { level in
+                                    CleanupCard(
+                                        level: level,
+                                        tagline: taglineFor(level),
+                                        isSelected: cleanupLevel == level.rawValue,
+                                        onTap: { cleanupLevel = level.rawValue }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Divider()
+
+                    // 4. Hotkeys (inlined, replaces the old nested sheet).
+                    section("Hotkeys") {
+                        VStack(spacing: Sp.md) {
+                            HotkeyRoleCard(role: .pushToTalk, bindings: $pttBindings)
+                            HotkeyRoleCard(role: .handsFree,  bindings: $lockBindings)
+                        }
+                    }
+
+                    Divider()
+
                     // 4. Output
                     section("Output") {
                         VStack(alignment: .leading, spacing: Sp.sm) {
@@ -899,7 +977,7 @@ private struct SettingsSheet: View {
                                     Circle()
                                         .fill(polishStatusColor)
                                         .frame(width: 6, height: 6)
-                                    Text("Status: \(Qwen3Polisher.availabilityStatus.displayLabel)")
+                                    Text(polishStatusLabel)
                                         .font(.bodySmall)
                                         .foregroundStyle(.secondary)
                                 }
@@ -1143,6 +1221,70 @@ private struct SettingsSheet: View {
     }
 }
 
+// MARK: - Engine card
+//
+// Two-option selector card: Cloud (Cerebras) vs Local. Larger icon, title,
+// and tagline. Tap selects. Matches the visual density of cleanup/personality
+// cards so the Settings sheet feels cohesive.
+
+private struct EngineCard: View {
+    let icon: String
+    let title: String
+    let tagline: String
+    let example: String
+    let isSelected: Bool
+    let onTap: () -> Void
+
+    @Environment(\.colorScheme) private var scheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Sp.md) {
+            VStack(alignment: .leading, spacing: Sp.xs) {
+                HStack(spacing: Sp.xs) {
+                    Image(systemName: icon)
+                        .font(.system(size: 16, weight: .regular))
+                        .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                    Text(title)
+                        .font(.serifSection)
+                }
+                Text(tagline)
+                    .font(.bodyBase)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+
+            Text(example)
+                .font(.sans(10, weight: .regular).italic())
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.accentColor.opacity(0.08))
+                )
+        }
+        .padding(Sp.lg)
+        .frame(maxWidth: .infinity, minHeight: 165, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: CardShape.corner)
+                .fill(scheme == .dark
+                    ? Color.white.opacity(0.04)
+                    : Color.black.opacity(0.025))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: CardShape.corner)
+                .strokeBorder(
+                    isSelected ? Color.accentColor.opacity(0.55) : Color.primary.opacity(0.06),
+                    lineWidth: isSelected ? CardShape.borderSelected : CardShape.borderUnselected
+                )
+        )
+        .contentShape(RoundedRectangle(cornerRadius: CardShape.corner))
+        .onTapGesture { onTap() }
+    }
+}
+
 // MARK: - Cleanup card (Wispr-style)
 //
 // One per CleanupLevel. Serif title + sans tagline, with the level's
@@ -1170,21 +1312,18 @@ private struct CleanupCard: View {
             Spacer(minLength: 0)
 
             Text(level.example.after)
-                .font(.sans(11, weight: .regular).italic())
+                .font(.sans(10, weight: .regular).italic())
                 .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, Sp.md)
-                .padding(.vertical, Sp.sm)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
                 .background(
-                    RoundedRectangle(cornerRadius: 10)
+                    RoundedRectangle(cornerRadius: 8)
                         .fill(Color.accentColor.opacity(0.08))
                 )
         }
         .padding(Sp.lg)
-        // Shared baseline height with PersonalityCard so the two grids read
-        // as one visual rhythm. 190 fits the tallest tagline + example bubble
-        // without forcing a vertical stretch on shorter variants.
-        .frame(maxWidth: .infinity, minHeight: 190, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 165, alignment: .topLeading)
         .background(
             RoundedRectangle(cornerRadius: CardShape.corner)
                 .fill(scheme == .dark
@@ -1232,12 +1371,12 @@ private struct PersonalityCard: View {
             Spacer(minLength: 0)
 
             Text(style.example.after)
-                .font(.sans(11, weight: .regular).italic())
-                .padding(.horizontal, Sp.md)
-                .padding(.vertical, Sp.sm)
+                .font(.sans(10, weight: .regular).italic())
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(
-                    RoundedRectangle(cornerRadius: 10)
+                    RoundedRectangle(cornerRadius: 8)
                         .fill(bubbleTint)
                 )
 
@@ -1260,10 +1399,7 @@ private struct PersonalityCard: View {
             }
         }
         .padding(Sp.lg)
-        // Matches CleanupCard.minHeight so the two card grids share an
-        // identical rhythm. The avatar strip adds height naturally; without
-        // a shared baseline the personality cards would always read taller.
-        .frame(maxWidth: .infinity, minHeight: 190, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: 165, alignment: .topLeading)
         .background(
             RoundedRectangle(cornerRadius: CardShape.corner)
                 .fill(scheme == .dark

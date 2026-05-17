@@ -1,0 +1,9 @@
+{
+  "id": "technical-code-review",
+  "title": "Code review notes — technical terms, method names, bug description",
+  "categories": ["technical", "proper-nouns", "multi-topic"],
+  "raw": "okay code review notes for the auth service so first thing the get user by email method is doing a full table scan because there's no index on the email column that needs to be fixed before we merge also the password reset token is stored in plain text in the database it should be hashed with bcrypt or argon two and the expiry check is comparing unix timestamps but using different time zones on the server and the database which is gonna cause bugs around daylight saving time and one more thing the rate limiter is using in-memory storage which means it won't work across multiple instances we need to move that to redis",
+  "reference": "Code review notes for the auth service:\n\n- `getUserByEmail` is doing a full table scan — no index on the email column. Fix before merge.\n- Password reset token is stored in plain text. Should be hashed with bcrypt or Argon2.\n- Expiry check compares Unix timestamps but uses different time zones on the server vs the database. This will cause bugs around daylight saving time.\n- Rate limiter uses in-memory storage, so it won't work across multiple instances. Needs to move to Redis.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

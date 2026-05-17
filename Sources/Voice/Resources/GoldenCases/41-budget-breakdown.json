@@ -1,0 +1,9 @@
+{
+  "id": "budget-breakdown",
+  "title": "Personal budget breakdown — corrections collapsed, numbers formatted",
+  "categories": ["numbers", "currency", "self-correction", "everyday"],
+  "raw": "okay monthly budget breakdown so rent is two thousand four hundred no two thousand three hundred and fifty because i negotiated it down in march and utilities are usually like one eighty no they've been closer to two ten lately because of the summer air conditioning and then groceries i spend about four hundred no more like four fifty to five hundred honestly if i'm being real with myself and subscriptions let me think netflix is fifteen no wait i'm on the duo plan so it's twenty two fifty and spotify is eleven and the gym is eighty five and icloud is like three dollars no point nine nine i think and then transport i have my metro card which is like a hundred thirty a month and then occasional ubers which is another like sixty to eighty and eating out is probably too high it's like three hundred a month if i count coffee and lunches and everything so total monthly expenses are probably around like forty four hundred to forty five hundred",
+  "reference": "Monthly budget breakdown: rent is $2,350 (negotiated down in March). Utilities have been closer to $210 lately, higher in summer. Groceries are realistically $450-$500. Subscriptions: Netflix Duo plan is $22.50, Spotify $11, gym $85, iCloud $0.99. Transport: metro card is about $130, occasional Ubers another $60-$80. Eating out, including coffee and lunches, is around $300. Total monthly expenses are probably around $4,400-$4,500.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

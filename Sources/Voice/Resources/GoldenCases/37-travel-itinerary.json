@@ -1,0 +1,9 @@
+{
+  "id": "travel-itinerary",
+  "title": "Travel itinerary with corrections and times",
+  "categories": ["multi-topic", "numbers", "self-correction", "proper-nouns", "time"],
+  "raw": "okay travel notes for the amsterdam trip so we fly out tuesday june twenty fourth no wait it's the twenty fifth at six fifteen am from jfk terminal four no terminal b actually let me check no it's terminal four and we land in amsterdam at like eight pm local time no eight thirty and the hotel is the andaz prinsengracht no wait just andaz amsterdam prinsengracht it's on the canal and check in is at three pm so we might need to leave our bags and we have a dinner reservation at rijks restaurant on wednesday the twenty sixth at seven thirty pm and thursday we have the anne frank house booked at nine am and you cannot be late for that because they're very strict about timed entries and then we fly back saturday the twenty eighth at two pm amsterdam time which means we should leave the hotel by ten thirty at the latest because schiphol is like forty minutes away and security takes forever",
+  "reference": "Travel notes for Amsterdam. Flying out Tuesday, June 25 — JFK Terminal 4 at 6:15 AM. Landing in Amsterdam at 8:30 PM local time. Hotel is the Andaz Amsterdam Prinsengracht, on the canal. Check-in at 3 PM, might need to drop bags first. Dinner reservation at Rijks restaurant on Wednesday the 26th at 7:30 PM. Thursday: Anne Frank House booked at 9 AM — do not be late, they're very strict about timed entries. Flying back Saturday the 28th at 2 PM Amsterdam time. Leave the hotel by 10:30 AM at the latest — Schiphol is about 40 minutes away and security takes forever.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

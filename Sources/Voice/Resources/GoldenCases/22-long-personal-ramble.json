@@ -1,0 +1,9 @@
+{
+  "id": "long-personal-ramble",
+  "title": "Long personal stream — 4 topics, heavy filler, corrections",
+  "categories": ["multi-topic", "filler", "self-correction", "conversational"],
+  "raw": "so uh i need to like figure out what to do about the gym situation because i've been going to like the one on fifth avenue no wait eighth avenue the one near the coffee shop and the membership is like ninety dollars a month which is kind of a lot and i was thinking about switching to that new place that opened up on broadway but i don't know if it's worth it also i need to call my mom she said to call her on tuesday no it was wednesday and i completely forgot about that and also uh speaking of forgetting i have a dentist appointment on the twenty third no the twenty fourth of june at like two thirty pm i think and i should probably confirm that and then the last thing i want to remember is to return that book to daniel the one about sleep i think it's called why we sleep or something like that i borrowed it like three weeks ago and i keep forgetting to give it back",
+  "reference": "I need to figure out the gym situation. I've been going to the one on Eighth Avenue near the coffee shop, and the membership is about $90 a month, which is a lot. I'm thinking about switching to the new place on Broadway but not sure if it's worth it.\n\nI also need to call my mom. She said to call on Wednesday and I completely forgot.\n\nI have a dentist appointment on June 24th at 2:30 PM. I should confirm that.\n\nI need to return that book to Daniel — the one about sleep, I think it's called \"Why We Sleep.\" I borrowed it three weeks ago and keep forgetting.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

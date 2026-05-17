@@ -1,0 +1,9 @@
+{
+  "id": "formal-email",
+  "title": "Formal email dictation — decontraction, register, corrections",
+  "categories": ["email", "formal", "self-correction"],
+  "raw": "hey so draft an email to the client uh to thomas at acme dot com subject project timeline update and the body should be something like hey thomas no wait dear thomas we're writing no we are writing to let you know that the project timeline has been revised due to some unexpected technical challenges we've completed no we have completed sixty percent of the deliverables and we're no we are on track to deliver the remaining work by july fifteenth twenty twenty six please don't hesitate no please feel free to reach out if you have any questions regards the team",
+  "reference": "Dear Thomas,\n\nWe are writing to let you know that the project timeline has been revised due to some unexpected technical challenges. We have completed 60% of the deliverables and are on track to deliver the remaining work by July 15, 2026.\n\nPlease feel free to reach out if you have any questions.\n\nRegards,\nThe team",
+  "cleanupLevel": "high",
+  "personality": "formal"
+}

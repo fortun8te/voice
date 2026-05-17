@@ -257,7 +257,7 @@ final class TranscriptionService: TranscriptionEngine {
 
         // Extract suspect words from per-token confidence. FluidAudio's
         // `ASRResult.tokenTimings` carries per-token confidence (0..1). We
-        // surface tokens below 0.6 to the polish layer as "suspect" — the
+        // surface tokens below 0.65 to the polish layer as "suspect" — the
         // LLM gets to double-check spelling / word choice on those.
         // Tokens are SentencePiece pieces ("▁world", "in", "g") — we coarsen
         // them up to whole words by re-joining adjacent pieces that don't
@@ -265,7 +265,7 @@ final class TranscriptionService: TranscriptionEngine {
         // suspectWords is nil and the polisher gets no hint.
         let suspectWords: [String]? = Self.extractSuspectWords(
             from: result.tokenTimings,
-            confidenceThreshold: 0.75
+            confidenceThreshold: 0.65
         )
         if let suspectWords, !suspectWords.isEmpty {
             print("[VOICE-TS] suspect words (low-confidence): \(suspectWords)")
@@ -492,7 +492,7 @@ final class TranscriptionService: TranscriptionEngine {
         var merged = outputs[0].text
         var mergedConf = outputs[0].confidence
         var allTimings: [TokenTiming] = outputs[0].timings ?? []
-        let overlapWordBudget = 24 // ~2s of speech at ~12 wps upper bound
+        let overlapWordBudget = 10 // 2s overlap ≈ 6-8 words at normal speech; 10 caps false-positive risk
 
         for i in 1..<outputs.count {
             let prevConf = mergedConf
@@ -557,7 +557,10 @@ final class TranscriptionService: TranscriptionEngine {
             var hits = 0
             for j in 0..<k where lTail[j] == rHead[j] { hits += 1 }
             let ratio = Double(hits) / Double(k)
-            if ratio >= 0.6 && lTail.first == rHead.first {
+            // Tighter guard: ≥75% word match AND first AND last word of the
+            // window agree. Raising from 60% + first-only prevents false-
+            // positive overlaps from eating non-overlap content at the seam.
+            if ratio >= 0.75 && lTail.first == rHead.first && lTail.last == rHead.last {
                 bestK = k
                 break
             }

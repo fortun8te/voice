@@ -1,0 +1,9 @@
+{
+  "id": "rant-then-list",
+  "title": "Rant up front, then a precise list — opposite order from case 33",
+  "categories": ["rant", "lists", "multi-topic"],
+  "raw": "okay so first of all i'm so frustrated with the onboarding flow because we've had the same three bugs for like six weeks now and every sprint we say we're gonna fix it and every sprint something more urgent comes up and then users complain and we apologize and then it happens again and i know we're a small team but at some point we just have to sit down and fix it anyway here are the actual bugs one the email verification link expires in ten minutes which is way too short it should be twenty four hours two the phone number field doesn't accept country codes starting with plus so international users can't sign up at all and three if you try to upload a profile picture larger than two megabytes the page just goes blank with no error message and zero feedback to the user",
+  "reference": "I'm frustrated with the onboarding flow. We've had the same three bugs for six weeks. Every sprint we say we'll fix it, every sprint something more urgent comes up. Users complain, we apologize, and it repeats. At some point we just have to sit down and fix it.\n\n**The bugs:**\n1. Email verification link expires in 10 minutes. Should be 24 hours.\n2. Phone number field doesn't accept country codes starting with `+`, so international users can't sign up.\n3. Uploading a profile picture larger than 2 MB makes the page go blank with no error message.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

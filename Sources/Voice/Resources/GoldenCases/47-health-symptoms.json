@@ -1,0 +1,9 @@
+{
+  "id": "health-symptoms",
+  "title": "Health/symptoms log — numbers, timeline, corrections collapsed",
+  "categories": ["everyday", "numbers", "self-correction"],
+  "raw": "okay symptoms log for the doctor so the headache started on monday no sunday evening around nine pm and it's like a dull pressure behind my left eye no both eyes actually and on a scale of one to ten it's like a six no more like a seven when it's bad and i've been taking ibuprofen four hundred milligrams no six hundred milligrams every eight hours and it helps for like four hours then comes back and i also have some neck stiffness especially in the morning and it goes away after like thirty minutes after i get up and i'm not running a fever i checked and it was thirty seven point two celsius which is normal and no nausea and no sensitivity to light no wait mild sensitivity to light but only when it's really bright like direct sunlight and i had a similar headache about three weeks ago that lasted four days and went away on its own and i haven't had any head injuries recently and my sleep has been fine about seven to eight hours a night",
+  "reference": "Symptoms log for the doctor. The headache started Sunday evening around 9 PM. It's a dull pressure behind both eyes. On a scale of one to ten, it's about a seven when it's bad. I've been taking ibuprofen 600mg every eight hours — it helps for about four hours, then comes back. I also have neck stiffness in the mornings, goes away after about 30 minutes. No fever (37.2°C, normal). No nausea. Mild light sensitivity, but only in direct sunlight. Similar headache about three weeks ago, lasted four days, went away on its own. No recent head injuries. Sleep is fine, about seven to eight hours a night.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

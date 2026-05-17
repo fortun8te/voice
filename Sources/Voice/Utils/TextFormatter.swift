@@ -1677,6 +1677,90 @@ class TextFormatter {
         ("co pilot", "Copilot"),
         ("github copilot", "GitHub Copilot"),
 
+        // AI model names — common Whisper mishears mapped to canonical
+        // Qwen: Whisper hears "coin", "queen", "quen", "kwen" — all → Qwen
+        ("coin 3", "Qwen3"),
+        ("coin three", "Qwen3"),
+        ("coin 2.5", "Qwen2.5"),
+        ("coin two point five", "Qwen2.5"),
+        ("coin 2", "Qwen2"),
+        ("queen 3", "Qwen3"),
+        ("queen three", "Qwen3"),
+        ("quen 3", "Qwen3"),
+        ("quen three", "Qwen3"),
+        ("kwen 3", "Qwen3"),
+        ("qwen 3", "Qwen3"),
+        ("qwen three", "Qwen3"),
+        ("qwen 2.5", "Qwen2.5"),
+        ("qwen3", "Qwen3"),
+        ("qwen", "Qwen"),
+        // GLM: Whisper hears "g l m", "gee el em"
+        ("g l m 4.6", "GLM-4.6"),
+        ("g l m 4.7", "GLM-4.7"),
+        ("g l m 4", "GLM-4"),
+        ("g l m", "GLM"),
+        ("gee el em", "GLM"),
+        ("glm 4.6", "GLM-4.6"),
+        ("glm 4.7", "GLM-4.7"),
+        ("glm 4", "GLM-4"),
+        ("glm", "GLM"),
+        // DeepSeek
+        ("deep seek", "DeepSeek"),
+        ("deep seek v3", "DeepSeek-V3"),
+        ("deep seek r1", "DeepSeek-R1"),
+        ("deepseek r1", "DeepSeek-R1"),
+        ("deepseek v3", "DeepSeek-V3"),
+        // Kimi / Moonshot
+        ("kimi k2", "Kimi K2"),
+        ("kimmy k2", "Kimi K2"),
+        ("moonshot", "Moonshot"),
+        // Llama
+        ("lama 3", "Llama 3"),
+        ("lama 4", "Llama 4"),
+        ("llama 3", "Llama 3"),
+        ("llama 4", "Llama 4"),
+        ("llama", "Llama"),
+        // Mistral / Mixtral
+        ("mistral", "Mistral"),
+        ("mixtral", "Mixtral"),
+        // GPT-OSS
+        ("gpt o s s", "GPT-OSS"),
+        ("gpt oss", "GPT-OSS"),
+        ("gpt oss 20b", "gpt-oss-20b"),
+        ("gpt oss 120b", "gpt-oss-120b"),
+        // Phi / Gemma / Yi
+        ("phi 3", "Phi-3"),
+        ("phi 4", "Phi-4"),
+        ("gemma 2", "Gemma 2"),
+        ("gemma 3", "Gemma 3"),
+        // o-series (OpenAI reasoning)
+        ("o one", "o1"),
+        ("o three", "o3"),
+        ("o four mini", "o4-mini"),
+        // Inference hosts
+        ("cerebras", "Cerebras"),
+        ("groq", "Groq"),
+        ("together ai", "Together AI"),
+        ("fireworks ai", "Fireworks"),
+        ("open router", "OpenRouter"),
+        ("hugging face", "Hugging Face"),
+        ("l m studio", "LM Studio"),
+        ("lm studio", "LM Studio"),
+        ("o llama", "Ollama"),
+        ("ollama", "Ollama"),
+        ("v l l m", "vLLM"),
+        ("vllm", "vLLM"),
+        // ML infra
+        ("m c p", "MCP"),
+        ("rag", "RAG"),
+        ("lora", "LoRA"),
+        ("q lora", "QLoRA"),
+        ("g g u f", "GGUF"),
+        ("gguf", "GGUF"),
+        ("g p t q", "GPTQ"),
+        ("mixture of experts", "Mixture of Experts"),
+        ("moe", "MoE"),
+
         // Voice/dictation competitors
         ("wispr flow", "Wispr Flow"),
         ("whisper flow", "Wispr Flow"),
@@ -2621,8 +2705,8 @@ class TextFormatter {
 
     // MARK: - Terminal punctuation
 
-    /// If the trimmed text doesn't end with terminal punctuation, append a period.
-    /// Skips list bullets, closing parens/quotes, and existing terminal marks.
+    /// If the trimmed text doesn't end with terminal punctuation, append a period —
+    /// but only when the last word doesn't signal an incomplete sentence.
     private func ensureTerminalPunctuation(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let last = trimmed.last else { return text }
@@ -2631,6 +2715,32 @@ class TextFormatter {
         if last == "-" || last == ")" || last == "\"" || last == "\u{201D}" {
             return text
         }
+
+        // Don't append a period if the last word implies the sentence is mid-flight.
+        let lastWord = trimmed
+            .components(separatedBy: .whitespacesAndNewlines)
+            .last?
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet.letters.inverted) ?? ""
+        let openEnders: Set<String> = [
+            // prepositions
+            "to", "with", "in", "on", "at", "from", "of", "for", "about",
+            "by", "into", "through", "after", "before", "between", "during",
+            "across", "over", "under", "without", "within", "around", "along",
+            // conjunctions
+            "and", "or", "but", "because", "that", "if", "when", "while",
+            "although", "since", "unless", "so", "yet", "nor", "whether",
+            // modal/aux verbs
+            "should", "would", "could", "might", "will", "shall", "must",
+            "can", "do", "does", "did", "is", "are", "was", "were", "be",
+            "been", "have", "had", "has", "am",
+            // articles / determiners
+            "the", "a", "an", "this", "that", "these", "those",
+            // adverbs that trail mid-clause
+            "also", "just", "even", "still", "already", "then", "now",
+        ]
+        if openEnders.contains(lastWord) { return text }
+
         if let trimmedRange = text.range(of: trimmed) {
             return text.replacingCharacters(in: trimmedRange, with: trimmed + ".")
         }
@@ -3036,12 +3146,17 @@ class TextFormatter {
         let shifts = [
             "also ", "oh and ", "wait also ", "and also ",
             "another thing ", "one more thing ", "also also ",
+            // Stronger topic-shift signals — these almost always introduce
+            // a new thread that deserves a paragraph break.
+            "anyway ", "anyways ", "moving on ", "on a different note ",
+            "by the way ", "btw ", "switching topics ", "separate topic ",
+            "different topic ", "next thing ", "secondly ", "thirdly ",
+            "finally ", "lastly ", "to wrap up ", "in summary ",
+            "one more ", "speaking of ", "that reminds me ",
+            // "Okay so" at sentence boundary almost always restarts a topic.
+            "okay so ", "ok so ", "alright so ", "right so ",
         ]
         for shift in shifts {
-            // After a sentence-ending period/!/?/ellipsis, if the shift word starts
-            // a new clause, insert a paragraph break.
-            // BUGFIX: include `\u{2026}` (ellipsis) in the terminal-punct class so
-            // sentences ending with "…" also trigger topic shifts.
             let pattern = "([.!?\u{2026}])\\s+(?i)\(NSRegularExpression.escapedPattern(for: shift))"
             t = t.replacingOccurrences(
                 of: pattern,

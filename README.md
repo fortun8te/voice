@@ -1,5 +1,7 @@
 # VOICE
 
+**Offline dictation for macOS with LLM-powered rewriting.** Press Cmd+Right, speak, get intelligent text that understands context—no cloud, no subscription, Wispr-level quality on your Mac.
+
 Dictation that understands. Press Cmd+Right, speak, get intelligent rewriting—locally, offline, no subscription.
 
 ```
@@ -9,12 +11,13 @@ VOICE: "Add this to the agenda for tomorrow's standup." (200ms)
 
 ---
 
-## Why It Works
+## Features
 
-- **Intelligent rewriting** — Qwen3 LLM fixes homophones, grammar, formatting. Not just transcription.
-- **Offline** — Runs locally on M-series Macs. No network, no latency, no cost.
-- **Wispr-level quality** — Recognizes 90+ AI model names, tech terms, custom vocabulary. Handles personalities (formal/casual/excited).
-- **Fast enough** — ~200ms latency. Instant enough to feel natural.
+- **LLM-powered rewriting** — Qwen3 (1.7B–235B) understands context, fixes homophones, grammar, formatting. Not just speech-to-text.
+- **Fully offline** — Runs locally on M-series Macs. No cloud dependency, no network latency, no subscription fees.
+- **Smart vocabulary** — Recognizes 90+ AI model names (Qwen, DeepSeek, GLM, etc.), technical terms, brand names. Add custom vocabulary in settings.
+- **Personality modes** — Formal, casual, neutral, excited. Handles tone transformation, not just transcription.
+- **200ms latency** — Fast enough to feel natural. Optional Qwen3-235B cloud mode for longer inputs.
 
 ---
 
@@ -32,13 +35,13 @@ Press **Cmd+Right**, speak, release. Done.
 
 ---
 
-## How It Works
+## How It Works (Speech-to-Text Pipeline)
 
-1. **Parakeet TDT** (on-device ASR) → captures your voice
-2. **TextFormatter** (pre-LLM) → fixes common Whisper mishears
-3. **Qwen3 1.7B** (local LLM) → rewrites for grammar, tone, formatting
-4. **PostProcessor** (smart rules) → strips em-dashes, formats lists, fixes decimals
-5. **Paste** → into your active app
+1. **Parakeet TDT** (on-device ASR, <1s) → speech recognition
+2. **TextFormatter** (regex layer) → fixes Whisper homophones before LLM
+3. **Qwen3 LLM** (1.7B local or 235B cloud) → intelligent rewriting (grammar, tone, formatting)
+4. **PostProcessor** (deterministic rules) → formatting cleanup (em-dashes, lists, decimals)
+5. **Clipboard + Paste** → inserts into active application
 
 ---
 
@@ -61,13 +64,13 @@ Settings > **Hotkeys** → Pick Cmd+Right or hands-free.
 
 ---
 
-## Why Qwen3?
+## Why Qwen3 (Not Claude/GPT/Whisper)?
 
-1. Runs locally (1.7B = 530MB, <500ms on M1)
-2. Excellent homophones (trained on diverse text)
-3. Fast inference (MLX-Swift on GPU)
-4. Open source (can self-host)
-5. Optional cloud tier for quality (235B)
+1. **Runs locally** (1.7B = 530MB, <500ms on M1 Mac)
+2. **Homophone-aware** — trained on diverse multilingual text, handles "Qwen"/"queen"/"coin" distinctions
+3. **Fast on-device inference** — MLX-Swift GPU acceleration avoids cloud latency
+4. **Open source** — fully transparent, can self-host, no vendor lock-in
+5. **Optional cloud fallback** — Qwen3-235B for complex dictation (via Hugging Face or local Ollama)
 
 ---
 
@@ -100,6 +103,24 @@ MIT. Use it, fork it, sell it.
 
 ---
 
-**[SETUP.md](./SETUP.md)** has everything else: cloud API keys, local model swapping, debug builds, performance tuning, full troubleshooting table.
+---
+
+## Compare to Alternatives
+
+| | VOICE | Wispr Flow | Other Clones |
+|---|---|---|---|
+| **Type** | Local LLM + cloud option | Cloud-only | Varies |
+| **Offline** | ✓ | ✗ | ✓ |
+| **LLM quality** | Qwen3 (1.7B–235B) | Proprietary | Tiny/none |
+| **Cost** | $0 | $4.99/mo | Varies |
+| **Latency** | ~200ms (local) | 2–3s (cloud) | Inconsistent |
+
+---
+
+## Resources
+
+- **[SETUP.md](./SETUP.md)** — Cloud API (Hugging Face/Groq/Ollama), model swapping, code signing, troubleshooting
+- **[GitHub](https://github.com/fortun8te/voice)** — Source code, issues
+- **License** — MIT (use, fork, sell freely)
 
 **Made by [fortun8te](https://twitter.com/fortun8te).**

@@ -1,0 +1,10 @@
+{
+  "id": "short-uncertainty-preserved",
+  "title": "Short sentence — uncertainty markers must NOT be stripped",
+  "categories": ["short", "uncertainty", "preservation", "regression"],
+  "raw": "i think we should probably push the deadline i'm not sure",
+  "reference": "I think we should probably push the deadline. I'm not sure.",
+  "notes": "REGRESSION: 'I think', 'probably', 'I'm not sure' must ALL survive. Removing any = FAIL. 'we should push the deadline' without hedges would be wrong. Two sentences, period after each. No other changes.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

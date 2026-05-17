@@ -32,7 +32,11 @@ targets:
           - "**/*.plist"
           - "**/*.entitlements"
           - "Resources/Fonts"
+          - "Resources/GoldenCases"
       - path: Sources/Voice/Resources/Fonts
+        buildPhase: resources
+        type: folder
+      - path: Sources/Voice/Resources/GoldenCases
         buildPhase: resources
         type: folder
     settings:
@@ -44,13 +48,45 @@ targets:
         INFOPLIST_FILE: Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: Voice.entitlements
-        # TWEAK: Stable signing — uses your Apple Development cert so TCC permissions
-        # (Microphone, Accessibility, etc.) persist across rebuilds
-        # TWEAK: Ad-hoc signing — for stable permissions, install once to /Applications
-        # then rebuild in place; TCC keys partly off install path + cdhash, so a
-        # stable path helps. Run ./install.sh after each significant rebuild.
+        #
+        # === CODE SIGNING — THE "Voice OLD" / TCC PERMISSIONS BUG ===
+        #
+        # TCC (Privacy & Security) pins every Microphone / Accessibility grant
+        # to the app's codesign *designated requirement*. With ad-hoc signing
+        # (`-`), the designated requirement is just `cdhash H"..."` — a SHA over
+        # the binary. Every rebuild produces a different cdhash, so TCC sees a
+        # brand-new app on every install and the user has to re-grant. Stale
+        # grants from previous builds show up as duplicate / "Voice OLD" rows in
+        # the TCC database.
+        #
+        # FIX: sign with a stable identity so the designated requirement is
+        # constant across rebuilds. Two options:
+        #
+        #   (A) Apple Development cert (preferred — already trusted, no setup):
+        #         CODE_SIGN_IDENTITY: "Apple Development: <your name> (TEAMID)"
+        #       Requires the cert's PRIVATE KEY in login keychain. Verify with:
+        #         security find-identity -v -p codesigning
+        #       and ensure a "code signing" capable identity is listed AND that
+        #         codesign --force --sign "<name>" /bin/ls.copy
+        #       actually signs without errSecInternalComponent (which means the
+        #       private key isn't present in this keychain — re-download from
+        #       developer.apple.com or restore from iCloud Keychain).
+        #
+        #   (B) Self-signed cert (works without an Apple Developer account):
+        #         ./scripts/setup-stable-cert.sh
+        #       creates a persistent `voice-dev` identity, then set:
+        #         CODE_SIGN_IDENTITY: "voice-dev"
+        #
+        # CURRENT SETTING: ad-hoc (`-`).
+        # The user's Apple Development cert has no usable private key in this
+        # keychain (signing errors with errSecInternalComponent). Until that's
+        # fixed OR the user runs setup-stable-cert.sh, builds use ad-hoc and TCC
+        # permissions will reset on each install. The icon bug — independent of
+        # signing — is fixed regardless of which identity is used.
+        #
         CODE_SIGN_STYLE: Manual
-        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_IDENTITY: "voice-dev"
+        CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
         SWIFT_VERSION: "5.9"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         ENABLE_HARDENED_RUNTIME: YES
@@ -65,6 +101,15 @@ targets:
         product: MLXLLM
       - package: mlx-swift-examples
         product: MLXLMCommon
+    postBuildScripts:
+      - name: Fix AppIcon icns
+        script: "\"${SRCROOT}/scripts/fix_appicon_icns.sh\""
+        inputFiles:
+          - $(SRCROOT)/Sources/Voice/Resources/IconSource.png
+          - $(SRCROOT)/scripts/fix_appicon_icns.sh
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/AppIcon.icns
+        runOnlyWhenInstalling: false
     entitlements:
       path: Voice.entitlements
       properties:
@@ -78,4 +123,5 @@ targets:
         CFBundleName: "VOICE"
         NSMicrophoneUsageDescription: "VOICE transcribes your speech to text on-device."
         NSAppleEventsUsageDescription: "VOICE pastes transcripts at your cursor."
+        NSAccessibilityUsageDescription: "VOICE pastes transcripts at your cursor using accessibility services."
         ATSApplicationFontsPath: "Fonts"

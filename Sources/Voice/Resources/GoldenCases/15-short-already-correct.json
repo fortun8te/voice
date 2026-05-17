@@ -1,0 +1,10 @@
+{
+  "id": "short-already-correct",
+  "title": "Short utterance — already correct, output UNCHANGED",
+  "categories": ["short", "preservation", "regression"],
+  "raw": "Let me know when you're done.",
+  "reference": "Let me know when you're done.",
+  "notes": "REGRESSION: input is already correct. Output must be BYTE-FOR-BYTE IDENTICAL to input. Any change = FAIL. This tests that the model does not add words, change punctuation, or rephrase when there is nothing to fix.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

@@ -1,0 +1,10 @@
+{
+  "id": "voice-commands",
+  "title": "Voice command punctuation",
+  "categories": ["voice-commands"],
+  "raw": "uh hey John comma actually no wait send it Friday period",
+  "reference": "Hey John. Actually no wait, send it Friday.",
+  "notes": "Spoken 'comma' / 'period' commands resolve correctly; filler stripped; sentence capitalization.",
+  "cleanupLevel": "medium",
+  "personality": "neutral"
+}

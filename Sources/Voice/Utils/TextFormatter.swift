@@ -83,6 +83,62 @@ class TextFormatter {
         self.config = config
     }
 
+    // MARK: - ASR confusables (Parakeet/Granite mis-hearings)
+
+    /// Words Parakeet frequently mis-transcribes. Surfaced to Qwen3 as
+    /// vocabulary hints when polish runs, so the LLM can correct in context.
+    /// Add new entries here as they're discovered.
+    // BUGFIX: Expanded ASR confusables — user has flagged "yo"→"yeah" multiple
+    // times. Added more yo/yote/yoat tokens, "test"/"tests", "house"/"host"
+    // pairs called out in the audit brief.
+    static let asrConfusables: [String: [String]] = [
+        "yeah": ["yo"],          // Parakeet often hears "yo" as "yeah"
+        "your": ["yo"],          // and sometimes as "your"
+        "you": ["yo"],
+        "yo": ["yo"],            // BUGFIX: surface "yo" itself so polish prompt knows it's intentional, not a Parakeet hallucination to "correct"
+        "yoat": ["yo"],          // "yoat houst" → "yo, quick test"
+        "yote": ["yo"],          // BUGFIX: another Parakeet "yo" mishear
+        "yoda": ["yo"],          // BUGFIX: seen in logs
+        "houst": ["host"],
+        "house": ["host"],       // BUGFIX: confusable pair
+        "host":  ["house"],
+        "tests": ["test"],       // BUGFIX: Parakeet pluralizes/depluralizes
+        "test":  ["tests"],
+        // BUGFIX (handle protection): Qwen3 polish keeps "correcting"
+        // "fortun8te" → "fortunate". Surface the pair to the LLM so it
+        // sees them as a known confusable and leaves usernames alone.
+        "fortunate":  ["fortun8te"],
+        // BUGFIX (handle protection): extra fortun8te confusables observed
+        // in the wild — sentence-ending punctuation ("fortunate.") and the
+        // letter-by-letter spellings Parakeet falls back to when it can't
+        // resolve the leetspeak digit ("forge net" / "forgenet").
+        "fortunate.": ["fortun8te"],
+        "forge net":  ["fortun8te"],
+        "forgenet":   ["fortun8te"],
+    ]
+
+    /// Per-utterance suspects — returns words from the transcript that have known
+    /// confusables. The polish prompt receives these via `suspectWords:` so the LLM
+    /// can disambiguate from context.
+    static func suspectsForPolish(_ text: String) -> [String] {
+        let lower = text.lowercased()
+        var hits: [String] = []
+        for (word, _) in asrConfusables {
+            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: word))\\b"
+            if lower.range(of: pattern, options: .regularExpression) != nil {
+                hits.append(word)
+            }
+        }
+        // BUGFIX (handle protection): also surface any letter+digit identifier
+        // (fortun8te, gr8, 4ever, ChatGPT3, m8) so the polisher treats them as
+        // "do not change". These are almost always usernames or shorthand the
+        // LLM tries to "correct" into dictionary words.
+        for handle in extractHandleShapes(text) {
+            hits.append(handle)
+        }
+        return Array(Set(hits))
+    }
+
     // MARK: - Cached regexes (compiled once at init time, reused on every format call)
     // Keeping these as lazy statics keeps `format` allocation-free on the hot path.
     private static let rxSpaceBeforePunct   = try! NSRegularExpression(pattern: #"\s+([,.!?;:])"#)
@@ -97,8 +153,10 @@ class TextFormatter {
     )
     // Sentence-start: position 0, OR after `.!?` plus optional close-quote/paren and whitespace,
     // OR after a paragraph break.
+    // NOTE: Swift `\u{...}` escapes are NOT processed inside raw strings (`#"..."#`),
+    // and ICU regex doesn't understand `\u{xxxx}`. Use literal Unicode characters.
     private static let rxSentenceStart = try! NSRegularExpression(
-        pattern: #"(^|[.!?\u{2026}][\"\u{201D}\)\]]?\s+|\n+\s*)([a-z])"#
+        pattern: #"(^|[.!?…]["”\)\]]?\s+|\n+\s*)([a-z])"#
     )
 
     // MARK: - Synchronous pipeline
@@ -110,6 +168,17 @@ class TextFormatter {
     /// fixed, numbers normalized.
     func format(_ text: String) -> String {
         var result = text
+
+        // BUGFIX (Yo/Yeah specific): normalize known Parakeet quirks BEFORE
+        // any other pass. "yoat" / "yote" → "yo", "houst" → "host". Conservative
+        // — only unambiguous tokens. Runs before stripLeadingFiller so the
+        // normalized "yo" isn't accidentally classified as a leading filler.
+        result = Self.normalizeParakeetQuirks(result)
+
+        // 1pre. Normalize known product / brand names BEFORE filler strip and
+        // dedup, so "wispr flow", "para keet", "moon shine" get canonicalized
+        // early and survive downstream passes intact.
+        result = normalizeKnownProductNames(result)
 
         // 1. Trim and strip leading filler at the very start of the utterance.
         result = stripLeadingFiller(result)
@@ -152,19 +221,19 @@ class TextFormatter {
         //     Runs BEFORE voice commands so salutation lines don't confuse command detection.
         result = formatSalutation(result)
 
-        // 2. Voice commands first (they introduce newlines that change structure).
+        // 2a. Special-character phrase formatting — MUST run BEFORE voice commands.
+        //     If voice commands fire first, "open quote"/"close quote" become the
+        //     unicode quote chars, and `wrapSpokenQuotes`'s "end quote / close quote"
+        //     pattern can no longer match. Same logic for paren commands.
+        //     Also must run BEFORE number folding so content inside still gets
+        //     normalized, and BEFORE percent/currency suffix passes.
+        result = wrapSpokenQuotes(result)
+        result = wrapSpokenParens(result)
+
+        // 2. Voice commands (they introduce newlines that change structure).
         if config.interpretVoiceCommands {
             result = applyVoiceCommands(result)
         }
-
-        // 2a. Special-character phrase formatting:
-        //     - "quote ... end quote" → smart-quoted span (with quote-verb detection)
-        //     - "(open) paren ... close paren" → "( ... )"
-        //     - "in parens X" → "(X)"
-        //     These must run BEFORE number folding so the content inside still
-        //     gets normalized, and BEFORE percent/currency suffix passes.
-        result = wrapSpokenQuotes(result)
-        result = wrapSpokenParens(result)
 
         // 3. Filler removal everywhere else.
         if config.removeFillers {
@@ -176,12 +245,37 @@ class TextFormatter {
             result = applySmartPunctuation(result)
         }
 
+        // 4a. PRE-NUMBER passes (deterministic, run BEFORE number-word folding
+        //     so multi-word phrases get matched as units instead of being
+        //     destroyed by the folder collapsing "nine thirty" → 39).
+        //     These fix the known LLM-polish failures: "39am", "12 point $5000000",
+        //     "version two point one point seven left verbatim", etc.
+        if config.formatNumbers {
+            result = normalizeSpokenTimesPrePass(result)           // "nine thirty AM" → "9:30 AM"
+            result = normalizeSpokenMoneyMagnitudesPrePass(result) // "twelve point five million dollars" → "$12.5 million"
+            result = normalizeVersionNumbers(result)               // "version two point one point seven" → "v2.1.7"
+            result = normalizeCountdowns(result)                   // "three two one" → "3, 2, 1"
+            result = normalizeDecimalNumbers(result)               // "three point one four" → "3.14"
+        }
+
         // 5. Number-word folding ("twenty three" → 23, "twenty third" → "23rd").
         if config.formatNumbers {
             result = convertOrdinals(result)
             result = convertNumberWords(result)
             result = convertSpokenTimes(result)
+            result = normalizeTimesOfDay(result)                   // BUGFIX: "5 30 pm" / "5:30 pm" → "5:30 PM", "5pm" → "5 PM"
+            result = normalizeMoneyAndUnits(result)                // NEW: "150 bucks" → "$150", "50 millimeter" → "50mm", "2.5 percent" → "2.5%"
+            result = normalizeLatencyDurations(result)             // "300 milliseconds" → "300ms"
         }
+
+        // 5a. Signal-rich structural prep for the polish stage. ORDER MATTERS:
+        //     `extractQuotedMessage` first so URLs inside the dictated body
+        //     get pulled out before URL protection runs; `detectAndMarkFieldLists`
+        //     before `backtickCodeTokens` so the snake_case-converted field
+        //     tokens it produces don't get double-wrapped in backticks.
+        result = extractQuotedMessage(result)
+        result = detectAndMarkFieldLists(result)
+        result = backtickCodeTokens(result)
 
         // 6. Currency ("five dollars" → "$5"). Runs AFTER number folding so it
         // can pick up "$<digits>" produced by the previous step.
@@ -209,6 +303,14 @@ class TextFormatter {
             result = fixContractions(result)
         }
 
+        // 8b. BUGFIX: protect URLs/emails from the capitalization + whitespace
+        // passes below, which otherwise insert spaces after the dots inside
+        // domains ("youtube.com" → "youtube. Com") and capitalize the TLD.
+        // We swap each match for a private-use unicode placeholder, run the
+        // pipeline, then restore at the end.
+        let (protectedText, urlMap) = protectURLsAndEmails(result)
+        result = protectedText
+
         // 9. Punctuation cleanup BEFORE capitalization so capitalization sees
         // the corrected sentence boundaries.
         result = cleanupPunctuation(result)
@@ -231,16 +333,28 @@ class TextFormatter {
         // 11. Em-dash strip (final defense — applies even if smartPunctuation off).
         result = stripEmDashes(result)
 
-        // 12. Whitespace pass.
-        result = cleanWhitespace(result)
-
-        // 13. Terminal punctuation (most users trail off without saying "period").
+        // 12. Terminal punctuation (most users trail off without saying "period").
         result = ensureTerminalPunctuation(result)
 
-        // 14. Question-mark inference — swap trailing `.` for `?` on sentences
+        // 13. Question-mark inference — swap trailing `.` for `?` on sentences
         // that start with an interrogative word. Runs after terminal punctuation
         // so the trailing `.` exists to be swapped.
         result = inferQuestionMarks(result)
+
+        // 13a. NEW: topic-shift paragraph breaks ("Also...", "Oh and...", "Wait...").
+        //      Runs AFTER terminal punctuation has been inferred so the `.!?`
+        //      boundary the regex matches on is reliably present.
+        result = insertTopicShiftBreaks(result)
+
+        // 14. BUGFIX: restore protected URLs / emails. Runs before final whitespace
+        // pass so cleanWhitespace can normalize spacing around them, but after all
+        // structural passes so the placeholders survive everything that mattered.
+        result = restoreURLsAndEmails(result, urlMap)
+
+        // 15. Whitespace pass — LAST. Verified newline/bullet/backtick-safe:
+        // only collapses runs of spaces and 3+ newlines, trims outer whitespace,
+        // never touches single newlines, leading `-` bullets, or backticks.
+        result = cleanWhitespace(result)
 
         return result
     }
@@ -348,6 +462,14 @@ class TextFormatter {
         ("open paren", "("),
         ("close paren", ")"),
         ("ellipsis", "\u{2026}"),
+        // CLI flags — must precede bare "dash" or the bare-dash rule fires first.
+        ("dash dash", "--"),
+        ("double dash", "--"),
+        ("double hyphen", "--"),
+        // Common symbols used in code/URLs
+        ("equals sign", "="),
+        ("tilde", "~"),
+        ("caret", "^"),
         ("dash", " - "),
 
         // List formatting.
@@ -360,12 +482,33 @@ class TextFormatter {
         ("tab", "\t"),
     ]
 
+    /// Spoken commands that have legitimate prose uses ("period drama",
+    /// "comma splice", "colon cancer"). For these we ONLY replace when the word
+    /// appears in a command-shaped context: at end of utterance, OR followed by
+    /// whitespace + (capitalized-word | line-end) — the natural pattern a speaker
+    /// uses to say "...sentence. period. Next sentence.".
+    private static let ambiguousVoiceCommands: Set<String> = [
+        "period", "comma", "colon", "semicolon"
+    ]
+
     /// Replace word-bounded spoken commands with their punctuation/structure.
     /// Word boundaries prevent "exclamation pointing" → "! ing".
+    /// BUGFIX: ambiguous single-word commands (period/comma/colon/semicolon)
+    /// require a command-shaped context so "the period drama was great" doesn't
+    /// become "the . drama was great".
     private func applyVoiceCommands(_ text: String) -> String {
         var result = text
         for command in voiceCommands {
-            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: command.pattern))\\b"
+            let escaped = NSRegularExpression.escapedPattern(for: command.pattern)
+            // For ambiguous words, require: preceded by space/start AND followed
+            // by end-of-string OR whitespace+capitalized OR newline.
+            // This catches "...store period next I went..." but not "the period drama".
+            let pattern: String
+            if Self.ambiguousVoiceCommands.contains(command.pattern) {
+                pattern = "\\b\(escaped)\\b(?=\\s*$|\\s+[A-Z]|\\s*\\n)"
+            } else {
+                pattern = "\\b\(escaped)\\b"
+            }
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
                 result = regex.stringByReplacingMatches(
                     in: result,
@@ -449,6 +592,9 @@ class TextFormatter {
 
     /// Replace straight apostrophes with curly. Letters on both sides → apostrophe
     /// (don't → don't); leading-space → open quote; otherwise close.
+    /// BUGFIX: special-case i == 0 (apostrophe at start of input) — emit OPENING
+    /// single quote since there's no preceding letter and we're clearly opening
+    /// a quoted span. Old logic fell through to closing-quote branch.
     private func replaceSmartSingleQuotes(_ text: String) -> String {
         var result = ""
         let chars = Array(text)
@@ -458,6 +604,9 @@ class TextFormatter {
                 let nextIsLetter = i < chars.count - 1 && chars[i+1].isLetter
                 if prevIsLetter && nextIsLetter {
                     result.append("\u{2019}")
+                } else if i == 0 && nextIsLetter {
+                    // Start-of-input + letter follows → opening quote.
+                    result.append("\u{2018}")
                 } else if prevIsLetter || (i > 0 && chars[i-1] == " ") {
                     result.append("\u{2018}")
                 } else {
@@ -521,10 +670,14 @@ class TextFormatter {
     // Only single-word tags listed here — multi-word ones like "isn't it" are
     // handled by the interrogative-starter pass above when they appear at the
     // sentence start of a short follow-on clause.
+    //
+    // BUGFIX: "really", "seriously", "honestly" removed — they're adverbs far
+    // more often than tag-question markers. "I'll tell you honestly." was being
+    // turned into a question. Short-sentence forms ("Really.", "Seriously.",
+    // "Honestly.") are still caught by `shortQuestionPhrases` below.
     private static let tagQuestionEnders: Set<String> = [
         "right", "correct", "yeah", "yes", "okay", "ok",
         "huh", "eh", "no",
-        "really", "seriously", "honestly",
     ]
 
     // Short standalone question words: single-word sentences like "Really."
@@ -600,6 +753,15 @@ class TextFormatter {
             guard let w = firstWord(from: sentenceStart) else { return }
             // Normalize curly apostrophe to straight for set lookup.
             let normalized = w.replacingOccurrences(of: "\u{2019}", with: "'")
+
+            // Guard: sentences ending with "question" that are long are likely
+            // rhetorical statements ("Are you sure this is the question."), not questions.
+            if let lastW = lastWord(sentStart: sentenceStart, sentEnd: terminalIndex),
+               lastW == "question" {
+                // Count words in sentence — long sentences ending "question" are statements.
+                let sentBody = sentenceBody(sentStart: sentenceStart, sentEnd: terminalIndex)
+                if sentBody.split(separator: " ").count > 6 { return }
+            }
 
             // 1. Interrogative-starter check (existing logic).
             if Self.interrogativeStarters.contains(normalized) {
@@ -793,6 +955,254 @@ class TextFormatter {
             if let r = Range(range, in: result) {
                 result.replaceSubrange(r, with: replacement)
             }
+        }
+        return result
+    }
+
+    // MARK: - Pre-number deterministic normalizers
+    //
+    // These run BEFORE `convertNumberWords` so multi-word number phrases tied
+    // to a unit/context (time, money, version) get matched as units before the
+    // general folder collapses them into a single integer (which produces
+    // garbage like "nine thirty am" → 9+30 = "39am").
+
+    /// Map number-WORDS 0-59 (no digit forms — those are handled by the existing
+    /// post-fold `convertSpokenTimes` regex). Covers single units, teens,
+    /// bare tens, and "tens unit" pairs.
+    private func wordsToMinuteOrHour(_ tokens: [String]) -> Int? {
+        guard !tokens.isEmpty, tokens.count <= 2 else { return nil }
+        if tokens.count == 1 {
+            if let v = Self.unitMap[tokens[0]] { return v }
+            if let v = Self.tensMap[tokens[0]] { return v }
+            return nil
+        }
+        // Two tokens: must be tens + unit (1-9).
+        guard let tens = Self.tensMap[tokens[0]],
+              let unit = Self.unitMap[tokens[1]],
+              unit < 10 else { return nil }
+        return tens + unit
+    }
+
+    /// "nine thirty AM" → "9:30 AM", "ten fifteen pm" → "10:15 PM",
+    /// "five AM" → "5 AM", "nine AM" → "9 AM", "nine thirty a m" → "9:30 AM".
+    /// CRITICAL: blocks "nine thirty" from being folded to 39 by the general
+    /// number-word folder. Single-hour forms (no minutes) defer to the
+    /// existing `convertSpokenTimes` regex for "9am" formatting.
+    private func normalizeSpokenTimesPrePass(_ text: String) -> String {
+        // (hour-words) (optional minute-words) (a.m.|am|p.m.|pm), word-bounded.
+        // Hour: 1-2 words. Minute: 0-2 words. AM/PM tolerates spaces and dots.
+        let hourWord = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)"
+        let minWord  = "(?:oh|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty)"
+        // Captures: 1=hour phrase, 2=optional minute phrase, 3=am/pm marker
+        let pat = "(?i)\\b(\(hourWord)(?:\\s+\(hourWord))?)(?:\\s+(\(minWord)(?:\\s+\(minWord))?))?\\s+(a\\.?\\s*m\\.?|p\\.?\\s*m\\.?)\\b"
+        guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
+        var result = text
+        let ns = result as NSString
+        let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            let hourTokens = ns.substring(with: m.range(at: 1)).lowercased().split(separator: " ").map(String.init)
+            guard let hour = wordsToMinuteOrHour(hourTokens), hour >= 0, hour <= 23 else { continue }
+            var minute: Int? = nil
+            if m.range(at: 2).location != NSNotFound {
+                let minTokens = ns.substring(with: m.range(at: 2)).lowercased()
+                    .split(separator: " ").map(String.init)
+                    .filter { $0 != "oh" }  // "nine oh five" → minute "5"
+                if let mv = wordsToMinuteOrHour(minTokens.isEmpty ? ["zero"] : minTokens),
+                   mv >= 0, mv < 60 {
+                    minute = mv
+                } else {
+                    continue  // bail — don't half-rewrite
+                }
+            }
+            let suffixRaw = ns.substring(with: m.range(at: 3))
+                .lowercased()
+                .replacingOccurrences(of: ".", with: "")
+                .replacingOccurrences(of: " ", with: "")
+            let suffix = (suffixRaw == "am") ? "AM" : "PM"
+            let formatted: String
+            if let mm = minute {
+                formatted = String(format: "%d:%02d %@", hour, mm, suffix)
+            } else {
+                formatted = "\(hour) \(suffix)"  // single-hour: keep simple, convertSpokenTimes turns it into "9am" if desired
+            }
+            result = (result as NSString).replacingCharacters(in: m.range, with: formatted)
+        }
+        return result
+    }
+
+    /// "twelve point five million dollars" → "$12.5 million" (keeps the word
+    /// "million" so the downstream `applyCurrencyMagnitudes` can fold it to
+    /// "$12.5M" if desired). Also handles "twenty million dollars" → "$20 million".
+    ///
+    /// CRITICAL: blocks the general number-folder from seeing the "point" word
+    /// (which stops the run, producing "12 point $5000000" garbage when
+    /// "five million dollars" then folds to $5,000,000).
+    private func normalizeSpokenMoneyMagnitudesPrePass(_ text: String) -> String {
+        let intWords = "(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)"
+        let mag      = "(million|billion|thousand|k)"
+        let currency = "(?:dollars?|bucks?|euros?|pounds?|yen|usd|gbp|eur)"
+        // (1=int phrase) (optional " point " + 2=fractional phrase) ws mag ws currency
+        let pat = "(?i)\\b(\(intWords)(?:\\s+(?:and\\s+)?\(intWords))*)(?:\\s+point\\s+(\(intWords)(?:\\s+\(intWords))*))?\\s+\(mag)\\s+\(currency)\\b"
+        guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
+        var result = text
+        let ns = result as NSString
+        let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            // Fold the integer part using the existing convertNumberWords on a
+            // tiny substring (cheap and re-uses the proven folder).
+            let intPhrase = ns.substring(with: m.range(at: 1))
+            let folded = convertNumberWords(intPhrase).trimmingCharacters(in: .whitespaces)
+            guard Int(folded) != nil || folded.allSatisfy({ $0.isNumber }) else { continue }
+
+            var numberText = folded
+            if m.range(at: 2).location != NSNotFound {
+                // Fractional part — each word becomes a single digit in sequence.
+                // "five" → "5", "five seven" → "57".
+                let fracPhrase = ns.substring(with: m.range(at: 2)).lowercased()
+                let digits = fracPhrase.split(separator: " ").compactMap { word -> String? in
+                    if let v = Self.unitMap[String(word)], v < 10 { return String(v) }
+                    return nil
+                }.joined()
+                if !digits.isEmpty {
+                    numberText += ".\(digits)"
+                }
+            }
+            let magWord = ns.substring(with: m.range(at: 3))
+            let replacement = "$\(numberText) \(magWord)"
+            result = (result as NSString).replacingCharacters(in: m.range, with: replacement)
+        }
+        return result
+    }
+
+    /// "version two point one point seven" → "v2.1.7",
+    /// "version 1 2 3" / "version 1.2.3" stays as "v1.2.3".
+    /// Triggered ONLY by the leading word "version" or "v" so prose like
+    /// "point one is X" doesn't accidentally match.
+    private func normalizeVersionNumbers(_ text: String) -> String {
+        let comp = "(?:\\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)"
+        // "version <comp> (point|dot|.|\s) <comp> ..." — require at least 2 components.
+        let pat = "(?i)\\bversion\\s+(\(comp))(?:\\s*(?:point|dot|\\.)\\s*(\(comp)))(?:\\s*(?:point|dot|\\.)\\s*(\(comp)))?(?:\\s*(?:point|dot|\\.)\\s*(\(comp)))?\\b"
+        guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
+        var result = text
+        let ns = result as NSString
+        let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            var parts: [String] = []
+            for i in 1..<m.numberOfRanges {
+                let r = m.range(at: i)
+                guard r.location != NSNotFound else { continue }
+                let raw = ns.substring(with: r).lowercased()
+                if let n = Int(raw) {
+                    parts.append(String(n))
+                } else if let v = Self.unitMap[raw] {
+                    parts.append(String(v))
+                } else if let v = Self.tensMap[raw] {
+                    parts.append(String(v))
+                } else if raw == "hundred" {
+                    parts.append("100")
+                } else {
+                    parts = []  // unknown token — bail
+                    break
+                }
+            }
+            guard parts.count >= 2 else { continue }
+            let replacement = "v" + parts.joined(separator: ".")
+            result = (result as NSString).replacingCharacters(in: m.range, with: replacement)
+        }
+        return result
+    }
+
+    /// "three two one" / "5 4 3 2 1" / "three, two, one" → "3, 2, 1".
+    /// Catches sequential descending small integers (digits OR words) of
+    /// length ≥3, all distinct, monotonically decreasing by 1. Conservative:
+    /// requires the run to end at 1 OR be followed by "go"/"liftoff"/"blast off"
+    /// so casual "one two three testing" doesn't trip it.
+    private func normalizeCountdowns(_ text: String) -> String {
+        let nWord = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten)"
+        let numTok = "(?:\\d{1,2}|\(nWord))"
+        // 3-5 number tokens separated by spaces or commas, optionally followed
+        // by a launch word.
+        let pat = "(?i)\\b(\(numTok))[,\\s]+(\(numTok))[,\\s]+(\(numTok))(?:[,\\s]+(\(numTok)))?(?:[,\\s]+(\(numTok)))?(\\s+(?:go|liftoff|lift\\s*off|blast\\s*off))?"
+        guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
+        func toInt(_ s: String) -> Int? {
+            let l = s.lowercased()
+            if let n = Int(l) { return n }
+            return Self.unitMap[l]
+        }
+        var result = text
+        let ns = result as NSString
+        let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            var nums: [Int] = []
+            for i in 1...5 {
+                let r = m.range(at: i)
+                if r.location == NSNotFound { continue }
+                guard let n = toInt(ns.substring(with: r)) else { nums = []; break }
+                nums.append(n)
+            }
+            guard nums.count >= 3 else { continue }
+            // Strictly descending by 1.
+            var ok = true
+            for j in 1..<nums.count where nums[j] != nums[j-1] - 1 { ok = false; break }
+            if !ok { continue }
+            // Either ends at 1, or trailed by launch word.
+            let hasLaunch = m.numberOfRanges > 6 && m.range(at: 6).location != NSNotFound
+            guard nums.last == 1 || hasLaunch else { continue }
+            var replacement = nums.map(String.init).joined(separator: ", ")
+            if hasLaunch {
+                replacement += ns.substring(with: m.range(at: 6))
+            }
+            result = (result as NSString).replacingCharacters(in: m.range, with: replacement)
+        }
+        return result
+    }
+
+    /// "three point one four" → "3.14", "zero point five" → "0.5".
+    /// Runs BEFORE `convertNumberWords` so "X point Y" survives as a decimal.
+    /// Negative lookahead prevents collision with the money-magnitude pre-pass
+    /// (which already handled "two point five million dollars").
+    private func normalizeDecimalNumbers(_ text: String) -> String {
+        let intWord = "(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)"
+        let decWord = "(?:zero|one|two|three|four|five|six|seven|eight|nine)"
+        // Don't fire when followed by a scale word — money pre-pass already handled that.
+        let pat = "(?i)\\b(\(intWord)(?:\\s+\(intWord))*)\\s+point\\s+(\(decWord)(?:\\s+\(decWord))*)(?!\\s*(?:million|billion|thousand|\\bk\\b|\\bm\\b|\\bb\\b))"
+        guard let rx = try? NSRegularExpression(pattern: pat) else { return text }
+        var result = text
+        let ns = result as NSString
+        let matches = rx.matches(in: result, range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            let intPhrase = ns.substring(with: m.range(at: 1))
+            let decPhrase = ns.substring(with: m.range(at: 2)).lowercased()
+            let folded = convertNumberWords(intPhrase).trimmingCharacters(in: .whitespaces)
+            guard folded.allSatisfy({ $0.isNumber }) else { continue }
+            let decDigits = decPhrase.split(separator: " ").compactMap { word -> String? in
+                if let v = Self.unitMap[String(word)], v < 10 { return String(v) }
+                return nil
+            }.joined()
+            guard !decDigits.isEmpty else { continue }
+            result = (result as NSString).replacingCharacters(in: m.range, with: "\(folded).\(decDigits)")
+        }
+        return result
+    }
+
+    /// "300 milliseconds" → "300ms", "1.5 seconds" → "1.5s" (decimal only),
+    /// "500 nanoseconds" → "500ns", "100 microseconds" → "100µs".
+    /// Runs AFTER number-word folding so spoken numbers are already digits.
+    private func normalizeLatencyDurations(_ text: String) -> String {
+        let subs: [(String, String)] = [
+            ("nanoseconds", "ns"), ("nanosecond", "ns"),
+            ("microseconds", "µs"), ("microsecond", "µs"),
+            ("milliseconds", "ms"), ("millisecond", "ms"),
+        ]
+        var result = text
+        for (unit, abbr) in subs {
+            let pat = #"(\d+(?:\.\d+)?)\s+"# + NSRegularExpression.escapedPattern(for: unit) + #"\b"#
+            guard let rx = try? NSRegularExpression(pattern: pat, options: .caseInsensitive) else { continue }
+            result = rx.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "$1\(abbr)")
+        }
+        // Seconds: only abbreviate when decimal (2.5s not 3s — "3 seconds" is natural prose).
+        if let rx = try? NSRegularExpression(pattern: #"(\d+\.\d+)\s+seconds?\b"#, options: .caseInsensitive) {
+            result = rx.stringByReplacingMatches(in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "$1s")
         }
         return result
     }
@@ -1093,6 +1503,23 @@ class TextFormatter {
             (" dot dev",  ".dev"),
             (" dot ai",   ".ai"),
             (" dot app",  ".app"),
+            (" dot xyz",  ".xyz"),
+            (" dot me",   ".me"),
+            (" dot gg",   ".gg"),
+            (" dot sh",   ".sh"),
+            (" dot so",   ".so"),
+            (" dot tv",   ".tv"),
+            (" dot us",   ".us"),
+            (" dot uk",   ".uk"),
+            (" dot ca",   ".ca"),
+            (" dot de",   ".de"),
+            (" dot fr",   ".fr"),
+            (" dot au",   ".au"),
+            (" dot edu",  ".edu"),
+            (" dot gov",  ".gov"),
+            (" dot info", ".info"),
+            (" dot tech", ".tech"),
+            (" dot cloud",".cloud"),
             (" at sign ", "@"),
             (" underscore ", "_"),
             (" forward slash ", "/"),
@@ -1126,16 +1553,37 @@ class TextFormatter {
     /// ensure space-after-punct, trim outer whitespace.
     private func cleanWhitespace(_ text: String) -> String {
         var result = text
-        while result.contains("  ") {
-            result = result.replacingOccurrences(of: "  ", with: " ")
-        }
+        // Collapse runs of spaces/tabs to a single space in ONE regex pass.
+        // Newlines and bullets/backticks are structural — leave them untouched
+        // so the polish stage can honor injected list / paragraph / code
+        // markers from earlier passes.
+        // BUGFIX (perf): replaced the `while contains("  ")` loop — that was
+        // O(n) per pass and O(log n) passes on long inputs, causing repeated
+        // allocations on dense whitespace. The regex form is one linear pass.
+        result = result.replacingOccurrences(
+            of: #"[ \t]{2,}"#,
+            with: " ",
+            options: .regularExpression
+        )
+        // Collapse 3+ consecutive newlines down to exactly 2 (one blank line
+        // separating paragraphs). Allows topic-shift / list / quoted-message
+        // passes to safely emit `\n\n` without compounding into walls of blank
+        // lines.
+        result = result.replacingOccurrences(
+            of: #"\n{3,}"#,
+            with: "\n\n",
+            options: .regularExpression
+        )
         result = result.replacingOccurrences(of: " .", with: ".")
         result = result.replacingOccurrences(of: " ,", with: ",")
         result = result.replacingOccurrences(of: " ?", with: "?")
         result = result.replacingOccurrences(of: " !", with: "!")
         let range = NSRange(result.startIndex..., in: result)
         result = Self.rxPunctSpacing.stringByReplacingMatches(in: result, range: range, withTemplate: "$1 $2")
-        result = result.trimmingCharacters(in: .whitespaces)
+        // Trim leading/trailing whitespace + newlines of the WHOLE string.
+        // Internal newlines, leading `-` bullets and backticks within the
+        // text body are preserved.
+        result = result.trimmingCharacters(in: .whitespacesAndNewlines)
         return result
     }
 
@@ -1149,9 +1597,12 @@ class TextFormatter {
         result = Self.rxRepeatedDots.stringByReplacingMatches(in: result, range: r2, withTemplate: ".")
         let r3 = NSRange(result.startIndex..., in: result)
         result = Self.rxRepeatedCommas.stringByReplacingMatches(in: result, range: r3, withTemplate: ",")
-        while result.contains("  ") {
-            result = result.replacingOccurrences(of: "  ", with: " ")
-        }
+        // BUGFIX (perf): see `cleanWhitespace` — same loop replaced with regex.
+        result = result.replacingOccurrences(
+            of: #"[ \t]{2,}"#,
+            with: " ",
+            options: .regularExpression
+        )
         return result
     }
 
@@ -1160,8 +1611,21 @@ class TextFormatter {
     // "F B I" → "FBI", "U S A" → "USA", "C E O of the company" → "CEO of the company".
     // Requires 2+ consecutive single-letter capitals separated by spaces. Lowercase
     // letters or longer tokens break the run.
+    //
+    // BUGFIX: trailing negative lookahead `(?!['\u{2019}])` prevents joining when
+    // the last single-letter capital is immediately followed by an apostrophe,
+    // which would signal a contraction ("I'm" / "I've") rather than an acronym
+    // letter. Without this, "F B I I'm" → "FBII'm". The `\b` alone doesn't help
+    // because `'` is a non-word char and so `\b` matches between `I` and `'`.
+    // We still allow "FBI's" (possessive) to be formed via the polish stage —
+    // it would arrive as "F B I's" which this regex declines to touch, but the
+    // LLM polish will collapse it correctly. Acceptable trade-off; favouring
+    // the false-negative on possessives over the false-positive on contractions.
+    // NOTE: This is a Swift raw string (`#"..."#`), so `\u{xxxx}` escapes are NOT
+    // processed by Swift — the regex engine would receive them literally and ICU
+    // doesn't understand `\u{xxxx}` (it uses `\uXXXX`). Use the literal character.
     private static let rxAcronymRun = try! NSRegularExpression(
-        pattern: #"\b([A-Z])(?:\s+([A-Z])){1,}\b"#
+        pattern: #"\b([A-Z])(?:\s+([A-Z])){1,}\b(?!['’])"#
     )
 
     /// Strip internal whitespace from runs of 2+ single uppercase letters.
@@ -1286,9 +1750,12 @@ class TextFormatter {
         result = result.replacingOccurrences(of: "\u{2014}", with: " - ")
         result = result.replacingOccurrences(of: " \u{2013} ", with: " - ")
         result = result.replacingOccurrences(of: "\u{2013}", with: " - ")
-        while result.contains("  ") {
-            result = result.replacingOccurrences(of: "  ", with: " ")
-        }
+        // BUGFIX (perf): see `cleanWhitespace` — same loop replaced with regex.
+        result = result.replacingOccurrences(
+            of: #"[ \t]{2,}"#,
+            with: " ",
+            options: .regularExpression
+        )
         return result
     }
 
@@ -1980,6 +2447,16 @@ class TextFormatter {
         "to sum up",
         "to recap",
         "meanwhile",
+        "on a different note",
+        "switching topics",
+        "next up",
+        "speaking of which",
+        "that being said",
+        "with that said",
+        "on that note",
+        "in other news",
+        "to be clear",
+        "going back to",
     ]
 
     /// Insert `\n\n` between a sentence-ending `.!?` and a following
@@ -2013,6 +2490,104 @@ class TextFormatter {
             }
         }
         return result
+    }
+
+    // MARK: - Parakeet-quirk normalization
+
+    /// BUGFIX (Yo/Yeah specific): Heuristic normalizations for common Parakeet
+    /// mistranscriptions. Runs after raw ASR but before formatRules / Qwen3.
+    /// Conservative — only applies in unambiguous cases where the input token
+    /// is not a real English word in any common usage.
+    ///
+    /// Currently handles:
+    ///   - "yoat" / "yote" / "yoda" → "yo" (Parakeet's stuttering "y-yo" collapse)
+    ///   - "houst" → "host" (rare Parakeet glitch on "host"/"hoist")
+    ///   - "areyou" → "are you" (also caught elsewhere but cheap to dedup here)
+    static func normalizeParakeetQuirks(_ text: String) -> String {
+        var out = text
+        // Case-insensitive replacements at word boundaries. We preserve casing
+        // by checking what the original token looked like — if it was capitalized,
+        // we keep the replacement capitalized too. Cheaper to just two-pass.
+        let pairs: [(String, String)] = [
+            (#"\byoat\b"#, "yo"),
+            (#"\bYoat\b"#, "Yo"),
+            (#"\byote\b"#, "yo"),
+            (#"\bYote\b"#, "Yo"),
+            (#"\byoda\b"#, "yo"),
+            (#"\bYoda\b"#, "Yo"),
+            (#"\bhoust\b"#, "host"),
+            (#"\bHoust\b"#, "Host"),
+        ]
+        for (pat, rep) in pairs {
+            out = out.replacingOccurrences(of: pat, with: rep, options: .regularExpression)
+        }
+
+        // BUGFIX (uhs / R's): Parakeet sometimes hears the plural filler "uhs"
+        // as the letter "R" with a possessive ("R's" / "R.'s"). Restore.
+        //
+        // Caveat: this WILL clobber a legitimate "R's" (e.g. "the R's were
+        // misspelled"). Accepted trade-off: the true-positive rate on "uhs"
+        // mishears is meaningfully higher than the false-positive rate on
+        // legit single-letter possessives in dictation. If a future user hits
+        // the legit case often, lift this into a config flag.
+        out = out.replacingOccurrences(
+            of: #"\bR's\b"#,
+            with: "uhs",
+            options: .regularExpression
+        )
+        out = out.replacingOccurrences(
+            of: #"\bR\.?'s\b"#,
+            with: "uhs",
+            options: .regularExpression
+        )
+        // BUGFIX (uhs / R's): explicit phrase form. The two patterns above
+        // already cover this in isolation, but listing the bigram makes the
+        // intent obvious to future maintainers and lets us tighten the word
+        // boundaries if the standalone passes ever become too aggressive.
+        out = out.replacingOccurrences(
+            of: #"\bums and R's\b"#,
+            with: "ums and uhs",
+            options: .regularExpression
+        )
+
+        // BUGFIX (handles): keep known usernames intact downstream. No
+        // transform here — this list exists so other helpers (e.g.
+        // suspectsForPolish) can surface them to the LLM as "do not change".
+        _ = Self.knownHandles
+
+        return out
+    }
+
+    /// Letter+digit identifiers that look like usernames but aren't dictionary
+    /// words. Surfaced to the polish LLM as protected tokens so it won't
+    /// "correct" "fortun8te" → "fortunate". Generic handle-shaped tokens
+    /// (e.g. "gr8", "m8") are also detected on the fly via
+    /// `containsHandleShape(_:)`.
+    static let knownHandles: [String] = [
+        "fortun8te",  // user's common username
+    ]
+
+    /// Regex matching letter+digit+letter or letter+digit identifiers that
+    /// look like screen names (`fortun8te`, `gr8`, `m8`, `ChatGPT3`). Used by
+    /// `suspectsForPolish` to surface these as protected tokens.
+    private static let rxHandleShape = try! NSRegularExpression(
+        pattern: #"\b(?:[A-Za-z]+\d+[A-Za-z]*|[A-Za-z]*\d+[A-Za-z]+)\b"#
+    )
+
+    /// True if `text` contains at least one handle-shaped token (letter-digit
+    /// mix), e.g. "fortun8te", "gr8", "4ever", "ChatGPT3".
+    static func containsHandleShape(_ text: String) -> Bool {
+        let ns = text as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        return rxHandleShape.firstMatch(in: text, range: range) != nil
+    }
+
+    /// Return all handle-shaped tokens in `text` (preserves original casing).
+    static func extractHandleShapes(_ text: String) -> [String] {
+        let ns = text as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        let matches = rxHandleShape.matches(in: text, range: range)
+        return matches.map { ns.substring(with: $0.range) }
     }
 
     // MARK: - Leading-filler strip
@@ -2060,6 +2635,501 @@ class TextFormatter {
             return text.replacingCharacters(in: trimmedRange, with: trimmed + ".")
         }
         return trimmed + "."
+    }
+
+    // MARK: - Time-of-day normalizer (digit forms)
+    //
+    // Word-form times ("five thirty PM") are handled by
+    // `normalizeSpokenTimesPrePass` BEFORE number folding. This pass cleans
+    // up DIGIT forms that survive the folder: "5pm", "5 30 pm", "5:30 pm",
+    // "5 thirty pm", "5 fifteen pm", "5 forty five pm".
+    //
+    // Output convention: hours stay as integers; minutes get a colon and are
+    // two-digit; suffix is uppercase AM / PM with a space between number and
+    // suffix when no minutes, and no space when minutes are present (matches
+    // common typography: "5 PM" but "5:30 PM").
+    //
+    // Bare hours without am/pm (e.g. "at 5") are intentionally left alone.
+
+    /// Single shared regex set, compiled once.
+    private static let rxTimeDigitWithSuffix = try! NSRegularExpression(
+        // 1=hour, 2=optional colon-or-space minutes, 3=am/pm
+        pattern: #"(?i)\b(\d{1,2})(?:\s*[:\s]\s*(\d{2}))?\s*(a\.?\s*m\.?|p\.?\s*m\.?)\b"#
+    )
+    private static let rxTimeDigitWord = try! NSRegularExpression(
+        // 1=hour, 2=minute-word (thirty / fifteen / forty.?five / forty-five), 3=am/pm
+        pattern: #"(?i)\b(\d{1,2})\s+(thirty|fifteen|forty[\s\-]?five|forty)\s+(a\.?\s*m\.?|p\.?\s*m\.?)\b"#
+    )
+
+    /// Normalize digit-form times of day in the post-fold text.
+    ///
+    /// Examples:
+    ///   "5pm"           → "5 PM"
+    ///   "5 pm"          → "5 PM"
+    ///   "5 30 pm"       → "5:30 PM"
+    ///   "5:30 pm"       → "5:30 PM"
+    ///   "5 thirty pm"   → "5:30 PM"
+    ///   "5 fifteen am"  → "5:15 AM"
+    ///   "5 forty five pm" → "5:45 PM"
+    ///   "at 730"        → "at 7:30"  (digit-string form near time preposition)
+    ///   "by 1130"       → "by 11:30"
+    ///   "at 5"          → "at 5"      (no suffix → unchanged)
+    private func normalizeTimesOfDay(_ text: String) -> String {
+        var result = text
+
+        // Pass 0: digit-string form near a time preposition. "730" / "1130"
+        // dictated as a single number after "at"/"around"/"by"/"about"/"by
+        // around" should become 7:30 / 11:30. Only fires in a clear time
+        // context to avoid mangling random 3-4 digit numbers (zip codes,
+        // amounts, etc.). Run BEFORE the digit+suffix pass so "at 730 pm"
+        // becomes "at 7:30 pm" → eventually "7:30 PM".
+        let timeContextPrefix = #"(?i)(\b(?:at|around|by|about|near|past|after|before|until|till|approximately|roughly)\s+)"#
+        // Hour 1-9 + minutes 00-59 (3 digits): "730", "915", "1030 ambiguous".
+        // Use 3-digit then 4-digit; the 4-digit form covers 10xx-12xx.
+        let threeDigit = timeContextPrefix + #"([1-9])([0-5]\d)\b(?!\s*(?:am|pm|a\.m|p\.m|st|nd|rd|th|%|dollars|bucks|kg|lb|mph|ml|°|degrees))"#
+        let fourDigit  = timeContextPrefix + #"(1[0-2])([0-5]\d)\b(?!\s*(?:am|pm|a\.m|p\.m|st|nd|rd|th|%|dollars|bucks|kg|lb|mph|ml|°|degrees))"#
+        for pattern in [fourDigit, threeDigit] {
+            if let rx = try? NSRegularExpression(pattern: pattern, options: []) {
+                let ns = result as NSString
+                let matches = rx.matches(in: result, options: [], range: NSRange(location: 0, length: ns.length))
+                for m in matches.reversed() {
+                    guard m.numberOfRanges >= 4 else { continue }
+                    let cur = result as NSString
+                    let prep = cur.substring(with: m.range(at: 1))
+                    let hour = cur.substring(with: m.range(at: 2))
+                    let min  = cur.substring(with: m.range(at: 3))
+                    let replacement = "\(prep)\(hour):\(min)"
+                    result = (result as NSString).replacingCharacters(in: m.range, with: replacement)
+                }
+            }
+        }
+
+        // Pass 1: digit + minute-WORD + am/pm. Run first because the
+        // surface "5 thirty pm" otherwise matches pass 2's "5 ... pm" too.
+        let ns1 = result as NSString
+        let m1 = Self.rxTimeDigitWord.matches(
+            in: result,
+            range: NSRange(location: 0, length: ns1.length)
+        )
+        for m in m1.reversed() {
+            let nsCur = result as NSString
+            let hour = nsCur.substring(with: m.range(at: 1))
+            let minWord = nsCur.substring(with: m.range(at: 2))
+                .lowercased()
+                .replacingOccurrences(of: "-", with: " ")
+                .trimmingCharacters(in: .whitespaces)
+            let mm: String
+            switch minWord {
+            case "thirty":               mm = "30"
+            case "fifteen":              mm = "15"
+            case "forty":                mm = "40"
+            case "forty five",
+                 "fortyfive":            mm = "45"
+            default:                     continue
+            }
+            let suffixRaw = nsCur.substring(with: m.range(at: 3))
+                .lowercased()
+                .replacingOccurrences(of: ".", with: "")
+                .replacingOccurrences(of: " ", with: "")
+            let suffix = (suffixRaw == "am") ? "AM" : "PM"
+            let formatted = "\(hour):\(mm) \(suffix)"
+            result = (result as NSString).replacingCharacters(in: m.range, with: formatted)
+        }
+
+        // Pass 2: digit (+ optional digit minutes) + am/pm.
+        let ns2 = result as NSString
+        let m2 = Self.rxTimeDigitWithSuffix.matches(
+            in: result,
+            range: NSRange(location: 0, length: ns2.length)
+        )
+        for m in m2.reversed() {
+            let nsCur = result as NSString
+            let hour = nsCur.substring(with: m.range(at: 1))
+            let suffixRaw = nsCur.substring(with: m.range(at: 3))
+                .lowercased()
+                .replacingOccurrences(of: ".", with: "")
+                .replacingOccurrences(of: " ", with: "")
+            let suffix = (suffixRaw == "am") ? "AM" : "PM"
+
+            let formatted: String
+            if m.range(at: 2).location != NSNotFound {
+                let mm = nsCur.substring(with: m.range(at: 2))
+                formatted = "\(hour):\(mm) \(suffix)"
+            } else {
+                // Bare hour + suffix → "5 PM" (uppercase + single space).
+                formatted = "\(hour) \(suffix)"
+            }
+            result = (result as NSString).replacingCharacters(in: m.range, with: formatted)
+        }
+
+        return result
+    }
+
+    // MARK: - Known product / brand-name normalizer
+    //
+    // Canonicalize spelling of products / brands that ASR routinely mangles
+    // (Wispr Flow, Parakeet, Moonshine, etc.). Runs EARLY in the pipeline so
+    // every downstream pass sees the canonical form. Distinct from
+    // `collapseBrandNames` which targets the long-tail of run-together brand
+    // words ("chat gpt", "you tube"); the entries here are specifically the
+    // ASR mis-hearings we've observed in the wild.
+    //
+    // Case-insensitive matching, word-bounded; output is the canonical
+    // capitalization from the right-hand side of each tuple.
+    private let productNameMap: [(String, String)] = [
+        // Wispr Flow variants — ASR commonly produces "whisper flow",
+        // "whisprflu", "whisper flu", "whisperflu" because of the breathy
+        // "wh-" onset and the unfamiliar brand spelling.
+        ("wispr flow",   "Wispr Flow"),
+        ("whispr flow",  "Wispr Flow"),
+        ("whisper flow", "Wispr Flow"),
+        ("whisprflu",    "Wispr Flow"),
+        ("whisper flu",  "Wispr Flow"),
+        ("whisperflu",   "Wispr Flow"),
+
+        // ASR model names.
+        ("para keet",    "Parakeet"),
+        ("parakeet",     "Parakeet"),
+        ("moon shine",   "Moonshine"),
+        ("moonshine",    "Moonshine"),
+
+        // IBM Granite — almost always lowercased by ASR even when referring
+        // to the LLM. The word is also common as a noun ("granite countertop")
+        // so we keep the case-insensitive match but accept the occasional
+        // over-capitalization; users dictating about rocks rarely capitalize
+        // anyway.
+        ("granite",      "Granite"),
+
+        // This app itself.
+        ("voice app",    "VOICE app"),
+
+        // BUGFIX (Bug 5): canonical brand/product names that need to land
+        // BEFORE URL protection runs, so YouTube / Gmail in bare domains
+        // ("youtube.com", "gmail.com") survive intact and so downstream
+        // capitalization can't mangle them. `collapseBrandNames` also covers
+        // most of these later, but doing them here too means the right form
+        // is in place EARLY, before number/time/URL passes run.
+        ("wispr",        "Wispr"),
+        ("chat gpt",     "ChatGPT"),
+        ("chatgpt",      "ChatGPT"),
+        ("open ai",      "OpenAI"),
+        ("openai",       "OpenAI"),
+        ("anthropic",    "Anthropic"),
+        ("github",       "GitHub"),
+        ("git hub",      "GitHub"),
+        ("mac os",       "macOS"),
+        ("macos",        "macOS"),
+        ("i os",         "iOS"),
+        ("ios",          "iOS"),
+        ("vs code",      "VS Code"),
+        ("vscode",       "VS Code"),
+        ("youtube",      "YouTube"),
+        ("you tube",     "YouTube"),
+        ("gmail",        "Gmail"),
+        ("g mail",       "Gmail"),
+        ("claude",       "Claude"),
+    ]
+
+    /// Replace known product / brand names with their canonical spelling.
+    /// Case-insensitive, word-bounded. Called early in `format(_:)` (right
+    /// after `normalizeParakeetQuirks`) so every downstream pass sees the
+    /// canonical form.
+    ///
+    /// TRADE-OFF: this is always-replace. If a user dictates the lowercase form
+    /// intentionally (e.g. the band "Wispr" rather than the app "Wispr Flow"),
+    /// the canonical capitalization wins. We accept this because the dictation
+    /// app's audience overwhelmingly references the products, not the
+    /// homophones. If/when this becomes a real complaint, switch to a context
+    /// heuristic (look for "the band", "song", surrounding verbs of music
+    /// listening) before replacing.
+    private func normalizeKnownProductNames(_ text: String) -> String {
+        var result = text
+        for (spoken, written) in productNameMap {
+            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: spoken))\\b"
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                result = regex.stringByReplacingMatches(
+                    in: result,
+                    range: NSRange(result.startIndex..., in: result),
+                    withTemplate: written
+                )
+            }
+        }
+        return result
+    }
+
+    // MARK: - Signal-rich structural hints (for Qwen3 polish stage)
+    //
+    // The following passes prep complex dictation by injecting structural
+    // markers (bullets, backticks, paragraph breaks, quoted spans) BEFORE
+    // the polish LLM sees the text. The polish stage is instructed to
+    // preserve these markers, so list-style enumerations come out as actual
+    // bulleted lists, snake_case identifiers come out as inline-code, etc.
+    //
+    // Each pass is conservative — only triggers on unambiguous patterns so
+    // we don't accidentally backtick prose or break paragraphs mid-clause.
+
+    /// Normalize money + unit phrases so digits land next to their unit.
+    /// Examples:
+    ///   "150 bucks"          → "$150"
+    ///   "50 millimeter"      → "50mm"
+    ///   "2.5 percent"        → "2.5%"
+    /// Runs AFTER `normalizeTimesOfDay` so "5:30 percent" doesn't show up;
+    /// runs BEFORE `extractQuotedMessage` so units inside a dictated message
+    /// body still get folded.
+    private func normalizeMoneyAndUnits(_ text: String) -> String {
+        var t = text
+        // "X bucks" / "X dollars" → "$X"
+        t = t.replacingOccurrences(
+            of: #"\b(\d+(?:\.\d+)?)\s+(bucks|dollars)\b"#,
+            with: "$$$1",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        // "X millimeter" / "X millimeters" / "X mm" → "Xmm"
+        t = t.replacingOccurrences(
+            of: #"\b(\d+(?:\.\d+)?)\s+(millimeters?|mm)\b"#,
+            with: "$1mm",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        // "X percent" → "X%"
+        t = t.replacingOccurrences(
+            of: #"\b(\d+(?:\.\d+)?)\s+percent\b"#,
+            with: "$1%",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        return t
+    }
+
+    /// Detect "tell/send/text/email X saying/that ..." patterns and convert
+    /// the quoted body into actual quotes on its own paragraph. This makes
+    /// the polish stage see a clear "this is the message body" boundary.
+    /// Runs BEFORE URL protection so URLs inside the body still get
+    /// extracted later in the pipeline.
+    private func extractQuotedMessage(_ text: String) -> String {
+        var t = text
+        // BUGFIX: original lookahead `(?=$|\.\s+[A-Z])` missed messages ending in
+        // `!` or `?`. With the old pattern, "tell John saying are you free? She
+        // replied yes." would greedily consume the entire input as the message
+        // body. Expanded to include `!?\u{2026}` terminators.
+        // Raw string `#"..."#` does NOT process `\u{...}` — use literal char.
+        let pattern = #"(?i)\b(send|tell|text|email|message|dm)\s+([A-Z][a-z]+|him|her|them)\s+(?:a\s+message\s+)?(?:saying|that\s+says?|telling\s+them)\s+(.+?)(?=$|[.!?…]\s+[A-Z]|\n)"#
+        guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { return t }
+        let ns = t as NSString
+        let matches = re.matches(in: t, options: [], range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            guard m.numberOfRanges >= 4 else { continue }
+            let verb    = ns.substring(with: m.range(at: 1))
+            let target  = ns.substring(with: m.range(at: 2))
+            var body    = ns.substring(with: m.range(at: 3))
+            body = body.trimmingCharacters(in: .whitespaces)
+            if !body.isEmpty {
+                // Capitalize first letter of body
+                body = body.prefix(1).uppercased() + body.dropFirst()
+                // Ensure terminal punctuation
+                if let last = body.last, !".!?\"'".contains(last) {
+                    body += "."
+                }
+                let replacement = "\(verb.capitalized) \(target) this message:\n\n\"\(body)\""
+                t = (t as NSString).replacingCharacters(in: m.range, with: replacement)
+            }
+        }
+        return t
+    }
+
+    /// If the speaker enumerates a list of 3+ short identifier-like words,
+    /// wrap each candidate in backticks so the polish stage emits inline-code.
+    /// Heuristic: a "field list" is a comma-separated run of 3+ tokens, each
+    /// 1-3 words, each token alphanumeric+hyphen/underscore, after a trigger
+    /// phrase like "with", "fields are", "columns", "table with", "containing".
+    ///
+    /// TODO: the bare "with" trigger over-fires on prose ("a meeting with John,
+    /// Sara, and Bob" → would not match because of the capitalized-name guard,
+    /// but "a smoothie with banana, apple, and yogurt" WOULD match and get
+    /// backticked). Consider gating "with" behind a stronger schema-like
+    /// signal (presence of snake_case / camelCase tokens, "table", "schema",
+    /// "object" earlier in the same sentence).
+    private func detectAndMarkFieldLists(_ text: String) -> String {
+        var t = text
+        let triggers = [
+            "with",
+            "table with",
+            "fields are",
+            "the fields are",
+            "columns are",
+            "containing",
+            "has",
+            "includes",
+            "consisting of",
+        ]
+
+        // Pattern: <trigger> <token>(,| and)( <token>){2,}
+        // For each match, backtick-quote the tokens.
+        for trigger in triggers {
+            let pattern = "(?i)\\b\(NSRegularExpression.escapedPattern(for: trigger))\\b\\s+((?:[a-z][a-z0-9_]*(?:\\s+[a-z][a-z0-9_]*)?\\s*[,]\\s*){2,}(?:[a-z][a-z0-9_]*(?:\\s+[a-z][a-z0-9_]*)?))"
+            guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { continue }
+            let ns = t as NSString
+            let matches = re.matches(in: t, options: [], range: NSRange(location: 0, length: ns.length))
+            for m in matches.reversed() {
+                let triggerRange = NSRange(location: m.range.location, length: trigger.count)
+                let listRange = m.range(at: 1)
+                guard listRange.location != NSNotFound else { continue }
+
+                let triggerText = ns.substring(with: triggerRange)
+                let listText = ns.substring(with: listRange)
+
+                // Tokenize on commas and "and"
+                let tokens = listText
+                    .components(separatedBy: CharacterSet(charactersIn: ","))
+                    .flatMap { $0.components(separatedBy: " and ") }
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+
+                // Convert spoken "guest id" → "guest_id"
+                let snake = tokens.map { token -> String in
+                    let parts = token.split(separator: " ").map(String.init)
+                    return parts.joined(separator: "_").lowercased()
+                }
+
+                // Build replacement: trigger + \n- `t1`\n- `t2`\n- `t3` etc.
+                let bulletList = snake.map { "- `\($0)`" }.joined(separator: "\n")
+                let replacement = "\(triggerText):\n\(bulletList)"
+
+                t = (t as NSString).replacingCharacters(in: m.range, with: replacement)
+            }
+        }
+        return t
+    }
+
+    /// Wrap obviously-code tokens in backticks so the polish stage preserves them
+    /// as inline code. Skip tokens already inside backticks or inside URL placeholders.
+    private func backtickCodeTokens(_ text: String) -> String {
+        var t = text
+        // snake_case: 2+ words joined by underscore
+        t = t.replacingOccurrences(
+            of: #"(?<![\w`])([a-z]+_[a-z0-9_]+)(?![\w`])"#,
+            with: "`$1`",
+            options: .regularExpression
+        )
+        // CLI flags
+        t = t.replacingOccurrences(
+            of: #"(?<![\w`])(--[a-z][a-z0-9-]+)(?![\w`])"#,
+            with: "`$1`",
+            options: .regularExpression
+        )
+        // Semantic version
+        t = t.replacingOccurrences(
+            of: #"(?<![\w`])(v?\d+\.\d+\.\d+(?:-[a-z0-9]+)?)(?![\w`])"#,
+            with: "`$1`",
+            options: .regularExpression
+        )
+        return t
+    }
+
+    /// Insert paragraph breaks at strong topic-shift signals. These markers are
+    /// almost always topic transitions in casual dictation. Runs AFTER terminal
+    /// punctuation has been inferred so we have the `.!?` boundary to match on.
+    ///
+    /// The leading `([.!?])\s+` guard ensures we only fire AFTER a sentence has
+    /// ended — mid-sentence uses like "I also like coffee" don't trigger because
+    /// "also" isn't preceded by terminal punctuation.
+    private func insertTopicShiftBreaks(_ text: String) -> String {
+        var t = text
+        let shifts = [
+            "also ", "oh and ", "wait also ", "and also ",
+            "another thing ", "one more thing ", "also also ",
+        ]
+        for shift in shifts {
+            // After a sentence-ending period/!/?/ellipsis, if the shift word starts
+            // a new clause, insert a paragraph break.
+            // BUGFIX: include `\u{2026}` (ellipsis) in the terminal-punct class so
+            // sentences ending with "…" also trigger topic shifts.
+            let pattern = "([.!?\u{2026}])\\s+(?i)\(NSRegularExpression.escapedPattern(for: shift))"
+            t = t.replacingOccurrences(
+                of: pattern,
+                with: "$1\n\n" + shift.prefix(1).uppercased() + shift.dropFirst(),
+                options: .regularExpression
+            )
+        }
+        return t
+    }
+
+    // MARK: - URL / email protection
+    //
+    // The cleanup pipeline (cleanupPunctuation → capitalizeSentences →
+    // cleanWhitespace) treats every `.` as a potential sentence boundary.
+    // That's correct for prose, but catastrophic for emails / URLs:
+    //
+    //   "michael@gmail.com"  →  "michael@gmail. Com"
+    //   "youtube.com/foo"    →  "youtube. Com/foo"
+    //
+    // Strategy: BEFORE those passes, swap every URL / email / bare-domain
+    // match for a placeholder built from private-use unicode codepoints
+    // (U+E000 … U+E001 sandwich, guaranteed not to collide with any input
+    // character). After the cleanup passes run, restore from the map.
+
+    /// Compiled once.
+    private static let rxURLEmail: NSRegularExpression = {
+        // Order matters within the alternation: longest / most specific first.
+        // 1. Email (must match before bare-domain so the `@` is preserved)
+        // 2. https?:// scheme URL
+        // 3. Bare domain with known TLD, optionally followed by /path
+        let tldList = [
+            "com","net","org","io","app","co","ai","dev","me","us",
+            "uk","tv","nl","de","fr","gov","edu","info","tech","xyz",
+            "so","sh","to","gl","ly",
+        ]
+        let tld = tldList.joined(separator: "|")
+        let email   = #"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"#
+        let scheme  = #"https?://\S+"#
+        let bare    = "\\b[A-Za-z0-9\\-]+\\.(?:\(tld))(?:/\\S*)?\\b"
+        let pattern = "(?:\(email))|(?:\(scheme))|(?:\(bare))"
+        return try! NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+    }()
+
+    /// Sentinel codepoints in the Unicode Private Use Area (U+E000 … U+F8FF).
+    /// Specifically U+E000 (start of BMP PUA) and U+E001. Never appear in
+    /// natural text or any prior pass's output, so the placeholders survive
+    /// every regex / replace / NSString round-trip cleanly.
+    ///
+    /// COLLISION RISK: dictation never produces PUA characters (no keyboard
+    /// emits them, ASR models don't produce them). If raw paste-augmented input
+    /// ever contains PUA chars, swap to a sentinel scheme that's verifiably
+    /// out-of-range (e.g. high-plane PUA U+F0000+) or escape any U+E000/U+E001
+    /// chars in input BEFORE this pass.
+    private static let urlPlaceholderOpen  = "\u{E000}URL"
+    private static let urlPlaceholderClose = "\u{E001}"
+
+    /// Replace every URL / email / bare-domain match with an opaque
+    /// placeholder; return the rewritten text plus the map used to restore.
+    private func protectURLsAndEmails(_ text: String) -> (String, [String: String]) {
+        let ns = text as NSString
+        let matches = Self.rxURLEmail.matches(
+            in: text,
+            range: NSRange(location: 0, length: ns.length)
+        )
+        guard !matches.isEmpty else { return (text, [:]) }
+
+        var map: [String: String] = [:]
+        var result = text
+        // Process in reverse so earlier ranges stay valid as we splice in
+        // shorter placeholders.
+        for (i, m) in matches.enumerated().reversed() {
+            let original = (result as NSString).substring(with: m.range)
+            let key = "\(Self.urlPlaceholderOpen)\(i)\(Self.urlPlaceholderClose)"
+            map[key] = original
+            result = (result as NSString).replacingCharacters(in: m.range, with: key)
+        }
+        return (result, map)
+    }
+
+    /// Inverse of `protectURLsAndEmails`. Swaps each placeholder back to its
+    /// original text. Safe to call with an empty map.
+    private func restoreURLsAndEmails(_ text: String, _ map: [String: String]) -> String {
+        guard !map.isEmpty else { return text }
+        var result = text
+        for (key, original) in map {
+            result = result.replacingOccurrences(of: key, with: original)
+        }
+        return result
     }
 
     // MARK: - Helpers

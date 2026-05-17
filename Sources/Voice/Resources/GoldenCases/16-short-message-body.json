@@ -1,0 +1,10 @@
+{
+  "id": "short-message-body",
+  "title": "Short send-message — body gets quoted, name outside",
+  "categories": ["short", "message", "regression"],
+  "raw": "text john hey we're running five minutes late",
+  "reference": "Text John: “Hey, we're running five minutes late.”",
+  "notes": "Message body detection on short input. 'John' capitalized. Body goes in curly quotes. 'five minutes' must NOT become '5 minutes' — it's casual prose where small numbers stay spelled out. 'we're' keeps apostrophe. The colon after 'John' is required.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

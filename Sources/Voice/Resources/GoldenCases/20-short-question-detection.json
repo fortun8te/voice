@@ -1,0 +1,10 @@
+{
+  "id": "short-question-detection",
+  "title": "Short question — question mark added, no other changes",
+  "categories": ["short", "question", "regression"],
+  "raw": "what time does the meeting start",
+  "reference": "What time does the meeting start?",
+  "notes": "Question detection: starts with 'what' → add '?'. Capitalize 'What'. No other changes. Must NOT become 'When does the meeting start?' or any rephrase. The word 'does' and 'start' must be preserved exactly.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

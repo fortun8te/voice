@@ -184,73 +184,85 @@ enum SoundEffects {
 
     /// Render the per-sample voice closure into a stereo buffer with
     /// subtle stereo widening (right channel delayed ~0.6ms + slight gain trim).
+    ///
+    /// Synthesis runs on a background QoS `.userInitiated` queue so the main
+    /// thread is never blocked. `player.play()` is called from the background
+    /// thread — AVAudioPlayerNode is thread-safe for schedule + play calls.
     private static func renderAndPlay(
         duration: Double,
         peakAmplitude: Float,
-        voice: (Double, Double) -> VoiceFrame
+        voice: @escaping (Double, Double) -> VoiceFrame
     ) {
-        let frameCount = AVAudioFrameCount(sampleRate * duration)
-        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2),
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
-        buffer.frameLength = frameCount
+        DispatchQueue.global(qos: .userInitiated).async {
+            let frameCount = AVAudioFrameCount(sampleRate * duration)
+            guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2),
+                  let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
+            buffer.frameLength = frameCount
 
-        guard let ch0 = buffer.floatChannelData?[0],
-              let ch1 = buffer.floatChannelData?[1] else { return }
+            guard let ch0 = buffer.floatChannelData?[0],
+                  let ch1 = buffer.floatChannelData?[1] else { return }
 
-        // Master envelope: 1.5ms cosine attack, exponential decay for the body
-        // (per-component decays already shape the tail; this just removes any DC click).
-        let attackSec = 0.0015
-        let releaseSec = duration * 0.15
-        let releaseStartSec = duration - releaseSec
+            // Master envelope: 1.5ms cosine attack, exponential decay for the body
+            // (per-component decays already shape the tail; this just removes any DC click).
+            let attackSec = 0.0015
+            let releaseSec = duration * 0.15
+            let releaseStartSec = duration - releaseSec
 
-        // Stereo widening: ~0.6ms inter-channel delay (Haas effect)
-        let delayFrames = Int(sampleRate * 0.0006)
+            // Stereo widening: ~0.6ms inter-channel delay (Haas effect)
+            let delayFrames = Int(sampleRate * 0.0006)
 
-        // First pass: synthesize mono into a scratch buffer so we can apply
-        // delay-based widening cheanly + measure peak for normalization.
-        var mono = [Double](repeating: 0, count: Int(frameCount))
-        var peak: Double = 0
-        for i in 0..<Int(frameCount) {
-            let t = Double(i) / sampleRate
-            let frame = voice(t, duration)
+            // First pass: synthesize mono into a scratch buffer so we can apply
+            // delay-based widening cleanly + measure peak for normalization.
+            var mono = [Double](repeating: 0, count: Int(frameCount))
+            var peak: Double = 0
+            for i in 0..<Int(frameCount) {
+                let t = Double(i) / sampleRate
+                let frame = voice(t, duration)
 
-            // Master attack/release (anti-click)
-            var menv: Double = 1.0
-            if t < attackSec {
-                menv = 0.5 - 0.5 * cos(.pi * t / attackSec)
-            } else if t > releaseStartSec {
-                let r = (t - releaseStartSec) / releaseSec
-                menv = 0.5 + 0.5 * cos(.pi * r)
+                // Master attack/release (anti-click)
+                var menv: Double = 1.0
+                if t < attackSec {
+                    menv = 0.5 - 0.5 * cos(.pi * t / attackSec)
+                } else if t > releaseStartSec {
+                    let r = (t - releaseStartSec) / releaseSec
+                    menv = 0.5 + 0.5 * cos(.pi * r)
+                }
+
+                // Mix noise + body. Noise is already enveloped internally.
+                let s = (frame.noise + frame.body) * menv
+                mono[i] = s
+                if abs(s) > peak { peak = abs(s) }
             }
 
-            // Mix noise + body. Noise is already enveloped internally.
-            let s = (frame.noise + frame.body) * menv
-            mono[i] = s
-            if abs(s) > peak { peak = abs(s) }
-        }
+            // Normalize to peakAmplitude target (prevents clipping, RMS-matches sounds)
+            let norm = peak > 0 ? Double(peakAmplitude) / peak : Double(peakAmplitude)
 
-        // Normalize to peakAmplitude target (prevents clipping, RMS-matches sounds)
-        let norm = peak > 0 ? Double(peakAmplitude) / peak : Double(peakAmplitude)
-
-        for i in 0..<Int(frameCount) {
-            let l = Float(mono[i] * norm)
-            // Right channel: delayed copy at ~0.97 gain (gentle Haas widening)
-            let j = i - delayFrames
-            let r = (j >= 0) ? Float(mono[j] * norm * 0.97) : 0
-            ch0[i] = l
-            ch1[i] = r
-        }
-
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        if !engine.isRunning { try? engine.start() }
-
-        player.scheduleBuffer(buffer) {
-            DispatchQueue.main.async {
-                engine.detach(player)
+            for i in 0..<Int(frameCount) {
+                let l = Float(mono[i] * norm)
+                // Right channel: delayed copy at ~0.97 gain (gentle Haas widening)
+                let j = i - delayFrames
+                let r = (j >= 0) ? Float(mono[j] * norm * 0.97) : 0
+                ch0[i] = l
+                ch1[i] = r
             }
+
+            let player = AVAudioPlayerNode()
+            // AVAudioEngine attach/connect/start must be serialized. The engine
+            // static is shared; guard with a lightweight lock. In practice only
+            // one sound plays at a time (start ≠ stop ≠ done), so contention is
+            // negligible. Using objc_sync on the engine object is enough.
+            objc_sync_enter(engine)
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+            if !engine.isRunning { try? engine.start() }
+            objc_sync_exit(engine)
+
+            player.scheduleBuffer(buffer) {
+                DispatchQueue.main.async {
+                    engine.detach(player)
+                }
+            }
+            player.play()
         }
-        player.play()
     }
 }

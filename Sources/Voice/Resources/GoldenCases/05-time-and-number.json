@@ -1,0 +1,10 @@
+{
+  "id": "time-and-number",
+  "title": "Time + number normalization",
+  "categories": ["time", "currency", "self-correction"],
+  "raw": "meeting at three thirty actually four with bob at like the usual place and bring the q one numbers eight billion in revenue not eight hundred million",
+  "reference": "Meeting at 4 with Bob at the usual place. Bring the Q1 numbers. $8B in revenue, not $800M.",
+  "notes": "Resolve 'three thirty actually four' to '4'. Q1 capitalization. Currency suffix style.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

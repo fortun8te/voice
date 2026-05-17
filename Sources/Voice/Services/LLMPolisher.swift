@@ -221,10 +221,13 @@ final class LLMPolisher {
             options: [.regularExpression, .caseInsensitive]
         )
 
-        // 4. Collapse double spaces from removals
-        result = result.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
-        // 5. Strip leading/trailing whitespace + dangling punctuation
-        result = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 4. Collapse runs of 2+ horizontal spaces (NOT newlines) from removals.
+        //    Preserving \n and \n\n is critical — TextFormatter inserts them for
+        //    voice commands ("new paragraph") and segment-gap paragraph breaks.
+        result = result.replacingOccurrences(of: #"[^\S\n]{2,}"#, with: " ", options: .regularExpression)
+        // 5. Strip leading/trailing whitespace + dangling punctuation.
+        //    Use .whitespaces (not .whitespacesAndNewlines) to preserve paragraph breaks.
+        result = result.trimmingCharacters(in: .whitespaces)
         result = result.replacingOccurrences(of: #"^[,;:]+\s*"#, with: "", options: .regularExpression)
 
         return result

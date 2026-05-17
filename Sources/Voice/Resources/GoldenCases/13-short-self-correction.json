@@ -1,0 +1,10 @@
+{
+  "id": "short-self-correction",
+  "title": "Short utterance — hard self-correction drops the first name",
+  "categories": ["short", "self-correction", "regression"],
+  "raw": "send it to mike wait no send it to sarah",
+  "reference": "Send it to Sarah.",
+  "notes": "CORRECTION RULE: 'mike wait no' signals the speaker is overriding. Drop everything before the correction. Output is ONLY the corrected instruction. 'send it to Mike' must NOT appear in output. Any form of both names = FAIL.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

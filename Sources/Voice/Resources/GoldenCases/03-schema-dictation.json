@@ -1,0 +1,10 @@
+{
+  "id": "schema-dictation",
+  "title": "Schema / table dictation",
+  "categories": ["schema"],
+  "raw": "create users table user id email password hash created at updated at and last login at where deleted is null",
+  "reference": "Create users table: `user_id`, `email`, `password_hash`, `created_at`, `updated_at`, `last_login_at` where `deleted` is null.",
+  "notes": "Snake_case identifiers wrapped in backticks; correct phrasing on 'where deleted is null'.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

@@ -1,0 +1,10 @@
+{
+  "id": "short-homophone",
+  "title": "Short sentence — homophone fix only",
+  "categories": ["short", "homophone", "regression"],
+  "raw": "your right we should ship it friday",
+  "reference": "You're right, we should ship it Friday.",
+  "notes": "One homophone fix: your → you're. Comma before 'we' (clause boundary). Friday capitalized. No other changes. 'ship it' must NOT become 'ship' or 'deliver it'.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

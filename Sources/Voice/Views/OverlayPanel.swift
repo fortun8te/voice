@@ -22,10 +22,10 @@ class OverlayPanel: NSPanel {
     var onConfirm: (() -> Void)?
     var onUndoCancel: (() -> Void)?
 
-    /// Token returned by `NSEvent.addGlobalMonitorForEvents` — must be passed
-    /// to `NSEvent.removeMonitor(_:)` in deinit or it leaks the closure.
-    private var globalMouseMonitor: Any?
-    private var globalKeyMonitor: Any?
+    // NOTE: We no longer install `.mouseMoved` or `.keyDown/.flagsChanged` global
+    // monitors. They fired at 60–200Hz on the main thread, dwarfing every other
+    // source of latency. Active-screen detection now polls NSEvent.mouseLocation
+    // on demand in resolveActiveScreen(), which is O(1) and virtually free.
 
     /// User pref: hide pill from screen capture / screen recording.
     @objc dynamic private var hidePillFromScreenCapture: Bool {
@@ -44,11 +44,8 @@ class OverlayPanel: NSPanel {
 
     // MARK: - Active-screen tracking
 
-    /// Three signal sources, each with a timestamp. Newest wins.
-    private var lastMouseScreen: NSScreen?
-    private var lastMouseSignalAt: TimeInterval = 0
-    private var lastKeyWindowScreen: NSScreen?
-    private var lastKeyWindowSignalAt: TimeInterval = 0
+    /// Recent app-activation screen (set when another app activates). Mouse + key-window
+    /// signals are polled live in resolveActiveScreen().
     private var lastAppActivationScreen: NSScreen?
     private var lastAppActivationAt: TimeInterval = 0
 
@@ -63,6 +60,14 @@ class OverlayPanel: NSPanel {
     private var displayLink: CVDisplayLink?
     private var currentTargetFrame: NSRect = .zero
     private var lastDockHiddenLogged: Bool? = nil
+
+    // Display-link frame counter — skip odd frames to cap main-thread dispatches at ~30Hz.
+    private var displayLinkFrameCounter: Int = 0
+
+    // Cached dock top edge — re-read at most every 3s (AX call is expensive at vsync rate).
+    private var cachedDockTopEdge: CGFloat? = nil
+    private var dockEdgeCachedAt: TimeInterval = 0
+    private let dockEdgeCacheTTL: TimeInterval = 3.0
 
     /// Periodic re-assert of front-most order while recording. Other apps
     /// occasionally push panels back even at high window levels — a cheap
@@ -150,7 +155,7 @@ class OverlayPanel: NSPanel {
         // view uses .contentShape(Capsule()) so only the visible pill area
         // captures hits; the surrounding panel padding stays click-through.
         switch phase {
-        case .idle, .recording, .transcribing:
+        case .idle, .recording, .transcribing, .polishingSelection:
             ignoresMouseEvents = true
         case .locked, .cancelled:
             // .locked has X/✓ buttons; .cancelled has an Undo button.
@@ -162,7 +167,7 @@ class OverlayPanel: NSPanel {
         switch phase {
         case .recording, .locked:
             beginTopmostReassert()
-        case .idle, .transcribing, .cancelled:
+        case .idle, .transcribing, .polishingSelection, .cancelled:
             endTopmostReassert()
         }
 
@@ -192,13 +197,10 @@ class OverlayPanel: NSPanel {
         nc.addObserver(self, selector: #selector(handleFullscreenChange),
                        name: NSWindow.didExitFullScreenNotification, object: nil)
 
-        // Mouse + key signals — light, just timestamp + screen.
-        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] _ in
-            self?.recordMouseSignal()
-        }
-        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] _ in
-            self?.recordKeySignal()
-        }
+        // NO global mouse/key monitors. They previously dispatched 60–200 main-thread
+        // closures per second while typing or moving the cursor — the root cause of
+        // the perceived pill latency. Active-screen detection now uses NSEvent.mouseLocation
+        // on-demand inside resolveActiveScreen(), which is O(1) and free.
 
         UserDefaults.standard.addObserver(self,
                                           forKeyPath: "hidePillFromScreenCapture",
@@ -217,6 +219,7 @@ class OverlayPanel: NSPanel {
 
     @objc private func handleScreenParametersChanged() {
         DispatchQueue.main.async { [weak self] in
+            self?.cachedDockTopEdge = nil  // force re-read after screen change
             self?.restartDisplayLink()
             self?.repositionImmediate(animated: true)
         }
@@ -262,28 +265,20 @@ class OverlayPanel: NSPanel {
         }
     }
 
-    // MARK: - Signal recording
+    // MARK: - Signal seeding
 
-    private func recordMouseSignal() {
+    /// Polls NSEvent.mouseLocation on demand — cheap, no global monitor needed.
+    private func currentMouseScreen() -> NSScreen? {
         let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
-        lastMouseScreen = screen
-        lastMouseSignalAt = CACurrentMediaTime()
-    }
-
-    private func recordKeySignal() {
-        // Treat keyboard activity as "user is here" — bump key-window signal.
-        if let s = NSApp.keyWindow?.screen ?? NSApp.mainWindow?.screen {
-            lastKeyWindowScreen = s
-            lastKeyWindowSignalAt = CACurrentMediaTime()
-        }
+        return NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
     }
 
     private func seedActiveScreenSignals() {
-        recordMouseSignal()
+        // App activation seed — keeps the first computeTargetFrame from picking
+        // a stale screen on launch. Mouse + key-window are polled live each tick.
         if let s = NSScreen.main {
-            lastKeyWindowScreen = s
-            lastKeyWindowSignalAt = CACurrentMediaTime()
+            lastAppActivationScreen = s
+            lastAppActivationAt = CACurrentMediaTime()
         }
     }
 
@@ -322,13 +317,11 @@ class OverlayPanel: NSPanel {
     private func resolveActiveScreen() -> NSScreen {
         let now = CACurrentMediaTime()
 
-        // Build candidate list with (screen, age).
+        // Build candidate list with (screen, age). All signals are polled live
+        // here — no event-monitor side channel, so this is the only cost.
         var candidates: [(screen: NSScreen, age: TimeInterval)] = []
-        if let s = lastMouseScreen { candidates.append((s, now - lastMouseSignalAt)) }
-        if let s = lastKeyWindowScreen { candidates.append((s, now - lastKeyWindowSignalAt)) }
+        if let s = currentMouseScreen() { candidates.append((s, 0)) }
         if let s = lastAppActivationScreen { candidates.append((s, now - lastAppActivationAt)) }
-
-        // Fresh-key-window also dynamically computed (covers app's window moves).
         if let dyn = NSApp.keyWindow?.screen ?? NSApp.mainWindow?.screen {
             candidates.append((dyn, 0))
         }
@@ -424,11 +417,23 @@ class OverlayPanel: NSPanel {
         let dockHidden = screen.visibleFrame.size == screen.frame.size
 
         // Prefer AX-derived dock edge when available; fallback to visibleFrame.
+        // Cache the AX result for 3s — dockTopEdge() is an AX round-trip and
+        // was previously called at 60Hz from the display link, causing latency.
         let y: CGFloat
-        if !dockHidden, let dockTop = dockTopEdge(on: screen) {
-            y = dockTop + 4
+        if !dockHidden {
+            let now = CACurrentMediaTime()
+            if cachedDockTopEdge == nil || (now - dockEdgeCachedAt) > dockEdgeCacheTTL {
+                cachedDockTopEdge = dockTopEdge(on: screen)
+                dockEdgeCachedAt = now
+            }
+            if let dockTop = cachedDockTopEdge {
+                y = dockTop + 4
+            } else {
+                y = screen.visibleFrame.minY + 4
+            }
         } else {
-            y = screen.visibleFrame.minY + (dockHidden ? 0 : 4)
+            cachedDockTopEdge = nil
+            y = screen.visibleFrame.minY
         }
 
         let x = screen.frame.midX - panelWidth / 2
@@ -472,6 +477,12 @@ class OverlayPanel: NSPanel {
 
     /// Display-link tick — called on vsync. Compares target to current frame,
     /// animates if delta exceeds 0.5pt.
+    ///
+    /// Frame mutation is deferred to the next runloop tick to ensure we never
+    /// call setFrame from inside a CA transaction commit. The display link
+    /// dispatches us to main, but main can land mid-transaction during a
+    /// SwiftUI re-render — directly calling setFrame from there crashes with
+    /// `_postWindowNeedsUpdateConstraints` on macOS 26.
     fileprivate func displayLinkTick() {
         let target = computeTargetFrame()
         let cur = self.frame
@@ -480,20 +491,32 @@ class OverlayPanel: NSPanel {
         let dh = abs(target.height - cur.height)
         if dx < 0.5 && dy < 0.5 && dh < 0.5 { return }
 
-        currentTargetFrame = target
-
         let intersectsAnyScreen = NSScreen.screens.contains { $0.frame.intersects(target) }
         guard intersectsAnyScreen else { return }
 
-        // Height changes (live-partial text appearing/disappearing) use a
-        // longer spring animation so the pill expansion reads as intentional.
-        // Position-only changes use the fast 8ms dock-follow animation.
+        currentTargetFrame = target
+
+        // Defer onto the next runloop pass to escape any active CA transaction.
+        // 0.0s asyncAfter is equivalent to "schedule for the next event loop turn"
+        // and is the cheapest way to guarantee we're outside layoutSubtreeIfNeeded.
         let duration: TimeInterval = dh > 1 ? 0.20 : 0.008
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = duration
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            ctx.allowsImplicitAnimation = true
-            animator().setFrame(target, display: true)
+        DispatchQueue.main.asyncAfter(deadline: .now()) { [weak self] in
+            guard let self else { return }
+            // Re-check the target — by the time this fires the screen / state
+            // may have moved on. Recomputing is cheap (dock edge is cached).
+            let now = self.computeTargetFrame()
+            let stillNeedsMove =
+                abs(now.minX - self.frame.minX) >= 0.5 ||
+                abs(now.minY - self.frame.minY) >= 0.5 ||
+                abs(now.height - self.frame.height) >= 0.5
+            guard stillNeedsMove else { return }
+
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = duration
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                ctx.allowsImplicitAnimation = true
+                self.animator().setFrame(now, display: true)
+            }
         }
     }
 
@@ -514,8 +537,11 @@ class OverlayPanel: NSPanel {
         CVDisplayLinkSetOutputCallback(link, { (_, _, _, _, _, ctx) -> CVReturn in
             guard let ctx else { return kCVReturnSuccess }
             let panel = Unmanaged<OverlayPanel>.fromOpaque(ctx).takeUnretainedValue()
-            // Throttle to ~30Hz to be polite — recording-state UI runs on
-            // SwiftUI's own TimelineView, this is just the panel-frame chase.
+            // True 30Hz throttle: skip every other vsync frame. Without this,
+            // at 60Hz we dispatch 60 main-thread closures/sec — each calling
+            // the AX dock-edge API — causing measurable click and audio latency.
+            panel.displayLinkFrameCounter &+= 1
+            guard panel.displayLinkFrameCounter % 2 == 0 else { return kCVReturnSuccess }
             DispatchQueue.main.async { panel.displayLinkTick() }
             return kCVReturnSuccess
         }, opaque)
@@ -553,7 +579,7 @@ class OverlayPanel: NSPanel {
     // MARK: - Content / lifecycle
 
     private func setupContent() {
-        let hostingView = NSHostingView(
+        let hostingView = PillHostingView(
             rootView: OverlayPillView(
                 state: recordingState,
                 onTap: { [weak self] in self?.onTap?() },
@@ -579,8 +605,10 @@ class OverlayPanel: NSPanel {
         repositionImmediate(animated: false)
         orderFrontRegardless()
         startDisplayLink()
-        let f = self.frame
-        print("[VOICE] Pill positioned at x=\(Int(f.minX)) y=\(Int(f.minY)) on \(resolveActiveScreen().localizedName)")
+        if debugEnabled {
+            let f = self.frame
+            print("[VOICE/dbg] Pill positioned at x=\(Int(f.minX)) y=\(Int(f.minY)) on \(resolveActiveScreen().localizedName)")
+        }
     }
 
     override var canBecomeKey: Bool { false }
@@ -594,11 +622,64 @@ class OverlayPanel: NSPanel {
         topmostReassertTimer = nil
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
-        if let token = globalMouseMonitor { NSEvent.removeMonitor(token) }
-        if let token = globalKeyMonitor { NSEvent.removeMonitor(token) }
-        globalMouseMonitor = nil
-        globalKeyMonitor = nil
         UserDefaults.standard.removeObserver(self, forKeyPath: "hidePillFromScreenCapture")
+    }
+}
+
+// MARK: - PillHostingView
+
+/// NSHostingView subclass that only captures mouse events inside the actual
+/// visible pill region. The 180×56 panel has substantial empty padding around
+/// the capsule; without this override, AppKit consumes clicks anywhere in the
+/// panel rect (even when SwiftUI's `.contentShape(Capsule())` ignores them),
+/// silently swallowing the user's click on whatever app is underneath.
+///
+/// We approximate the visible region as a horizontally-centered band at the
+/// bottom of the panel matching the largest possible pill bounds (160×34).
+/// Points outside that band return nil → AppKit forwards the click to the
+/// window below.
+private final class PillHostingView<Content: View>: NSHostingView<Content> {
+    // Bottom-anchored band that contains every pill phase (idle dot, recording
+    // capsule, locked capsule, transcribing dot, cancelled toast). Generous
+    // enough to never clip a real interactive control, tight enough that all
+    // the click-through padding goes to the app below.
+    private let visibleBandHeight: CGFloat = 34
+    private let visibleBandWidth: CGFloat = 170
+
+    required init(rootView: Content) {
+        super.init(rootView: rootView)
+        // CRITICAL: disable constraint-based layout for this hosting view. The
+        // panel uses explicit setFrame() calls from the display link; without
+        // this, NSHostingView's internal constraints fight setFrame during the
+        // CA transaction commit phase, triggering an exception in
+        // `_postWindowNeedsUpdateConstraints` (observed crash on live-partial
+        // expand on macOS 26+).
+        translatesAutoresizingMaskIntoConstraints = true
+        autoresizingMask = [.width, .height]
+    }
+
+    @MainActor required dynamic init?(coder: NSCoder) {
+        fatalError("not implemented")
+    }
+
+    // Pin safe-area insets to zero. SwiftUI's auto safe-area handling on a
+    // borderless overlay panel triggers `invalidateSafeAreaInsets` during
+    // layout, which schedules `setNeedsUpdateConstraints`, which throws if
+    // it lands inside a CA transaction commit. Zeroing eliminates the path.
+    override var safeAreaInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let bounds = self.bounds
+        let bandX = (bounds.width - visibleBandWidth) / 2
+        let bandY: CGFloat = (bounds.height > visibleBandHeight + 6) ? 4 : 0
+        let bandHeight = max(visibleBandHeight, bounds.height - bandY)
+        let band = NSRect(x: bandX, y: bandY, width: visibleBandWidth, height: bandHeight)
+        // Quick reject — point is in the dead padding. AppKit will forward the
+        // click to whatever window is underneath.
+        guard band.contains(point) else { return nil }
+        return super.hitTest(point)
     }
 }
 
@@ -609,6 +690,7 @@ enum PillPhase: Equatable {
     case recording        // push-to-talk
     case locked           // 2x click mode
     case transcribing
+    case polishingSelection  // Opt+1 flow — polishing externally selected text
     case cancelled        // toast
 }
 
@@ -626,10 +708,23 @@ struct OverlayPillView: View {
     /// Phase priority. Order matters — `transcribing` must win over a stale
     /// `isRecording=false` so the post-recording → transcribing handoff
     /// doesn't lapse to .idle for a frame (visible flicker).
+    ///
+    /// `pendingRecordingStart` short-circuits BEFORE any async audio-engine
+    /// spin-up. The moment the hotkey closure flips that flag the pill should
+    /// snap to .recording on the next render — no waiting for AVAudioEngine,
+    /// the tap install, or the first sample to arrive. The flag is cleared
+    /// when isRecording actually becomes true (or on abort).
     private var rawPhase: PillPhase {
+        // pendingRecordingStart MUST be the first check — it's the zero-latency
+        // path that flips the moment the hotkey closure fires, before the audio
+        // engine has spun up or isRecording has been set true. Anything else
+        // checked above this re-introduces the latency we fixed.
+        if state.pendingRecordingStart && !state.isLocked { return .recording }
         if state.isTranscribing { return .transcribing }
         if state.isLocked && state.isRecording { return .locked }
         if state.isRecording { return .recording }
+        // polishingSelection: added by another agent — check defensively.
+        if state.isPolishingSelection { return .polishingSelection }
         if state.showingCancelledToast { return .cancelled }
         return .idle
     }
@@ -638,7 +733,22 @@ struct OverlayPillView: View {
     @State private var lastLoggedPhase: PillPhase = .idle
     @State private var settlingTask: Task<Void, Never>?
 
-    private let phaseSpring = Animation.spring(response: 0.22, dampingFraction: 0.88)
+    // Per-edge animation specs. The single-spring approach (one curve for
+    // every transition) reads as "the pill is animating" rather than "the
+    // pill is reacting to a specific event". Each edge gets the curve that
+    // matches its semantic urgency:
+    //   - idle → recording:    instant (no animation — see applyPhase)
+    //   - recording → locked:  spring 0.32/0.78 — user just double-tapped,
+    //                          a mild celebration is OK
+    //   - recording → trans.:  spring 0.28/0.82 — tapering off
+    //   - transcribing → idle: easeOut 0.25 — non-urgent "done"
+    //   - cancelled → idle:    easeOut 0.35 — give user time to register
+    //   - everything else:     a calm phaseSpring for ambient transitions
+    private let phaseSpring          = Animation.spring(response: 0.22, dampingFraction: 0.88)
+    private let recordingToLocked    = Animation.spring(response: 0.32, dampingFraction: 0.78)
+    private let recordingToTranscribe = Animation.spring(response: 0.28, dampingFraction: 0.82)
+    private let transcribeToIdle     = Animation.easeOut(duration: 0.25)
+    private let cancelledToIdle      = Animation.easeOut(duration: 0.35)
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -647,8 +757,19 @@ struct OverlayPillView: View {
                 IdlePill(onTap: { onTap?() })
                     .transition(growFromBottom)
             case .recording:
+                // NO transition into recording — the user pressed the hotkey
+                // and needs visual confirmation on the SAME frame. Any spring
+                // or fade here reads as "the app is slow". Removal still uses
+                // the standard transition (handled by the outgoing phase).
+                // BUGFIX: removed `.id(displayPhase)` — it forced SwiftUI to
+                // tear down and rebuild the RecordingPill on every parent
+                // re-render that touched displayPhase, which manifested as
+                // the occasional gradient "glitch" (AuroraBackground inside
+                // GlassCapsule remounted, re-running its onAppear and
+                // re-seeding the TimelineView phase). The switch case itself
+                // already provides correct identity per phase.
                 RecordingPill(state: state)
-                    .transition(growFromBottom)
+                    .transition(.identity)
             case .locked:
                 LockedPill(
                     state: state,
@@ -658,6 +779,9 @@ struct OverlayPillView: View {
                 .transition(growFromBottom)
             case .transcribing:
                 TranscribingPill()
+                    .transition(growFromBottom)
+            case .polishingSelection:
+                PolishingSelectionPill()
                     .transition(growFromBottom)
             case .cancelled:
                 CancelledToast(
@@ -669,44 +793,96 @@ struct OverlayPillView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .padding(.bottom, 6)
+        // Subtle scale: idle state contracts slightly (0.96) so transitions
+        // INTO active states feel like a physical "pop". The scale animates
+        // implicitly as part of the explicit `withAnimation` block driving
+        // `displayPhase` in applyPhase — no `.animation(_:value:)` modifier
+        // here, which would otherwise compete with that block and produce
+        // double-animation jank on every phase commit.
+        .scaleEffect(displayPhase == .idle ? 0.96 : 1.0)
         // Constrain hit-testing to the visible capsule. The 180x56 panel has
         // ~60pt of empty space around the actual pill; without this, that
         // padding still captures clicks when ignoresMouseEvents=false.
         .contentShape(Capsule())
-        .animation(phaseSpring, value: displayPhase)
+        // No static `.animation` modifier here — each phase commit drives its
+        // own withAnimation block so we can choose snap vs. spring per direction.
         .onAppear { applyPhase(rawPhase, immediate: true) }
         .onChange(of: rawPhase) { _, newPhase in applyPhase(newPhase, immediate: false) }
+        .onChange(of: displayPhase) { old, new in
+            // Debug-gated. The pill ticks through many phase transitions per
+            // recording and the firehose drowns out real signal at runtime.
+            if UserDefaults.standard.bool(forKey: "voicePillDebug") {
+                print("[VOICE-PILL/dbg] \(old) -> \(new) @ \(Date().timeIntervalSinceReferenceDate)")
+            }
+        }
     }
 
     private func applyPhase(_ next: PillPhase, immediate: Bool) {
         settlingTask?.cancel()
         settlingTask = nil
 
-        let commit: (PillPhase) -> Void = { newValue in
+        let commit: (PillPhase, Animation?) -> Void = { newValue, anim in
             if newValue != lastLoggedPhase {
-                print("[VOICE] Pill phase: \(lastLoggedPhase) → \(newValue)")
+                if UserDefaults.standard.bool(forKey: "voicePillDebug") {
+                    print("[VOICE/dbg] Pill phase: \(lastLoggedPhase) -> \(newValue)")
+                }
                 lastLoggedPhase = newValue
             }
-            displayPhase = newValue
+            if let anim {
+                withAnimation(anim) {
+                    displayPhase = newValue
+                }
+            } else {
+                displayPhase = newValue
+            }
             onPhaseChange?(newValue)
         }
 
         if next == .idle && !immediate && displayPhase != .idle {
+            // Delay idle-settle 300ms so a brief transcribing flash doesn't
+            // immediately collapse the pill before the user can see it.
+            // Curve depends on origin: cancelled→idle wants a longer, calmer
+            // fade (gives the user time to register the cancel toast was
+            // there); transcribing→idle is a non-urgent "done"; everything
+            // else falls back to the ambient phase spring.
+            let origin = displayPhase
+            let idleAnim: Animation
+            switch origin {
+            case .cancelled:    idleAnim = cancelledToIdle
+            case .transcribing: idleAnim = transcribeToIdle
+            default:            idleAnim = phaseSpring
+            }
             settlingTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 300_000_000)
                 if Task.isCancelled { return }
-                commit(.idle)
+                commit(.idle, idleAnim)
             }
+        } else if immediate {
+            commit(next, nil)
+        } else if next == .recording {
+            // Recording entry must be INSTANT — no animation, no spring. The
+            // user pressed the hotkey and any easing here reads as "the app
+            // is slow". Pair this with `.transition(.identity)` on the
+            // RecordingPill case so SwiftUI doesn't fade/scale it in.
+            commit(next, nil)
+        } else if next == .locked && displayPhase == .recording {
+            // The user just double-tapped to lock — a mild celebration is OK.
+            commit(next, recordingToLocked)
+        } else if next == .transcribing && displayPhase == .recording {
+            // Tapering off — slightly snappier than the lock celebration.
+            commit(next, recordingToTranscribe)
         } else {
-            commit(next)
+            // Ambient transitions (polishingSelection, cancelled entry, etc.)
+            // use the calm phase spring.
+            commit(next, phaseSpring)
         }
     }
 
     private var growFromBottom: AnyTransition {
         .asymmetric(
-            insertion: .scale(scale: 0.82, anchor: .bottom)
+            insertion: .scale(scale: 0.88, anchor: .bottom)
                 .combined(with: .opacity),
-            removal: .scale(scale: 0.82, anchor: .bottom)
+            removal: .scale(scale: 1.06, anchor: .bottom)
                 .combined(with: .opacity)
         )
     }
@@ -725,6 +901,8 @@ private struct GlassCapsule: View {
     var fillOpacity: Double = 0.55
     var glowLevel: CGFloat = 0
 
+    @AppStorage("pillSkin") private var pillSkin: String = "default"
+
     private var glowRadius: CGFloat { min(glowLevel * 12, 9) }
     private var glowOpacity: Double { min(Double(glowLevel) * 0.40, 0.16) }
 
@@ -732,21 +910,62 @@ private struct GlassCapsule: View {
         Capsule(style: .continuous)
             .fill(.ultraThinMaterial)
             .overlay(
-                Capsule(style: .continuous)
-                    .fill(Color.black.opacity(fillOpacity))
+                Group {
+                    if pillSkin == "niche" {
+                        // The aurora mesh control points oscillate (amp 0.14 mid,
+                        // 0.06 edge) AND the corner points sit at -0.05 / 1.05.
+                        // Combined, the leftmost middle control point can swing
+                        // to ~-0.16 — outside the unit square. Add a generous
+                        // overscan via NEGATIVE padding so the gradient is laid
+                        // out in a frame ~8pt larger on each side than the
+                        // visible capsule. Then scale 1.35× (keeps the
+                        // off-center indigo blob inside the thin visible band)
+                        // and clip AFTER both — so the visible capsule is the
+                        // only mask, never the gradient's own frame. Order is
+                        // critical: padding (grow) → scaleEffect → clipShape.
+                        AuroraBackground()
+                            .padding(-8)
+                            .scaleEffect(1.35)
+                            .clipShape(Capsule(style: .continuous))
+                            .allowsHitTesting(false)
+                    } else {
+                        Capsule(style: .continuous)
+                            .fill(Color.black.opacity(fillOpacity))
+                    }
+                }
+            )
+            .overlay(
+                // Niche-only top sheen: subtle white highlight band across
+                // the top of the capsule sells the "glass over color" read.
+                Group {
+                    if pillSkin == "niche" {
+                        Capsule(style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    stops: [
+                                        .init(color: Color.white.opacity(0.22), location: 0.0),
+                                        .init(color: Color.white.opacity(0.0),  location: 0.45)
+                                    ],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                            )
+                            .blendMode(.plusLighter)
+                            .allowsHitTesting(false)
+                    }
+                }
             )
             .overlay(
                 Capsule(style: .continuous)
                     .strokeBorder(
                         LinearGradient(
-                            colors: [
-                                Color.white.opacity(0.36),
-                                Color.white.opacity(0.06)
-                            ],
+                            colors: pillSkin == "niche"
+                                ? [Color.white.opacity(0.55), Color.white.opacity(0.12)]
+                                : [Color.white.opacity(0.36), Color.white.opacity(0.06)],
                             startPoint: .top,
                             endPoint: .bottom
                         ),
-                        lineWidth: 0.6
+                        lineWidth: pillSkin == "niche" ? 0.75 : 0.6
                     )
             )
             .shadow(color: .white.opacity(glowOpacity), radius: glowRadius, y: 0)
@@ -829,15 +1048,60 @@ private struct RecordingPill: View {
     }
 
     var body: some View {
-        WaveformView(
-            levels: state.audioLevels,
-            audioPeak: audioPeak
-        )
-        .frame(width: 68, height: 16)
+        HStack(spacing: 7) {
+            // No-input warning: a small pulsing red dot is louder visually
+            // than 22 chars of microcopy and never bloats the pill width.
+            if state.noInputDetected {
+                NoInputDot()
+                    .transition(.scale.combined(with: .opacity))
+            }
+
+            WaveformView(
+                levels: state.audioLevels,
+                audioPeak: audioPeak,
+                inputLevel: state.inputLevel,
+                accent: .neutral
+            )
+            .frame(width: 88, height: 18)
+        }
         .padding(.horizontal, 14)
         .padding(.vertical, 5)
-        .background(GlassCapsule(fillOpacity: 0.85, glowLevel: 0))
+        .background(GlassCapsule(fillOpacity: 0.85, glowLevel: CGFloat(audioPeak)))
         .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
+        // BUGFIX: scoping the implicit animation to ONLY noInputDetected
+        // prevents it from being applied to every other state change that
+        // re-renders this pill (audioPeak updates, livePartial deltas).
+        // The previous broad `.animation(...)` was fighting the NoInputDot
+        // `.transition(.scale.combined(with: .opacity))` AND animating the
+        // background glow re-render — visible as the pill "shimmer" the
+        // user reported. Wrapping in `transaction` confines the animation
+        // strictly to the no-input toggle event.
+        .transaction(value: state.noInputDetected) { tx in
+            tx.animation = .spring(response: 0.28, dampingFraction: 0.85)
+        }
+    }
+}
+
+// MARK: - No-input pulsing dot
+
+private struct NoInputDot: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            // 1.2s breath
+            let phase = (t.truncatingRemainder(dividingBy: 1.2)) / 1.2
+            let s = sin(phase * 2 * .pi)
+            let opacity = 0.55 + 0.35 * s   // 0.20 … 0.90
+            let scale = 1.0 + 0.18 * s
+            Circle()
+                .fill(Color(red: 1.0, green: 0.32, blue: 0.32))
+                .frame(width: 6, height: 6)
+                .opacity(opacity)
+                .scaleEffect(scale)
+                .shadow(color: Color.red.opacity(0.45), radius: 3, y: 0)
+                .help("No mic input. Check microphone permissions.")
+        }
+        .frame(width: 8, height: 8)
     }
 }
 
@@ -876,16 +1140,19 @@ private struct LockedPill: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Live-partial preview — only when text is available.
+            // Live-partial preview (only when partial text is available).
+            // Literal `Color.white` is intentional here: the pill capsule is
+            // always a dark glass surface regardless of system theme, so the
+            // text needs to be a fixed light value, not `.primary`.
             if !state.livePartialText.isEmpty {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
                         Text(state.livePartialText)
-                            .font(.system(size: 11, weight: .regular))
+                            .font(.sans(11, weight: .regular))
                             .foregroundStyle(
                                 state.livePartialIsVolatile
                                     ? Color.white.opacity(0.55)
-                                    : Color.white.opacity(1.0)
+                                    : Color.white
                             )
                             .multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -902,22 +1169,29 @@ private struct LockedPill: View {
                 }
                 .frame(maxWidth: .infinity)
 
-                // Thin separator
+                // Hairline separator between partial text and the controls row.
                 Rectangle()
                     .fill(Color.white.opacity(0.10))
                     .frame(height: 0.5)
             }
 
-            // Controls row: X | waveform | ✓
-            HStack(spacing: 6) {
+            // Controls row: X | lock-glyph + waveform | ✓
+            // The amber lock glyph + warm-tinted bars give locked mode a
+            // distinct visual identity vs. push-to-talk (cool neutral).
+            HStack(spacing: 5) {
                 ActionButton(systemName: "xmark", hoverTint: Color.red.opacity(0.55), action: onCancel)
+
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(WaveformAccent.warm.primary.opacity(0.85))
 
                 WaveformView(
                     levels: state.audioLevels,
-                    audioPeak: audioPeak
+                    audioPeak: audioPeak,
+                    inputLevel: state.inputLevel,
+                    accent: .warm
                 )
-                .frame(width: 56, height: 16)
-                .padding(.horizontal, 3)
+                .frame(width: 68, height: 16)
 
                 ActionButton(systemName: "checkmark", hoverTint: Color.green.opacity(0.55), action: onConfirm)
             }
@@ -935,22 +1209,56 @@ private struct ActionButton: View {
     let systemName: String
     let hoverTint: Color
     let action: () -> Void
+
     @State private var isHovering = false
+    @State private var isPressed = false
 
     var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.95))
-                .frame(width: 22, height: 22)
-                .background(
-                    Circle().fill(isHovering ? hoverTint : Color.white.opacity(0.28))
+        // Custom gesture, not Button — SwiftUI's Button on macOS adds a
+        // small but perceptible delay before invoking its action (it waits
+        // to disambiguate a press from a drag). The X / ✓ buttons in lock
+        // mode are the user's "I'm done" affordance; any latency here reads
+        // as "the app is slow to respond". DragGesture(minimumDistance: 0)
+        // dispatches on first contact and gives us sub-frame response.
+        Image(systemName: systemName)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.95))
+            .frame(width: 22, height: 22)
+            .background(
+                Circle().fill(
+                    isPressed
+                        ? hoverTint.opacity(0.85)
+                        : (isHovering ? hoverTint : Color.white.opacity(0.28))
                 )
-                .scaleEffect(isHovering ? 1.06 : 1.0)
-        }
-        .buttonStyle(.plain)
-        .onHover { isHovering = $0 }
-        .animation(.spring(response: 0.18, dampingFraction: 0.75), value: isHovering)
+            )
+            .scaleEffect(isPressed ? 0.94 : (isHovering ? 1.06 : 1.0))
+            // Two animation channels so press and hover don't fight each
+            // other — press is faster (the click should feel immediate);
+            // hover is slightly slower (an idle ambient cue).
+            .animation(.easeOut(duration: 0.10), value: isPressed)
+            .animation(.easeOut(duration: 0.14), value: isHovering)
+            .contentShape(Circle())
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+            }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        if !isPressed { isPressed = true }
+                    }
+                    .onEnded { value in
+                        isPressed = false
+                        // Only fire if the release landed inside the 22×22
+                        // hit region. Lets the user "slide off" to cancel
+                        // a press — matches native button behavior.
+                        let t = value.translation
+                        let dist = (t.width * t.width + t.height * t.height).squareRoot()
+                        if dist < 22 {
+                            action()
+                        }
+                    }
+            )
     }
 }
 
@@ -987,12 +1295,51 @@ private struct SweepingRing: View {
     }
 }
 
+// MARK: - Polishing Selection
+
+/// Shown during the Opt+1 flow while a selected text region is being polished.
+/// Click-through (user cannot interact) — same visual weight as TranscribingPill
+/// but with a sparkles glyph + label to signal a distinct AI-rewrite action.
+private struct PolishingSelectionPill: View {
+    var body: some View {
+        HStack(spacing: 6) {
+            SparklesBreath()
+                .frame(width: 16, height: 16)
+            Text("Polishing\u{2026}")
+                .font(.sans(13, weight: .medium))
+                .foregroundStyle(.primary.opacity(0.85))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(GlassCapsule(fillOpacity: 0.80))
+        .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
+    }
+}
+
+/// Sparkles icon that breathes in sync with the SweepingRing pulse pattern.
+private struct SparklesBreath: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let phase = (t.truncatingRemainder(dividingBy: 1.6)) / 1.6
+            let s = sin(phase * 2 * .pi)
+            let opacity = 0.70 + 0.18 * s     // 0.52 … 0.88 (matches SweepingRing)
+            let scale = 1.0 + 0.06 * s        // 0.94 … 1.06
+            Image(systemName: "sparkles")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.primary.opacity(opacity))
+                .scaleEffect(scale)
+        }
+    }
+}
+
 // MARK: - Cancelled Toast
 
 private struct CancelledToast: View {
     let shownAt: Date
     let onUndo: () -> Void
     @State private var undoHovering = false
+    @State private var undoPressed = false
     private let totalDuration: TimeInterval = 4.0
 
     var body: some View {
@@ -1002,25 +1349,43 @@ private struct CancelledToast: View {
 
             HStack(spacing: 8) {
                 Text("Cancelled")
-                    .font(.sans(10.5, weight: .medium))
-                    .tracking(LetterSpacing.body)
-                    .foregroundStyle(.white.opacity(0.80))
+                    .font(.sans(11, weight: .medium))
+                    .foregroundStyle(Color.white.opacity(0.80))
 
-                Button(action: onUndo) {
-                    Text("Undo")
-                        .font(.sans(10, weight: .semibold))
-                        .tracking(LetterSpacing.body)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(
-                            Capsule(style: .continuous)
-                                .fill(Color.white.opacity(undoHovering ? 0.22 : 0.14))
-                        )
-                }
-                .buttonStyle(.plain)
-                .onHover { undoHovering = $0 }
-                .animation(.spring(response: 0.18, dampingFraction: 0.75), value: undoHovering)
+                // Same low-latency gesture pattern as ActionButton: the
+                // 4-second window to undo is tight, every ms of perceived
+                // delay matters.
+                Text("Undo")
+                    .font(.sans(11, weight: .semibold))
+                    .foregroundStyle(Color.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color.white.opacity(
+                                undoPressed ? 0.30 : (undoHovering ? 0.22 : 0.14)
+                            ))
+                    )
+                    .scaleEffect(undoPressed ? 0.96 : 1.0)
+                    .animation(.easeOut(duration: 0.10), value: undoPressed)
+                    .animation(.easeOut(duration: 0.14), value: undoHovering)
+                    .contentShape(Capsule())
+                    .onHover { hovering in
+                        undoHovering = hovering
+                        if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                    }
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in
+                                if !undoPressed { undoPressed = true }
+                            }
+                            .onEnded { value in
+                                undoPressed = false
+                                let t = value.translation
+                                let dist = (t.width * t.width + t.height * t.height).squareRoot()
+                                if dist < 40 { onUndo() }
+                            }
+                    )
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 5)
@@ -1043,47 +1408,267 @@ private struct CancelledToast: View {
     }
 }
 
+// MARK: - Waveform accent
+
+/// Color palette for the waveform. `neutral` for push-to-talk (cool white),
+/// `warm` for locked-mode (subtle amber so the user can tell the two states
+/// apart at a glance). Each accent ships a top→bottom gradient that ties bar
+/// height to a slight hue shift — taller = warmer/brighter.
+enum WaveformAccent {
+    case neutral
+    case warm
+
+    var primary: Color {
+        switch self {
+        case .neutral: return .white
+        case .warm:    return Color(red: 1.0, green: 0.78, blue: 0.42)
+        }
+    }
+
+    var textColor: Color {
+        switch self {
+        case .neutral: return .white
+        case .warm:    return Color(red: 1.0, green: 0.88, blue: 0.65)
+        }
+    }
+
+    func gradient(forLevel level: Float) -> LinearGradient {
+        let intensity = Double(min(max(level, 0), 1))
+        switch self {
+        case .neutral:
+            return LinearGradient(
+                colors: [
+                    Color.white.opacity(0.95 + intensity * 0.05),
+                    Color.white.opacity(0.55 + intensity * 0.20)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        case .warm:
+            return LinearGradient(
+                colors: [
+                    Color(red: 1.0, green: 0.84, blue: 0.52).opacity(0.95),
+                    Color(red: 0.95, green: 0.65, blue: 0.30).opacity(0.65 + intensity * 0.30)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+    }
+}
+
+// MARK: - Glass bar (niche skin)
+
+/// Frosted-glass waveform bar used by the "niche" skin. Layers:
+///   1. Vertical white gradient fill (top 95% → bottom 70%) for the
+///      translucent glass body.
+///   2. Top inner highlight — a 35%-height white gradient fading to clear,
+///      drives the "lit from above" optical cue.
+///   3. Thin hairline stroke (white@70%, 0.5pt) — refined edge.
+///   4. Soft drop shadow (black@15%, 2pt radius, 1pt y) — separates bars
+///      from the gradient background.
+private struct GlassBar: View {
+    let width: CGFloat
+    let height: CGFloat
+
+    var body: some View {
+        Capsule(style: .continuous)
+            .fill(
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(0.95),
+                        Color.white.opacity(0.72)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+            .overlay(
+                // Top inner highlight — 35% height white→clear.
+                Capsule(style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            stops: [
+                                .init(color: Color.white.opacity(0.45), location: 0.0),
+                                .init(color: Color.white.opacity(0.0),  location: 0.35)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+                    .blendMode(.plusLighter)
+                    .allowsHitTesting(false)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.70), lineWidth: 0.5)
+            )
+            .frame(width: width, height: height)
+            .shadow(color: Color.black.opacity(0.15), radius: 2, x: 0, y: 1)
+    }
+}
+
 // MARK: - Waveform
 
-/// 5-bar mirror-symmetric meter. Bars 0/4 share band 0, bars 1/3 share band 1,
-/// bar 2 is the peak band — gives a centered audio-meter look that reads as
-/// "I'm hearing you" without the chaotic shimmer of the older 11-bar wave.
+/// 7-bar mirror-symmetric meter. Bars are paired around the center
+/// (0↔6, 1↔5, 2↔4, 3 = peak) so the meter reads as a single chest-rising
+/// "I'm hearing you" rather than a chaotic per-bin spectrum.
+///
+/// Reactivity model (Wispr-quality):
+///   1. Per-bar low-pass filter on the incoming `levels` (α 0.35). Filters
+///      single-frame DSP spikes without smearing real onsets.
+///   2. Gamma 0.55 perceptual curve — quiet speech (0.05-0.40 band) gets the
+///      headroom it deserves. Linear scaling makes bars look dead at normal
+///      conversational volume.
+///   3. 6% floor — never fully flat at silence so the pill doesn't look
+///      broken. 4pt ceiling reservation so peaks have visual breathing room.
+///   4. NO additive idle breath. The previous breath was a constant 30Hz
+///      TimelineView tick that masked real low-volume input ("you're talking
+///      but the bars aren't moving") and kept the pill re-rendering every
+///      frame even on silence. With the floor in #3 the pill stays visually
+///      alive without faking activity.
+///   5. The 60ms ease-out on each bar's height is the only smoothing layer
+///      SwiftUI applies — fast enough to feel reactive (one breath cycle of
+///      speech is ~250ms), slow enough to bridge per-frame DSP jitter.
 struct WaveformView: View {
     let levels: [Float]
     let audioPeak: Float
+    /// Perceptual 0..1 RMS-derived input level. Retained on the public API
+    /// for callsite stability — no longer drives the bar floor (the bars
+    /// now track `levels` directly through the gamma curve).
+    var inputLevel: Float = 0
+    var accent: WaveformAccent = .neutral
+    /// When false, the bar grid is hidden (single idle blob is rendered
+    /// instead). Defaults to true since current callsites only mount this
+    /// view during active recording / locked phases.
+    var isRecording: Bool = true
+
+    @AppStorage("pillSkin") private var pillSkin: String = "default"
+
+    private let barCount = 7
+    private let maxBarHeight: CGFloat = 22
+    private let minBarHeight: CGFloat = 4
+
+    /// Per-bar exponential moving average. Maintains continuity across
+    /// renders so a single-frame DSP spike never dominates the visual.
+    @State private var smoothed: [Float] = Array(repeating: 0, count: 7)
 
     var body: some View {
-        HStack(spacing: 3) {
-            ForEach(0..<5, id: \.self) { i in
-                Capsule()
-                    .fill(Color.white.opacity(0.9 + Double(audioPeak) * 0.1))
-                    .frame(width: 3, height: max(3, barHeight(for: i)))
-                    .animation(.spring(response: 0.14, dampingFraction: 0.65), value: level(for: i))
+        Group {
+            if isRecording {
+                bars
+            } else {
+                idleBlob
             }
         }
-        .frame(width: 52, height: 22)
+        .frame(height: 22)
     }
 
+    private var bars: some View {
+        // No TimelineView — the bars update purely via the reactive path
+        // on `levels`. The audio capture service pushes `audioLevels` at
+        // 30Hz; SwiftUI invalidates the row only when the array actually
+        // changes. Previously a 30Hz TimelineView re-evaluated the entire
+        // ForEach every frame regardless of input — measurable main-thread
+        // cost during long recordings.
+        HStack(spacing: 2.5) {
+            ForEach(0..<barCount, id: \.self) { i in
+                let lvl = smoothed.indices.contains(i) ? smoothed[i] : 0
+                let h = max(minBarHeight, barHeight(value: lvl, maxHeight: maxBarHeight))
+                Group {
+                    if pillSkin == "niche" {
+                        GlassBar(width: 2.5, height: h)
+                    } else {
+                        Capsule(style: .continuous)
+                            .fill(accent.gradient(forLevel: lvl))
+                            .frame(width: 2.5, height: h)
+                    }
+                }
+                // 60ms is fast enough to feel reactive, slow enough to
+                // filter remaining jitter that survived the EMA. Keyed on
+                // the per-bar level so a change in bar i doesn't animate
+                // bar j.
+                .animation(.easeOut(duration: 0.06), value: lvl)
+            }
+        }
+        .drawingGroup() // composite bars into one Metal layer
+        .onAppear { applySmoothing(rebandedLevels()) }
+        .onChange(of: levels) { _, _ in applySmoothing(rebandedLevels()) }
+    }
+
+    /// Single calm dot — shown when not recording. Replaces the previous
+    /// "fake breathing" bars that made the pill look unresponsive when
+    /// real input was quiet. The dot is intentionally static (no Timeline
+    /// tick); the OverlayPillView's idle state owns idle animation.
+    private var idleBlob: some View {
+        Circle()
+            .fill(accent.primary.opacity(0.45))
+            .frame(width: 6, height: 6)
+    }
+
+    /// Re-band raw `levels` into the 7-bar mirrored layout BEFORE smoothing,
+    /// so the EMA filter operates on the same values that will be rendered.
+    private func rebandedLevels() -> [Float] {
+        var out = [Float](repeating: 0, count: barCount)
+        guard !levels.isEmpty else { return out }
+        for i in 0..<barCount {
+            out[i] = level(for: i)
+        }
+        return out
+    }
+
+    /// Low-pass filter the freshly-banded levels into `smoothed`.
+    /// α = 0.65: fast enough to track speech onsets within ~1 frame at 30Hz (~33ms).
+    /// The upstream AudioCaptureService already applies a 0.3 EMA before publishing
+    /// audioLevels, so a light secondary filter here just bridges per-frame DSP jitter
+    /// without adding noticeable lag. Previously α=0.35 (slow) was stacked on top of
+    /// AudioCaptureService's 0.3 EMA, making the combined time constant ~2.5× too slow
+    /// and causing bars to look sluggish / barely responsive.
+    private func applySmoothing(_ raw: [Float]) {
+        let alpha: Float = 0.65
+        var out = smoothed
+        if out.count != barCount {
+            out = Array(repeating: 0, count: barCount)
+        }
+        let count = min(raw.count, out.count)
+        for i in 0..<count {
+            out[i] = alpha * raw[i] + (1 - alpha) * out[i]
+        }
+        smoothed = out
+    }
+
+    /// Map bar index → mirrored band index (0..3). 7 bars, 4 unique bands.
+    /// 0↔6 → band 0, 1↔5 → band 1, 2↔4 → band 2, bar 3 → band 3 (peak).
     private func level(for index: Int) -> Float {
-        // Mirror symmetric: bars 0/4 share band 0, bars 1/3 share band 1, bar 2 is band 2 (peak)
         guard !levels.isEmpty else { return 0 }
-        let symmetricIndex = index <= 2 ? index : 4 - index
-        let band = symmetricIndex
+        let mirror = index <= barCount / 2 ? index : (barCount - 1 - index)
+        let bandCount = 4
+        let band = min(mirror, bandCount - 1)
         let count = levels.count
-        let start = (band * count) / 3
-        let end = ((band + 1) * count) / 3
+        let start = (band * count) / bandCount
+        let end = ((band + 1) * count) / bandCount
         guard end > start else { return 0 }
         let slice = levels[start..<end]
         return slice.reduce(0, +) / Float(slice.count)
     }
 
-    private func barHeight(for index: Int) -> CGFloat {
-        let raw = CGFloat(level(for: index))
-        // Soft-knee compander: pull quiet audio up so the bars feel
-        // responsive even at conversational volume, but cap at the
-        // 22px frame so they never clip.
-        let boosted = pow(raw, 0.7) * 1.15
-        let clipped = min(1.0, boosted)
-        return 3 + clipped * 18
+    /// Perceptual mapping from a 0..1 smoothed bar value → pixel height.
+    /// Gamma 0.40 (was 0.55) compresses harder so quiet speech maps higher up
+    /// the bar; 14% floor keeps the pill visually alive even at silence.
+    /// We also apply a recording-active boost: when actively recording, push
+    /// any non-zero input above the floor by a fixed offset so bars clearly
+    /// rise off the baseline on whispers / quiet input. 4pt ceiling
+    /// reservation prevents the tallest bar from kissing the capsule edge.
+    private func barHeight(value: Float, maxHeight: CGFloat) -> CGFloat {
+        let clamped = max(0.0, min(1.0, Double(value)))
+        let amplified = pow(clamped, 0.40)
+        // Floor lifted from 0.06 → 0.14 so silence still shows a clear baseline.
+        // When recording AND any input is present, add a small visibility boost
+        // (clamped to 0.85) so the bars unambiguously animate above floor.
+        var normalized = max(0.14, amplified)
+        if clamped > 0.005 {
+            normalized = min(0.95, normalized + 0.08)
+        }
+        return CGFloat(normalized) * (maxHeight - 4)
     }
 }

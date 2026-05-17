@@ -1,0 +1,10 @@
+{
+  "id": "preserve-short-utterance",
+  "title": "Short utterance — no gratuitous rewriting",
+  "categories": ["short", "preservation", "regression"],
+  "raw": "I just had an idea.",
+  "reference": "I just had an idea.",
+  "notes": "REGRESSION TEST: polisher must NOT change real words to synonyms or shorter forms. 'just had' carries different meaning than 'have'. Acceptable variations: punctuation only, capitalization only. Word changes = FAIL.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

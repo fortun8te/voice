@@ -1,0 +1,10 @@
+{
+  "id": "short-lol-removal",
+  "title": "Short casual — trailing lol removed in high cleanup, content untouched",
+  "categories": ["short", "filler", "regression"],
+  "raw": "fixed the bug finally lol",
+  "reference": "Fixed the bug finally.",
+  "notes": "High cleanup: 'lol' as pure reaction at end of clause → remove. 'finally' is real emphasis — KEEP. Capitalize first word. Period at end. Must NOT become 'The bug has been fixed' or any other rewording. Only changes: capitalize + period + remove lol.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

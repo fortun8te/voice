@@ -48,7 +48,11 @@ let package = Package(
                 .product(name: "MLXLLM", package: "mlx-swift-examples"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-examples"),
             ],
-            path: "Sources/Voice"
+            path: "Sources/Voice",
+            resources: [
+                .copy("Resources/granite_server.py"),
+                .copy("Resources/moonshine_server.py"),
+            ]
         ),
         .testTarget(
             name: "VoiceTests",

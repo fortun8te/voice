@@ -1,0 +1,10 @@
+{
+  "id": "short-filler-time",
+  "title": "Short message — all fillers stripped, time formatted",
+  "categories": ["short", "filler", "time", "regression"],
+  "raw": "um okay so the meeting is at uh three thirty pm tomorrow",
+  "reference": "The meeting is at 3:30 PM tomorrow.",
+  "notes": "Strip: um, okay so, uh. Time: 'three thirty pm' → '3:30 PM'. No content added. Must NOT add 'I will attend' or 'Please join' or any padding. Output is exactly one sentence.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

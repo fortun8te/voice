@@ -1,83 +1,93 @@
 // VOICE — Typography Theme
 // ============================================================
-// Custom type system using bundled fonts:
-//   • Test Tiempos Headline (serif) — for headlines
-//   • ABC Diatype Plus Variable (sans + mono) — for body & mono
+// Two font families with graceful fallback chains:
 //
-// PostScript names verified via fc-query:
-//   Family for serif: "Test Tiempos Headline"
-//   Family for sans:  "ABC Diatype Plus Variable Unlicensed Trial"
-//   Mono PS name:     "ABCDiatypePlusVariable-MonoRegular"
+//   SERIF (titles, section headers, big labels)
+//     Tiempos Headline → Tiempos Text → NewYork → system .serif
 //
-// Tighter tracking is applied across the board because the user
-// asked for shorter letter spacing.
+//   SANS (body, labels, secondary text)
+//     ABC Diatype Variable → ABC Diatype → Inter-Regular → system .default
+//
+//   MONO (logs, code)
+//     JetBrainsMono-Regular → system .monospaced
+//
+// Each named static const lazily resolves via the helper functions
+// (`serif`, `sans`, `monoBase`), so swapping a font is one place.
+//
+// Fonts are not bundled in this file — that's a project.yml change.
+// `NSFont(name:size:)` returning nil is the macOS-correct check for
+// "font not installed" and drives the fallback cascade.
 // ============================================================
 
 import SwiftUI
+import AppKit
+
+// Typography hierarchy (largest -> smallest)
+//   serifHero    40  Page hero titles
+//   serifTitle   28  Sheet titles ("Settings")
+//   serifValue   32  Stat card numbers (sits below hero, above section)
+//   serifSection 22  Card titles ("Light", "Casual")
+//   serifLabel   16  Muted serif captions
+//   bodyLarge    15  Settings descriptions
+//   bodyBase     13  Body text
+//   bodyMedium   13  Emphasized body (.medium)
+//   bodySmall    12  Secondary captions
+//   label        11  Uppercase section headers (.semibold)
+//   badge        10  Chips, pill badges (.semibold)
+//   mono         12  Logs, code
+//
+// Rule of thumb: `.tracking(0.8)` is reserved for uppercase `label` only.
+// Body and serif sizes never get explicit tracking.
 
 extension Font {
-    /// Serif — Test Tiempos Headline (for headlines).
+    // SERIF family (Tiempos / fallback chain)
+    static let serifHero    = serif(40, weight: .regular)   // hero titles
+    static let serifTitle   = serif(28, weight: .regular)   // sheet titles
+    static let serifValue   = serif(32, weight: .medium)    // stat card numbers
+    static let serifSection = serif(22, weight: .regular)   // card titles
+    static let serifLabel   = serif(16, weight: .regular)   // muted serif captions
+
+    // SANS family (Diatype / fallback)
+    static let bodyLarge    = sans(15, weight: .regular)    // settings descriptions
+    static let bodyBase     = sans(13, weight: .regular)    // body text everywhere
+    static let bodyMedium   = sans(13, weight: .medium)     // emphasized body
+    static let bodySmall    = sans(12, weight: .regular)    // secondary captions
+    static let label        = sans(11, weight: .semibold)   // ALL-CAPS section headers
+    static let badge        = sans(10, weight: .semibold)   // chips, badges
+    static let mono         = monoBase(12)                  // log/code
+
+    // Family helpers (call these for arbitrary sizes)
     static func serif(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        Font.custom("Test Tiempos Headline", size: size).weight(weight)
+        if NSFont(name: "Tiempos Headline", size: size) != nil {
+            return Font.custom("Tiempos Headline", size: size).weight(weight)
+        }
+        if NSFont(name: "Tiempos Text", size: size) != nil {
+            return Font.custom("Tiempos Text", size: size).weight(weight)
+        }
+        if NSFont(name: "NewYork", size: size) != nil {
+            return Font.custom("NewYork", size: size).weight(weight)
+        }
+        // System serif (macOS 13+)
+        return Font.system(size: size, weight: weight, design: .serif)
     }
 
-    /// Sans (body) — ABC Diatype Plus Variable.
-    /// The variable font handles weight via the Weight axis.
     static func sans(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        Font.custom("ABC Diatype Plus Variable Unlicensed Trial", size: size).weight(weight)
+        if NSFont(name: "ABC Diatype Variable", size: size) != nil {
+            return Font.custom("ABC Diatype Variable", size: size).weight(weight)
+        }
+        if NSFont(name: "ABC Diatype", size: size) != nil {
+            return Font.custom("ABC Diatype", size: size).weight(weight)
+        }
+        if NSFont(name: "Inter-Regular", size: size) != nil {
+            return Font.custom("Inter-Regular", size: size).weight(weight)
+        }
+        return Font.system(size: size, weight: weight, design: .default)
     }
 
-    /// Mono — Mono variant of Diatype Plus, accessed via PostScript name.
-    /// If this falls back, switch to Semi-Mono or the regular family with
-    /// `.monospaced()` modifier — but on macOS variable-font subfamilies
-    /// addressed by PS name typically resolve correctly.
-    static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
-        Font.custom("ABCDiatypePlusVariable-MonoRegular", size: size).weight(weight)
-    }
-}
-
-/// Tighter tracking — the user asked for shorter letter spacing.
-/// Apply via `.tracking(...)` on Text views.
-enum LetterSpacing {
-    static let body: CGFloat = -0.2
-    static let headline: CGFloat = -0.6
-    static let mono: CGFloat = 0
-}
-
-/// Preset modifiers — apply consistent type styles across the app.
-extension Text {
-    func appH1() -> some View {
-        self.font(.serif(28, weight: .semibold))
-            .tracking(LetterSpacing.headline)
-    }
-    func appH2() -> some View {
-        self.font(.serif(22, weight: .medium))
-            .tracking(LetterSpacing.headline)
-    }
-    func appH3() -> some View {
-        self.font(.sans(15, weight: .semibold))
-            .tracking(LetterSpacing.body)
-    }
-    func appBody() -> some View {
-        self.font(.sans(13))
-            .tracking(LetterSpacing.body)
-    }
-    func appBodySemibold() -> some View {
-        self.font(.sans(13, weight: .semibold))
-            .tracking(LetterSpacing.body)
-    }
-    func appCaption() -> some View {
-        self.font(.sans(11, weight: .medium))
-            .tracking(LetterSpacing.body)
-            .foregroundStyle(.secondary)
-    }
-    func appMicro() -> some View {
-        self.font(.sans(10))
-            .tracking(LetterSpacing.body)
-            .foregroundStyle(.tertiary)
-    }
-    func appMono(_ size: CGFloat = 12) -> some View {
-        self.font(.mono(size))
-            .tracking(LetterSpacing.mono)
+    static func monoBase(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        if NSFont(name: "JetBrainsMono-Regular", size: size) != nil {
+            return Font.custom("JetBrainsMono-Regular", size: size).weight(weight)
+        }
+        return Font.system(size: size, weight: weight, design: .monospaced)
     }
 }

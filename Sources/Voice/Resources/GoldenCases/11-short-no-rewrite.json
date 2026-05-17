@@ -1,0 +1,10 @@
+{
+  "id": "short-no-rewrite",
+  "title": "Short casual one-liner — punctuation only, no word changes",
+  "categories": ["short", "preservation", "regression"],
+  "raw": "gonna ship it today let me know if theres issues",
+  "reference": "Gonna ship it today. Let me know if there's issues.",
+  "notes": "REGRESSION: 'gonna' must NOT become 'going to'. 'theres' → 'there's' (apostrophe). Split into two sentences. No other changes. Any word substitution = FAIL.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

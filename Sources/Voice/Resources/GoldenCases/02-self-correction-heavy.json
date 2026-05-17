@@ -1,0 +1,10 @@
+{
+  "id": "self-correction-heavy",
+  "title": "Self-correction heavy",
+  "categories": ["self-correction"],
+  "raw": "okay hey i mean uh send maya a message no wait actually message john saying we're running late no he already knows say we're already at the restaurant",
+  "reference": "Send John a message saying we're already at the restaurant.",
+  "notes": "Should resolve every self-correction layer: maya -> john, running late -> already at the restaurant. No filler.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

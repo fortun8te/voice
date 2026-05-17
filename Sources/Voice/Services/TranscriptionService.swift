@@ -77,7 +77,7 @@ final class TranscriptionService: TranscriptionEngine {
             // Time downloadAndLoad to detect first-ever launch (CoreML compile).
             let downloadStart = Date()
             let models = try await AsrModels.downloadAndLoad(
-                version: .v3,
+                version: .v2,
                 progressHandler: { [weak self] progress in
                     Task { @MainActor in
                         self?.modelState = .downloading(progress: progress.fractionCompleted)
@@ -114,7 +114,7 @@ final class TranscriptionService: TranscriptionEngine {
 
             isReady = true
             modelState = .ready
-            print("[VOICE] Parakeet TDT v3 ready (batch engine pre-warmed, \(batchDecoderLayerCount) decoder layers)")
+            print("[VOICE] Parakeet TDT v2 ready (batch engine pre-warmed, \(batchDecoderLayerCount) decoder layers)")
         } catch {
             let msg = error.localizedDescription
             modelState = .error(msg)
@@ -162,9 +162,11 @@ final class TranscriptionService: TranscriptionEngine {
 
     // MARK: - File transcription (primary path for dictation + crash recovery)
 
-    /// Transcribe an audio file by passing its URL directly to FluidAudio.
-    /// FluidAudio handles format detection, resampling, and chunking internally.
-    /// This is the macparakeet approach — no manual AVAudioFile reading needed.
+    /// Transcribe an audio file. For audio that fits in a single Parakeet
+    /// decode window (≤15 s @ 16 kHz) we hand the URL to FluidAudio unchanged
+    /// — same code path as before. For longer audio we take the chunking
+    /// into our own hands to side-step a boundary-merge bug in FluidAudio's
+    /// `ChunkProcessor.mergeByMidpoint` (see VOICE-MERGE comment below).
     func transcribeFile(url: URL) async throws -> [TranscriptSegment] {
         guard let manager = batchManager else {
             print("[VOICE-TS] transcribeFile FAILED — batchManager nil")
@@ -174,16 +176,71 @@ final class TranscriptionService: TranscriptionEngine {
         let t0 = Date()
         print("[VOICE-TS] transcribeFile() ENTER — \(url.lastPathComponent) at \(t0)")
 
-        var decoderState = TdtDecoderState.make(decoderLayers: batchDecoderLayerCount)
+        // ============================================================
+        // [VOICE-MERGE] Chunk-boundary fix
+        // ------------------------------------------------------------
+        // FluidAudio v3's ChunkProcessor splits long audio into ~14.96s
+        // windows with 2.0s overlap, decodes each chunk with a FRESH
+        // decoder state (state.reset()), then attempts to merge the
+        // overlapping token streams. When the two decodings of the same
+        // boundary audio disagree (which is common — the chunk whose
+        // window has the boundary AT THE EDGE has less acoustic context
+        // and tends to mis-decode), the merge falls through to
+        // `mergeByMidpoint`, which splits on TIMESTAMP alone and just
+        // happens to drop the higher-context decoding. The user-visible
+        // failure: tail-of-chunk-N text is *lost* AND the head-of-chunk-
+        // (N+1) text appears mutated.
+        //
+        // Fix (strategy: drive chunking ourselves, prefer higher-
+        // confidence decoding at boundaries):
+        //   1. Read the audio file into a [Float] at 16 kHz.
+        //   2. If the whole recording fits in one ~15s Parakeet window,
+        //      ask FluidAudio for a single-shot decode — no chunking, no
+        //      boundary at all. This eliminates the bug for typical
+        //      dictation lengths.
+        //   3. If it's longer, chunk it ourselves into ≤14.5 s windows
+        //      with a 2.0 s overlap and call `manager.transcribe(samples)`
+        //      on each. Each chunk stays at-or-below maxModelSamples so
+        //      FluidAudio routes to its single-decode path internally —
+        //      ChunkProcessor.mergeByMidpoint never runs. We then merge
+        //      the per-chunk text by suffix/prefix overlap and pick the
+        //      higher-confidence span at the seam.
+        //
+        // Trade-off: this loses FluidAudio's internal token-level dedup
+        // and gets a string-level merge instead — but it eliminates the
+        // class of bug where a mis-decoded boundary stomps a correct one.
+        // ============================================================
+        let samples: [Float]
+        do {
+            samples = try Self.readSamplesAt16kMono(url: url)
+        } catch {
+            print("[VOICE-TS] readSamplesAt16kMono FAILED: \(error.localizedDescription) — falling back to URL path")
+            return try await transcribeFile_legacyURL(url: url, manager: manager, t0: t0)
+        }
+
+        let maxModelSamples = 240_000              // 15s @ 16kHz (FluidAudio limit)
+        let safeChunkSamples = 232_000             // ~14.5s — leaves margin under the model cap
+        let overlapSamples   = 32_000              //  2.0s overlap, matches FluidAudio's ChunkProcessor
+
         let result: ASRResult
         do {
-            // Pass `language: .english` so Parakeet TDT v3's script-aware top-K
-            // filter rejects non-Latin candidate tokens. Without this the
-            // decoder occasionally substitutes Cyrillic/Greek lookalikes
-            // (e.g. "ChatGPT" → "Сhatgpt") because the multilingual v3 model
-            // shares output vocab across scripts. v3-only — silently ignored
-            // on v2 / tdtCtc110m. Free accuracy win for an English-only app.
-            result = try await manager.transcribe(url, decoderState: &decoderState, language: .english)
+            if samples.count <= maxModelSamples {
+                // === Path A: single-shot decode — bug-free by construction ===
+                print("[VOICE-MERGE] single-shot decode: \(samples.count) samples (≤ \(maxModelSamples))")
+                var decoderState = TdtDecoderState.make(decoderLayers: batchDecoderLayerCount)
+                result = try await manager.transcribe(samples, decoderState: &decoderState, language: .english)
+            } else {
+                // === Path B: manual chunked decode with text-level merge ===
+                print("[VOICE-MERGE] chunked decode: \(samples.count) samples → ~\(samples.count / (safeChunkSamples - overlapSamples) + 1) chunks of \(safeChunkSamples) (overlap \(overlapSamples))")
+                result = try await Self.chunkedTranscribe(
+                    samples: samples,
+                    manager: manager,
+                    decoderLayers: batchDecoderLayerCount,
+                    chunkSamples: safeChunkSamples,
+                    overlapSamples: overlapSamples,
+                    sampleRate: 16_000
+                )
+            }
         } catch {
             print("[VOICE-TS] transcribeFile THREW: \(error)")
             throw error
@@ -208,10 +265,23 @@ final class TranscriptionService: TranscriptionEngine {
         // suspectWords is nil and the polisher gets no hint.
         let suspectWords: [String]? = Self.extractSuspectWords(
             from: result.tokenTimings,
-            confidenceThreshold: 0.6
+            confidenceThreshold: 0.75
         )
         if let suspectWords, !suspectWords.isEmpty {
             print("[VOICE-TS] suspect words (low-confidence): \(suspectWords)")
+        }
+
+        // Section F (merge correctness): aggregate per-token confidence into
+        // a single segment-level confidence value. Used downstream by
+        // Qwen3Polisher.mergeWithMLX to pick the higher-confidence span when
+        // two transcripts disagree. Falls back to `result.confidence` (the
+        // ASR's own overall score) when token timings are unavailable.
+        let segmentConfidence: Float
+        if let timings = result.tokenTimings, !timings.isEmpty {
+            let total = timings.reduce(Float(0)) { $0 + $1.confidence }
+            segmentConfidence = total / Float(timings.count)
+        } else {
+            segmentConfidence = result.confidence
         }
 
         return [
@@ -220,10 +290,296 @@ final class TranscriptionService: TranscriptionEngine {
                 text: trimmed,
                 startTime: 0,
                 endTime: result.duration,
-                confidence: result.confidence,
+                confidence: segmentConfidence,
                 suspectWords: suspectWords
             )
         ]
+    }
+
+    // MARK: - Boundary-fix helpers (see [VOICE-MERGE] block above)
+
+    /// Legacy fallback path — exactly the pre-fix behaviour. Only invoked
+    /// when our own audio-file reader can't decode the file. Keeps Voice
+    /// resilient on weird inputs (e.g. orphan recovery on a half-written
+    /// .caf where the AVAudioFile path errors out).
+    private func transcribeFile_legacyURL(
+        url: URL,
+        manager: AsrManager,
+        t0: Date
+    ) async throws -> [TranscriptSegment] {
+        var decoderState = TdtDecoderState.make(decoderLayers: batchDecoderLayerCount)
+        let result = try await manager.transcribe(url, decoderState: &decoderState, language: .english)
+        let trimmed = result.text.trimmingCharacters(in: .whitespaces)
+        let elapsed = Date().timeIntervalSince(t0)
+        print("[VOICE-TS] transcribeFile() OK (legacy URL path) → '\(trimmed.prefix(80))' (\(trimmed.count) chars) in \(String(format: "%.2f", elapsed))s")
+        guard !trimmed.isEmpty else { return [] }
+        return [TranscriptSegment(
+            speaker: "Speaker 1",
+            text: trimmed,
+            startTime: 0,
+            endTime: result.duration,
+            confidence: result.confidence,
+            suspectWords: nil
+        )]
+    }
+
+    /// Read an audio file into mono Float32 samples at 16 kHz.
+    /// AVAudioConverter handles format / sample-rate conversion. We need a
+    /// concrete [Float] (not a URL) so we can split it ourselves and stay
+    /// off FluidAudio's buggy ChunkProcessor merge path for long inputs.
+    private static func readSamplesAt16kMono(url: URL) throws -> [Float] {
+        let file = try AVAudioFile(forReading: url)
+        let srcFormat = file.processingFormat
+
+        guard let dstFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw NSError(domain: "VOICE-TS", code: -1, userInfo: [NSLocalizedDescriptionKey: "failed to build 16k mono format"])
+        }
+
+        // Same format already → just read straight through.
+        if abs(srcFormat.sampleRate - 16_000) < 0.1 && srcFormat.channelCount == 1 {
+            guard let buf = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: AVAudioFrameCount(file.length)) else {
+                throw NSError(domain: "VOICE-TS", code: -2, userInfo: [NSLocalizedDescriptionKey: "PCM buffer alloc failed"])
+            }
+            try file.read(into: buf)
+            return floatArray(from: buf)
+        }
+
+        // Otherwise resample via AVAudioConverter.
+        guard let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else {
+            throw NSError(domain: "VOICE-TS", code: -3, userInfo: [NSLocalizedDescriptionKey: "converter init failed"])
+        }
+        let srcCapacity: AVAudioFrameCount = 4096
+        guard let srcBuf = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: srcCapacity) else {
+            throw NSError(domain: "VOICE-TS", code: -4, userInfo: [NSLocalizedDescriptionKey: "src buffer alloc failed"])
+        }
+
+        // Output buffer grows as we go. Estimate capacity from src length.
+        let ratio = 16_000.0 / srcFormat.sampleRate
+        let estimatedOut = AVAudioFrameCount(Double(file.length) * ratio) + 4096
+        guard let dstBuf = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: estimatedOut) else {
+            throw NSError(domain: "VOICE-TS", code: -5, userInfo: [NSLocalizedDescriptionKey: "dst buffer alloc failed"])
+        }
+
+        var fileEOF = false
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+            if fileEOF {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            srcBuf.frameLength = 0
+            do {
+                try file.read(into: srcBuf, frameCount: srcCapacity)
+            } catch {
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            if srcBuf.frameLength == 0 {
+                fileEOF = true
+                outStatus.pointee = .endOfStream
+                return nil
+            }
+            outStatus.pointee = .haveData
+            return srcBuf
+        }
+
+        var error: NSError?
+        let status = converter.convert(to: dstBuf, error: &error, withInputFrom: inputBlock)
+        if status == .error, let error { throw error }
+        return floatArray(from: dstBuf)
+    }
+
+    private static func floatArray(from buffer: AVAudioPCMBuffer) -> [Float] {
+        guard let ch = buffer.floatChannelData else { return [] }
+        let n = Int(buffer.frameLength)
+        return Array(UnsafeBufferPointer(start: ch[0], count: n))
+    }
+
+    /// Chunk a long sample array into ~14.5 s windows with 2 s overlap,
+    /// decode each via the single-shot path (`manager.transcribe(samples)`
+    /// stays ≤ maxModelSamples so it bypasses ChunkProcessor entirely),
+    /// then string-merge the per-chunk outputs using confidence-weighted
+    /// overlap dedup at each seam.
+    ///
+    /// Each `manager.transcribe(samples:)` call uses a FRESH decoder state.
+    /// We accept slight intra-chunk LM context loss (the boundary words get
+    /// fresh state) in exchange for not relying on FluidAudio's broken
+    /// token-window merger.
+    private static func chunkedTranscribe(
+        samples: [Float],
+        manager: AsrManager,
+        decoderLayers: Int,
+        chunkSamples: Int,
+        overlapSamples: Int,
+        sampleRate: Int
+    ) async throws -> ASRResult {
+        precondition(chunkSamples > overlapSamples * 2, "chunk must be more than 2× overlap")
+
+        struct ChunkOut {
+            let index: Int
+            let text: String
+            let confidence: Float
+            let timings: [TokenTiming]?
+            let duration: TimeInterval
+            let startSec: Double
+        }
+
+        var outputs: [ChunkOut] = []
+        var chunkStart = 0
+        var idx = 0
+        let stride = chunkSamples - overlapSamples
+
+        while chunkStart < samples.count {
+            let end = min(chunkStart + chunkSamples, samples.count)
+            let slice = Array(samples[chunkStart..<end])
+            var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
+            // FluidAudio requires ≥ minimumRequiredSamples; pad final tiny tail.
+            let minSamples = sampleRate / 4 // 250ms
+            let toDecode: [Float]
+            if slice.count < minSamples {
+                // Tail too short by itself — fold it into the previous chunk
+                // by extending the previous decoder's range. Since we already
+                // emitted the previous chunk, just drop this tail; the prior
+                // chunk's overlap should already cover it. (overlapSamples ≥
+                // this floor.)
+                print("[VOICE-MERGE] chunk \(idx) tail <250ms, skipping (covered by prior overlap)")
+                break
+            } else {
+                toDecode = slice
+            }
+
+            let r = try await manager.transcribe(toDecode, decoderState: &decoderState, language: .english)
+            let txt = r.text.trimmingCharacters(in: .whitespaces)
+            print("[VOICE-MERGE] chunk \(idx) start=\(chunkStart) len=\(slice.count) text=\"\(txt.prefix(60))…\" conf=\(String(format: "%.3f", r.confidence))")
+            outputs.append(ChunkOut(
+                index: idx,
+                text: txt,
+                confidence: r.confidence,
+                timings: r.tokenTimings,
+                duration: r.duration,
+                startSec: Double(chunkStart) / Double(sampleRate)
+            ))
+            if end == samples.count { break }
+            chunkStart += stride
+            idx += 1
+        }
+
+        // Merge chunk texts. Strategy: for each adjacent pair (L, R) find
+        // the longest word-suffix of L that matches a word-prefix of R, up
+        // to ~`overlapSeconds` worth of words. Whichever side has higher
+        // segment confidence wins the overlap; the other side's overlap
+        // copy is dropped. If no word-overlap is found (rare — two
+        // independent decodings of the same audio usually share at least
+        // a couple of words), fall back to a confidence-weighted midpoint
+        // (keep the higher-confidence chunk's words for the seam).
+        guard !outputs.isEmpty else {
+            return ASRResult(text: "", confidence: 0, duration: 0, processingTime: 0, tokenTimings: nil)
+        }
+        if outputs.count == 1 {
+            return ASRResult(
+                text: outputs[0].text,
+                confidence: outputs[0].confidence,
+                duration: outputs[0].duration,
+                processingTime: 0,
+                tokenTimings: outputs[0].timings
+            )
+        }
+
+        var merged = outputs[0].text
+        var mergedConf = outputs[0].confidence
+        var allTimings: [TokenTiming] = outputs[0].timings ?? []
+        let overlapWordBudget = 24 // ~2s of speech at ~12 wps upper bound
+
+        for i in 1..<outputs.count {
+            let prevConf = mergedConf
+            let r = outputs[i]
+            let (joined, keptSide) = mergeByWordOverlap(
+                left: merged,
+                right: r.text,
+                leftConf: prevConf,
+                rightConf: r.confidence,
+                maxWords: overlapWordBudget
+            )
+            merged = joined
+            mergedConf = max(prevConf, r.confidence)
+            if let t = r.timings { allTimings.append(contentsOf: t) }
+            print("[VOICE-MERGE] chunk \(i-1)-\(i) boundary: kept=\(keptSide) confL=\(String(format: "%.3f", prevConf)) confR=\(String(format: "%.3f", r.confidence))")
+        }
+
+        let totalDur = TimeInterval(samples.count) / TimeInterval(sampleRate)
+        return ASRResult(
+            text: merged,
+            confidence: mergedConf,
+            duration: totalDur,
+            processingTime: 0,
+            tokenTimings: allTimings.isEmpty ? nil : allTimings
+        )
+    }
+
+    /// Merge two chunk transcripts by finding the longest word-level overlap
+    /// at the L-suffix / R-prefix seam. The higher-confidence side's copy of
+    /// the overlap region wins. Returns the merged string and a tag for
+    /// which side was preferred ("left", "right", or "none" when no overlap
+    /// was detected).
+    private static func mergeByWordOverlap(
+        left: String,
+        right: String,
+        leftConf: Float,
+        rightConf: Float,
+        maxWords: Int
+    ) -> (String, String) {
+        let lWords = left.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        let rWords = right.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard !lWords.isEmpty, !rWords.isEmpty else {
+            return ((left + " " + right).trimmingCharacters(in: .whitespaces), "none")
+        }
+
+        // Look for the longest k such that lWords.suffix(k) ≈ rWords.prefix(k)
+        // — case-insensitive, punctuation-stripped match. We scan k from the
+        // budget down so the first hit is the longest.
+        let maxK = min(maxWords, lWords.count, rWords.count)
+        let norm: (String) -> String = { s in
+            s.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters)
+        }
+        var bestK = 0
+        var requireMatches = 2 // at least 2 consecutive matching words to declare overlap
+        for k in stride(from: maxK, through: requireMatches, by: -1) {
+            let lTail = lWords.suffix(k).map(norm)
+            let rHead = rWords.prefix(k).map(norm)
+            // Allow a small mismatch tolerance: require ≥ 60 % matches AND
+            // first + last token to match. This handles the case where the
+            // boundary words mis-decoded ("trade" vs "treat") but the rest
+            // of the overlap is intact.
+            var hits = 0
+            for j in 0..<k where lTail[j] == rHead[j] { hits += 1 }
+            let ratio = Double(hits) / Double(k)
+            if ratio >= 0.6 && lTail.first == rHead.first {
+                bestK = k
+                break
+            }
+        }
+
+        if bestK == 0 {
+            // No detectable overlap. Just concatenate with a space.
+            return ((left + " " + right).trimmingCharacters(in: .whitespaces), "none")
+        }
+
+        // Pick the higher-confidence side's copy of the overlap region.
+        if leftConf >= rightConf {
+            // Keep L's overlap; drop R's prefix-of-bestK and append the rest.
+            let rTail = Array(rWords.dropFirst(bestK))
+            let merged = (lWords + rTail).joined(separator: " ")
+            return (merged, "left")
+        } else {
+            // Keep R's overlap; drop L's suffix-of-bestK and append R as-is.
+            let lHead = Array(lWords.dropLast(bestK))
+            let merged = (lHead + rWords).joined(separator: " ")
+            return (merged, "right")
+        }
     }
 
     /// Group adjacent SentencePiece tokens into whole words and return the

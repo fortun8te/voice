@@ -57,6 +57,7 @@
 import Foundation
 import AppKit
 import Carbon
+import ApplicationServices
 
 class CursorPaster {
     // TWEAK: Delay before simulating paste (seconds).
@@ -77,11 +78,11 @@ class CursorPaster {
     // RAPID-FIRE CACHE: When the user rapidly toggles the hotkey, we cache
     // the last paste's ending context to avoid re-reading the field (which
     // would see our own text and misinterpret it as user input). Cache expires
-    // after 1 second of inactivity — long enough for natural rapid presses
-    // but short enough to reset between intentional pauses.
+    // after 30 seconds of inactivity — long enough for natural rapid presses
+    // while still resetting after a genuine pause between dictation sessions.
     private var lastPasteEndingContext: InsertionContext? = nil
     private var lastPasteTime: Date? = nil
-    private let rapidFireCacheTTL: TimeInterval = 1.0
+    private let rapidFireCacheTTL: TimeInterval = 30.0
 
     /// Per-app paste delay. Most native apps regain focus in <50ms, so 0.08s
     /// is more than enough. Electron/Chromium apps need the full 0.20s.
@@ -123,8 +124,17 @@ class CursorPaster {
 
     /// Paste the given text at the current cursor position in any app.
     /// - Parameter restoreClipboard: If true, restores the original clipboard contents after paste.
-    func pasteAtCursor(_ text: String, restoreClipboard: Bool = false) {
+    /// - Parameter preFormatted: When true, skip the AX read + spacing/casing adjustment
+    ///   entirely. Use this when the upstream polisher (Qwen3) was given the field
+    ///   context and already decided on the appropriate leading whitespace, case,
+    ///   and punctuation. The text is pasted verbatim.
+    func pasteAtCursor(_ text: String, restoreClipboard: Bool = false, preFormatted: Bool = false) {
         guard !text.isEmpty else { return }
+
+        // Standardized paste-lifecycle logging. Grep for `[VOICE-PASTE]` to
+        // reconstruct what happened on any given paste.
+        let targetBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
+        print("[VOICE-PASTE] start: textLength=\(text.count) target=\(targetBundle) preFormatted=\(preFormatted)")
 
         // SECURITY: never paste into a password field. macOS exposes the
         // subrole `AXSecureTextField` on focused secure inputs (1Password,
@@ -153,108 +163,119 @@ class CursorPaster {
         // surface a toast so the user knows their text is on the clipboard.
         let targetSnapshot = currentPasteTargetSnapshot()
 
-        // Check if this is a rapid-fire paste (within 1 second of the last paste).
-        // If so, use the cached context from the previous paste to avoid re-reading
-        // the field, which would see our own text and misinterpret formatting.
+        // Determine whether this is a rapid-fire press (our text is still landing).
+        // Cache the result NOW before the dispatch so the next rapid press that
+        // fires within the TTL window uses a timestamp relative to THIS call.
         let now = Date()
-        let isRapidFire = if let lastTime = lastPasteTime {
-            now.timeIntervalSince(lastTime) < rapidFireCacheTTL
-        } else {
-            false
-        }
+        let isRapidFire = lastPasteTime.map { now.timeIntervalSince($0) < rapidFireCacheTTL } ?? false
+        let cachedContext: InsertionContext? = isRapidFire ? lastPasteEndingContext : nil
+        lastPasteTime = now  // stamp before dispatch so rapid-fire TTL is relative to call time
 
-        // Determine insertion context: use cache if rapid-fire, otherwise re-read field.
-        let context: InsertionContext
-        if isRapidFire, let cached = lastPasteEndingContext {
-            // Rapid re-fire: use cached context from the last paste.
-            // This avoids re-reading the field, which would see our own text and
-            // misinterpret formatting. The cached context represents what the field
-            // will look like after the last paste completes.
-            context = cached
-        } else {
-            // Normal paste: read actual field state.
-            let preceding = contextStringBeforeCursor(length: 3)
-            context = determineContext(preceding)
-        }
-
-        let (adjustedText, prependSpace) = adjustForContext(text, context: context)
-
-        // Decide whether the leading space goes into the clipboard payload or
-        // is typed as a separate Space keystroke. Some apps (Notion, many
-        // web text fields) strip leading whitespace from pasted content, so
-        // even when we include " How are you?" on the clipboard the field
-        // ends up showing "How are you?". Typing the space as a real key
-        // event before Cmd+V bypasses that — the app sees a normal space
-        // keypress followed by a paste.
-        //
-        // CGEvent path  → type the space, don't include it in the clipboard
-        // AppleScript    → can't cleanly type a sibling space, prepend instead
-        let willUseCGEvent = isAccessibilityTrusted()
-        let needsLeadingSpace = prependSpace && !adjustedText.hasPrefix(" ") && !adjustedText.hasPrefix("\n")
-
-        var pasteText = adjustedText
-        if needsLeadingSpace && !willUseCGEvent {
-            pasteText = " " + pasteText
-        }
-
-        let pasteboard = NSPasteboard.general
-        let finalText = pasteText
-
-        // Step 0: Update rapid-fire cache.
-        // Cache the context that will exist AFTER this paste completes.
-        // This lets the next rapid press (within 1s) know it's following our text.
-        lastPasteTime = now
-        // After our text is pasted, the field will end with whatever our text ends with.
-        // For rapid-fire simplicity: if this paste produces a period, next paste is .afterTerminal.
-        // If this paste has trailing space, next paste is .afterTerminalWS.
-        // Otherwise, next paste is .afterWhitespace (mid-sentence).
-        if adjustedText.hasSuffix(".") || adjustedText.hasSuffix("!") || adjustedText.hasSuffix("?") {
+        // Predict what the field will look like AFTER this paste based on the raw
+        // text's trailing character, and stamp the cache synchronously. Without
+        // this, a second hotkey press arriving during our 80–200ms pre-paste
+        // delay reads stale cache (from two pastes ago, or nil) and falls back
+        // to a doomed AX read — the back-to-back jam the cache was meant to fix.
+        // The dispatch block below can refine this once it knows the adjusted text.
+        let predictedTrailing = text.trimmingCharacters(in: .whitespacesAndNewlines).last
+        if let last = predictedTrailing, last == "." || last == "!" || last == "?" {
             lastPasteEndingContext = .afterTerminal
-        } else if adjustedText.hasSuffix(" ") {
-            lastPasteEndingContext = .afterTerminalWS
+        } else if predictedTrailing == nil {
+            // Empty/whitespace-only text — preserve whatever the prior paste left.
         } else {
-            lastPasteEndingContext = .afterWhitespace
+            lastPasteEndingContext = .midSentence
         }
 
-        // Step 1: Save current clipboard (optional).
+        let willUseCGEvent = isAccessibilityTrusted()
+        let delay = currentPrePasteDelay()
+        let pasteboard = NSPasteboard.general
         let savedContents = restoreClipboard ? saveClipboard(pasteboard) : nil
 
-        // Step 2: Write our text to clipboard.
-        pasteboard.clearContents()
-        let ok = pasteboard.setString(finalText, forType: .string)
-        print("[VOICE] Clipboard write ok=\(ok), len=\(finalText.count), context=\(context), msg=\(isMessagingApp()), code=\(isCodeEditor()), prependSpace=\(prependSpace), typeSpace=\(needsLeadingSpace && willUseCGEvent), rapidFire=\(isRapidFire), leading='\(finalText.prefix(4))'")
-        if !ok {
-            print("[VOICE] ⚠️ Clipboard write FAILED")
-            return
+        // All context-sensitive work (AX read, text adjustment, clipboard write, keystrokes)
+        // happens inside the dispatch block. By the time this fires, the pre-paste delay has
+        // elapsed and the target app's focus is settled — so AX reads return valid results.
+        // Previously, the AX read ran immediately at call-time (before focus was restored),
+        // returning nil and falling back to .afterTerminalWS (no space added). Moving it here
+        // fixes back-to-back dictations that were jamming words together without spaces.
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+
+            let pasteText: String
+            let needsLeadingSpace: Bool
+
+            if preFormatted {
+                // Polisher saw the field context and already chose any leading
+                // whitespace, casing, and trailing punctuation. Paste verbatim.
+                pasteText = text
+                // If the text starts with a space and we're on the CGEvent path,
+                // type it as a keystroke instead of relying on the clipboard
+                // (Chrome / Notion / web textareas strip leading whitespace).
+                if text.hasPrefix(" ") && willUseCGEvent {
+                    needsLeadingSpace = true
+                } else {
+                    needsLeadingSpace = false
+                }
+                // Refresh cache from the actual text the polisher produced.
+                if text.hasSuffix(".") || text.hasSuffix("!") || text.hasSuffix("?") {
+                    self.lastPasteEndingContext = .afterTerminal
+                } else if text.hasSuffix(" ") || text.hasSuffix("\n") {
+                    self.lastPasteEndingContext = .afterWhitespace
+                } else {
+                    self.lastPasteEndingContext = .midSentence
+                }
+                print("[VOICE] Clipboard write (preFormatted) len=\(text.count), leading='\(text.prefix(4))'")
+            } else {
+                // Determine insertion context: use rapid-fire cache if available,
+                // otherwise read the live field (focus is settled now).
+                let context: InsertionContext
+                if let cached = cachedContext {
+                    context = cached
+                } else {
+                    let preceding = self.contextStringBeforeCursor(length: 3)
+                    context = self.determineContext(preceding)
+                }
+
+                let (adjustedText, prependSpace) = self.adjustForContext(text, context: context)
+                needsLeadingSpace = prependSpace && !adjustedText.hasPrefix(" ") && !adjustedText.hasPrefix("\n")
+
+                // Update cache with what the field will look like after this paste.
+                if adjustedText.hasSuffix(".") || adjustedText.hasSuffix("!") || adjustedText.hasSuffix("?") {
+                    self.lastPasteEndingContext = .afterTerminal
+                } else if adjustedText.hasSuffix(" ") || adjustedText.hasSuffix("\n") {
+                    self.lastPasteEndingContext = .afterWhitespace
+                } else {
+                    self.lastPasteEndingContext = .midSentence
+                }
+                pasteText = adjustedText
+                print("[VOICE] Clipboard write len=\(pasteText.count), context=\(context), msg=\(self.isMessagingApp()), code=\(self.isCodeEditor()), prependSpace=\(prependSpace), typeSpace=\(needsLeadingSpace), rapidFire=\(isRapidFire), leading='\(pasteText.prefix(4))'")
+            }
+
+            pasteboard.clearContents()
+            guard pasteboard.setString(preFormatted && needsLeadingSpace ? String(pasteText.dropFirst()) : pasteText, forType: .string) else {
+                print("[VOICE-PASTE] result: failed reason=clipboard-write-failed")
+                NotificationCenter.default.post(
+                    name: .voiceError,
+                    object: nil,
+                    userInfo: ["message": "Paste failed — could not write to clipboard."]
+                )
+                return
+            }
+
+            // Space is always delivered as a real keystroke — never prepended to
+            // clipboard content. Many apps (Chrome, Notion, web textareas) silently
+            // strip leading whitespace from paste payloads, so prepend would be lost.
+            if willUseCGEvent {
+                print("[VOICE-PASTE] strategy: cgevent")
+                if needsLeadingSpace { self.simulateSpaceKey() }
+                self.simulatePaste()
+            } else {
+                print("[VOICE-PASTE] strategy: applescript")
+                self.pasteViaSystemEvents(leadingSpace: needsLeadingSpace)
+            }
+            self.verifyPasteLanded(expected: targetSnapshot)
         }
 
-        // Step 3: Fire exactly ONE paste method.
-        //
-        // Use CGEvent if Accessibility is granted (fast, reliable, no popup).
-        // Fall back to AppleScript / System Events (Automation permission,
-        // no Accessibility needed, ~80ms slower).
-        //
-        // We NEVER fire both. The old changeCount check was supposed to detect
-        // whether CGEvent worked, but changeCount only tracks pasteboard WRITES
-        // not reads — it was always "no change" → AppleScript always fired →
-        // double paste in most apps.
-        let delay = currentPrePasteDelay()
-        if willUseCGEvent {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                if needsLeadingSpace { self?.simulateSpaceKey() }
-                self?.simulatePaste()
-                print("[VOICE] Pasted via CGEvent (Accessibility granted)")
-                self?.verifyPasteLanded(expected: targetSnapshot)
-            }
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                print("[VOICE] Pasted via AppleScript (no Accessibility)")
-                self?.pasteViaSystemEvents()
-                self?.verifyPasteLanded(expected: targetSnapshot)
-            }
-        }
-
-        // Step 4: Restore clipboard.
+        // Restore clipboard after paste + extra breathing room.
         if let saved = savedContents {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay + clipboardRestoreDelay) { [weak self] in
                 self?.restoreClipboard(pasteboard, from: saved)
@@ -268,86 +289,104 @@ class CursorPaster {
         pasteAtCursor(formatted, restoreClipboard: restoreClipboard)
     }
 
-    /// Async paste with LLM polish pass. Falls through to sync paste if LLM is
-    /// disabled or unavailable. Caller must be in an async context.
-    func pasteFormattedWithLLM(_ text: String, formatter: TextFormatter, restoreClipboard: Bool = false) async {
-        let formatted = formatter.format(text)
-        let polished = await Qwen3Polisher.shared.polish(formatted, context: currentPolishContext())
-        pasteAtCursor(polished, restoreClipboard: restoreClipboard)
-    }
-
-    /// Async paste of pre-formatted text with LLM polish pass. Returns the
-    /// (possibly polished) string actually pasted so the caller can also
-    /// stash it on the clipboard / recent list.
-    @discardableResult
-    func pasteWithLLM(_ formatted: String, restoreClipboard: Bool = false) async -> String {
-        let polished = await Qwen3Polisher.shared.polish(formatted, context: currentPolishContext())
-        pasteAtCursor(polished, restoreClipboard: restoreClipboard)
-        return polished
-    }
-
     // MARK: - Cursor context reading
 
-    /// Read up to `length` characters immediately before the insertion point using
-    /// the AX API. Uses the system-wide focused element for reliability across apps.
-    /// Two-path: parameterized attr (O(1)) then full-value fallback for Electron/browsers.
+    /// Read up to `length` characters immediately before the insertion point.
+    /// Three-path cascade — each path catches what the previous misses:
+    ///
+    ///  Path A (native controls): kAXSelectedTextRangeAttribute + kAXStringForRangeParameterizedAttribute
+    ///  Path B (Electron/web):    kAXSelectedTextRangeAttribute + kAXValueAttribute full-read
+    ///  Path C (anything else):   kAXValueAttribute suffix — assumes cursor is at end,
+    ///                             which is always true right after a dictation
+    ///
+    /// Returns nil only when AX is not trusted or no focused element exists.
+    /// Returns "" when the cursor is at position 0 (empty field / beginning of field).
+    ///
+    /// Public wrapper — callers (VoiceApp) should sample this at recording-START,
+    /// because that's when the user's target text field reliably has focus. By
+    /// the time we paste, focus may have moved around (toast popups, dropdowns).
+    /// We pass the snapshot through to Qwen3 polish so the model can decide
+    /// spacing / punctuation / number formatting relative to existing field text.
+    func sampleFieldContextBeforeCursor(length: Int = 24) -> String? {
+        return contextStringBeforeCursor(length: length)
+    }
+
     private func contextStringBeforeCursor(length: Int = 3) -> String? {
         guard AXIsProcessTrusted() else { return nil }
 
-        let systemElement = AXUIElementCreateSystemWide()
+        let sys = AXUIElementCreateSystemWide()
         var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(systemElement, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+        guard AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
               let focused = focusedRef else { return nil }
         let element = focused as! AXUIElement
 
+        // Try to read the cursor position via kAXSelectedTextRangeAttribute.
         var rangeRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
-              let rv = rangeRef,
-              CFGetTypeID(rv) == AXValueGetTypeID() else { return nil }
+        let rangeOK = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success
+        var cfRange = CFRange(location: -1, length: 0)
+        if rangeOK, let rv = rangeRef, CFGetTypeID(rv) == AXValueGetTypeID() {
+            AXValueGetValue(rv as! AXValue, .cfRange, &cfRange)
+        }
 
-        var cfRange = CFRange()
-        guard AXValueGetValue(rv as! AXValue, .cfRange, &cfRange) else { return nil }
+        let cursorKnown = cfRange.location >= 0
 
-        // Position 0 = empty field or cursor at start.
-        guard cfRange.location > 0 else { return "" }
+        if cursorKnown {
+            guard cfRange.location > 0 else { return "" }  // cursor at start → fresh field
+            let readLen = min(length, cfRange.location)
 
-        let readLen = min(length, cfRange.location)
+            // Path A: parameterized string-for-range (O(1), works in AppKit / UIKit controls).
+            var beforeRange = CFRange(location: cfRange.location - readLen, length: readLen)
+            if let rangeValue = AXValueCreate(.cfRange, &beforeRange) {
+                var charRef: CFTypeRef?
+                if AXUIElementCopyParameterizedAttributeValue(
+                    element,
+                    kAXStringForRangeParameterizedAttribute as CFString,
+                    rangeValue,
+                    &charRef
+                ) == .success, let str = charRef as? String, !str.isEmpty {
+                    print("[VOICE-AX] Path A: '\(str)'")
+                    return str
+                }
+            }
 
-        // Fast path: parameterized attribute reads exactly readLen chars (native controls).
-        var beforeRange = CFRange(location: cfRange.location - readLen, length: readLen)
-        if let rangeValue = AXValueCreate(.cfRange, &beforeRange) {
-            var charRef: CFTypeRef?
-            if AXUIElementCopyParameterizedAttributeValue(
-                element,
-                kAXStringForRangeParameterizedAttribute as CFString,
-                rangeValue,
-                &charRef
-            ) == .success, let str = charRef as? String, !str.isEmpty {
-                return str
+            // Path B: cursor position known but parameterized attr failed — read full value.
+            // Handles Electron and some Qt-based apps that expose the value but not the range attr.
+            guard cfRange.location <= 200_000 else { return nil }
+            var textRef: CFTypeRef?
+            if AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &textRef) == .success,
+               let fullText = textRef as? String, cfRange.location <= fullText.count {
+                let endIdx = fullText.index(fullText.startIndex, offsetBy: cfRange.location)
+                let startIdx = fullText.index(endIdx, offsetBy: -readLen)
+                let result = String(fullText[startIdx..<endIdx])
+                print("[VOICE-AX] Path B: '\(result)'")
+                return result
             }
         }
 
-        // Fallback: full value read (Electron, some other frameworks).
-        guard cfRange.location <= 100_000 else { return nil }
+        // Path C: cursor position unknown — read the full field value and take the suffix.
+        // This assumes the cursor is at the end of the field, which is virtually always
+        // true immediately after the user stops dictating. Works in Chrome, Safari, Notion,
+        // GitHub, and other web-based text areas that don't expose kAXSelectedTextRangeAttribute.
         var textRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &textRef) == .success,
-              let fullText = textRef as? String,
-              cfRange.location <= fullText.count else { return nil }
-
-        let endIdx = fullText.index(fullText.startIndex, offsetBy: cfRange.location)
-        let startIdx = fullText.index(endIdx, offsetBy: -readLen)
-        return String(fullText[startIdx..<endIdx])
+              let fullText = textRef as? String else { return nil }
+        guard !fullText.isEmpty else { return "" }
+        let suffix = String(fullText.suffix(length))
+        print("[VOICE-AX] Path C (suffix): '\(suffix)'")
+        return suffix
     }
 
     // MARK: - Context determination and text adjustment
 
     private func determineContext(_ preceding: String?) -> InsertionContext {
-        // nil = AX unavailable. Treat as afterTerminalWS: keep capitalization
-        // and keep terminal period, but DON'T inject a leading space. We
-        // can't tell whether the field already has whitespace, and a
-        // double-space is more visually offensive than a missed space the
-        // user can type themselves.
-        guard let preceding = preceding else { return .afterTerminalWS }
+        // nil = AX read failed (app doesn't expose text, or focus not settled).
+        // Fall back to whatever the last paste ended with (cached) — that's
+        // almost always correct for back-to-back dictation. If no cache at all
+        // (first ever paste), default to .afterTerminal (adds a space). A stray
+        // extra space is far less bad than two words smashed together.
+        guard let preceding = preceding else {
+            return lastPasteEndingContext ?? .afterTerminal
+        }
         guard !preceding.isEmpty else { return .fresh }
 
         let last = preceding.last!
@@ -444,7 +483,7 @@ class CursorPaster {
             return (t, false)
 
         case .midSentence:
-            var t = lowercaseFirstPreservingI(stripTrailingPeriod(text))
+            let t = lowercaseFirstPreservingI(stripTrailingPeriod(text))
             // Add space unless text already begins with whitespace (rapid-fire guard).
             let needsSpace = !(t.first?.isWhitespace ?? false)
             return (t, needsSpace)
@@ -568,8 +607,31 @@ class CursorPaster {
 
     // MARK: - Simulate Paste (Cmd+V)
 
+    /// Build a CGEventSource that does NOT inherit the user's currently-held
+    /// physical modifier flags. We use `.privateState` (fresh state pool not
+    /// shared with the system input state) so when the user is still holding
+    /// the hotkey's modifier keys at paste time, our synthesized Cmd+V is
+    /// pure Cmd+V — not Cmd+Opt+V / Cmd+Fn+V / Cmd+Space etc. Without this,
+    /// the global hotkey's release race produced phantom Cmd+Opt+V combos in
+    /// apps like Chrome, Cursor, and any electron shell with a debug shortcut
+    /// on those bindings. Also explicitly zero local-mod suppression flags so
+    /// the OS doesn't merge held modifiers into our keystrokes.
+    private func makeIsolatedEventSource() -> CGEventSource? {
+        guard let src = CGEventSource(stateID: .privateState) else { return nil }
+        // Suppress ALL local modifiers from being combined with our synthetic
+        // events. 0x80000000 (kCGEventFlagMaskNonCoalesced upper bits) + all
+        // lower modifier bits = every modifier flag class.
+        src.setLocalEventsFilterDuringSuppressionState(
+            [.permitLocalMouseEvents, .permitSystemDefinedEvents],
+            state: .eventSuppressionStateSuppressionInterval
+        )
+        // Sources default to a 0.25s suppression interval — long enough that
+        // a user re-pressing their hotkey can't disrupt our pending keystrokes.
+        return src
+    }
+
     private func simulatePaste() {
-        let source = CGEventSource(stateID: .hidSystemState)
+        let source = makeIsolatedEventSource()
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true)
         let keyUp   = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false)
         keyDown?.flags = .maskCommand
@@ -578,32 +640,90 @@ class CursorPaster {
         keyUp?.post(tap: .cghidEventTap)
     }
 
+    /// Synthesize Cmd+Z to undo the most recent text insertion. Used by the
+    /// optimistic-paste swap path: after pasting unpolished TextFormatter
+    /// output, we Cmd+Z it and paste the polished version.
+    /// Falls back to AppleScript when Accessibility isn't granted.
+    /// Virtual key 6 = Z.
+    func undoLastPaste() {
+        if isAccessibilityTrusted() {
+            let source = makeIsolatedEventSource()
+            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 6, keyDown: true)
+            let keyUp   = CGEvent(keyboardEventSource: source, virtualKey: 6, keyDown: false)
+            keyDown?.flags = .maskCommand
+            keyUp?.flags   = .maskCommand
+            keyDown?.post(tap: .cghidEventTap)
+            keyUp?.post(tap: .cghidEventTap)
+        } else {
+            let script = """
+            tell application "System Events"
+                keystroke "z" using command down
+            end tell
+            """
+            if let appleScript = NSAppleScript(source: script) {
+                var error: NSDictionary?
+                appleScript.executeAndReturnError(&error)
+                if let error = error {
+                    print("[VOICE] AppleScript undo error: \(error)")
+                }
+            }
+        }
+    }
+
     /// Synthesize a single Space keystroke. Used before simulatePaste() when
     /// the cursor context calls for a leading space. Typing the space as a
     /// real key event (rather than prepending it to the clipboard payload)
     /// avoids paste-time whitespace stripping in Notion, browser text
     /// fields, and other Electron/web surfaces. Virtual key 49 = Space.
+    ///
+    /// Uses the isolated event source so a still-held hotkey modifier doesn't
+    /// turn this into Cmd-Space (Spotlight) or Opt-Space.
     private func simulateSpaceKey() {
-        let source = CGEventSource(stateID: .hidSystemState)
+        let source = makeIsolatedEventSource()
         let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: true)
         let keyUp   = CGEvent(keyboardEventSource: source, virtualKey: 49, keyDown: false)
+        // Explicitly clear modifier flags. CGEvent inherits the source's
+        // current flags by default; forcing them to [] guarantees a bare space.
+        keyDown?.flags = []
+        keyUp?.flags   = []
         keyDown?.post(tap: .cghidEventTap)
         keyUp?.post(tap: .cghidEventTap)
     }
 
     /// AppleScript paste — requires Automation permission for System Events.
-    private func pasteViaSystemEvents() {
+    /// When `leadingSpace` is true, types a Space keystroke before the paste
+    /// so apps that strip leading clipboard whitespace still receive the space.
+    ///
+    /// When AppleScript fails (most commonly: user denied Automation
+    /// permission for System Events, or Accessibility is also denied),
+    /// we surface a `voiceError` toast — otherwise the user has no idea
+    /// why their text didn't appear. The polished text is still on the
+    /// clipboard, so Cmd+V manually still works.
+    private func pasteViaSystemEvents(leadingSpace: Bool = false) {
+        let spaceStep = leadingSpace ? "keystroke \" \"\n            " : ""
         let script = """
         tell application "System Events"
-            keystroke "v" using command down
+            \(spaceStep)keystroke "v" using command down
         end tell
         """
-        if let appleScript = NSAppleScript(source: script) {
-            var error: NSDictionary?
-            appleScript.executeAndReturnError(&error)
-            if let error = error {
-                print("[VOICE] AppleScript paste error: \(error)")
-            }
+        guard let appleScript = NSAppleScript(source: script) else {
+            print("[VOICE-PASTE] result: failed reason=applescript-compile-failed")
+            NotificationCenter.default.post(
+                name: .voiceError,
+                object: nil,
+                userInfo: ["message": "Paste failed. Text copied — press Cmd+V to paste."]
+            )
+            return
+        }
+        var error: NSDictionary?
+        appleScript.executeAndReturnError(&error)
+        if let error = error {
+            print("[VOICE-PASTE] result: failed reason=applescript error=\(error)")
+            NotificationCenter.default.post(
+                name: .voiceError,
+                object: nil,
+                userInfo: ["message": "Paste failed (Automation permission missing?). Text copied — press Cmd+V to paste."]
+            )
         }
     }
 
@@ -648,47 +768,155 @@ class CursorPaster {
     /// a `voiceError` notification so the user knows the text is still on
     /// the clipboard.
     private func verifyPasteLanded(expected: PasteTargetSnapshot) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            let nowBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-            if nowBundle != expected.bundleId {
-                print("[VOICE] ⚠️ paste verify FAIL — frontmost changed \(expected.bundleId ?? "nil") → \(nowBundle ?? "nil")")
-                NotificationCenter.default.post(
-                    name: .voiceError,
-                    object: nil,
-                    userInfo: ["message": "Paste failed. Text copied — press Cmd+V to paste."]
-                )
+        // Tight 40ms window: if the frontmost app changed within this window
+        // it's a focus-stealing race (a modal, popup, or another app pulling
+        // focus during paste delivery). After 40ms a focus change is most
+        // likely the user voluntarily switching apps (Cmd-Tab, click) AFTER
+        // the paste already landed — we must NOT toast on that.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+            // Skip verify entirely when we couldn't snapshot the source bundle
+            // (typically: no frontmost app at hotkey time, like Spotlight open).
+            // Without a baseline we can't tell good from bad.
+            guard let expectedBundle = expected.bundleId else {
+                print("[VOICE-PASTE] verify SKIP — no snapshot bundle")
                 return
             }
-            // Compare focused element identity when AX is available.
-            // IMPORTANT: only treat a focus change as a failure when the
-            // frontmost APP also changed. Within the same app, focus shifts
-            // (autocomplete popup, dropdown, suggestion list) are a normal
-            // side effect of accepting text and should NOT surface an error.
-            // We already confirmed `nowBundle == expected.bundleId` above, so
-            // this block only runs when we know the app is still the same one.
-            if AXIsProcessTrusted(), let before = expected.focusedElement {
+            let nowBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+            guard nowBundle != expectedBundle else {
+                print("[VOICE-PASTE] result: success target=\(expectedBundle)")
+                return
+            }
+            // Skip the toast if our own pasteboard contents got consumed —
+            // many apps clear the selection / clipboard preview right after
+            // accepting a paste, which is also a strong signal that the
+            // paste landed even though focus moved.
+            let pbStill = NSPasteboard.general.string(forType: .string)
+            if pbStill == nil || pbStill?.isEmpty == true {
+                print("[VOICE-PASTE] result: success (clipboard consumed) target=\(expectedBundle)")
+                return
+            }
+            // Belt-and-suspenders: if AX is trusted and the *focused element*
+            // identity is unchanged, that's a stronger "paste landed" signal
+            // than bundle id alone (frontmost can flicker briefly without the
+            // user-perceived focus changing — Sonoma sometimes reports the
+            // hotkey-emitting helper as briefly frontmost).
+            if AXIsProcessTrusted(), let expectedEl = expected.focusedElement {
                 let sys = AXUIElementCreateSystemWide()
                 var ref: CFTypeRef?
                 if AXUIElementCopyAttributeValue(sys, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
                    let r = ref {
-                    let after = r as! AXUIElement
-                    // Only toast when the PID of the focused element also
-                    // changed, which means a different app grabbed the AX
-                    // focus token. Same-app element transitions (autocomplete,
-                    // Spotlight, dropdowns) keep the same PID — not an error.
-                    var beforePID: pid_t = 0
-                    var afterPID: pid_t = 0
-                    AXUIElementGetPid(before, &beforePID)
-                    AXUIElementGetPid(after, &afterPID)
-                    if !CFEqual(before, after) && beforePID != afterPID {
-                        print("[VOICE] ⚠️ paste verify FAIL — focused element changed to different process")
-                        NotificationCenter.default.post(
-                            name: .voiceError,
-                            object: nil,
-                            userInfo: ["message": "Paste failed. Text copied — press Cmd+V to paste."]
-                        )
+                    let nowEl = r as! AXUIElement
+                    if CFEqual(nowEl, expectedEl) {
+                        print("[VOICE-PASTE] result: success (focused element stable) target=\(expectedBundle)")
+                        return
                     }
                 }
+            }
+            print("[VOICE-PASTE] result: failed reason=focus-changed \(expectedBundle) → \(nowBundle ?? "nil") within 40ms")
+            NotificationCenter.default.post(
+                name: .voiceError,
+                object: nil,
+                userInfo: ["message": "Paste failed. Text copied — press Cmd+V to paste."]
+            )
+        }
+    }
+
+    // MARK: - Selection Read / Replace
+
+    /// Read the currently selected text from the frontmost app via AX API.
+    /// Returns nil if nothing is selected, AX is unavailable, or the frontmost
+    /// app doesn't expose selected text.
+    func getSelectedText() -> String? {
+        guard AXIsProcessTrusted() else {
+            print("[VOICE-CP] getSelectedText: AX not trusted")
+            return nil
+        }
+        guard let app = NSWorkspace.shared.frontmostApplication else {
+            print("[VOICE-CP] getSelectedText: no frontmost app")
+            return nil
+        }
+        print("[VOICE-CP] getSelectedText: app=\(app.bundleIdentifier ?? "?")")
+
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedRef: CFTypeRef?
+        let focusRes = AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute as CFString, &focusedRef)
+        guard focusRes == .success, let focusedRef else {
+            print("[VOICE-CP] getSelectedText: no focused element (axErr=\(focusRes.rawValue))")
+            return nil
+        }
+        let focused = focusedRef as! AXUIElement  // swiftlint:disable:this force_cast
+
+        var selRef: CFTypeRef?
+        let selRes = AXUIElementCopyAttributeValue(focused, kAXSelectedTextAttribute as CFString, &selRef)
+        if selRes == .success, let txt = selRef as? String, !txt.isEmpty {
+            print("[VOICE-CP] getSelectedText AX → \(txt.count) chars")
+            return txt
+        }
+        print("[VOICE-CP] getSelectedText: AX returned empty (axErr=\(selRes.rawValue)) — falling back to copy-via-Cmd+C")
+
+        // Fallback: copy via Cmd+C then read clipboard.
+        let pb = NSPasteboard.general
+        let prior = pb.string(forType: .string)
+        let priorChangeCount = pb.changeCount
+
+        // Use isolated source so held hotkey modifiers don't pollute Cmd+C.
+        let src = makeIsolatedEventSource()
+        let cDown = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: true)   // C = 8
+        let cUp   = CGEvent(keyboardEventSource: src, virtualKey: 8, keyDown: false)
+        cDown?.flags = .maskCommand
+        cUp?.flags   = .maskCommand
+        cDown?.post(tap: .cghidEventTap)
+        cUp?.post(tap: .cghidEventTap)
+
+        // Wait for clipboard to update (max 250ms, poll every 15ms).
+        let deadline = Date().addingTimeInterval(0.25)
+        while Date() < deadline {
+            if pb.changeCount != priorChangeCount { break }
+            usleep(15_000)
+        }
+
+        let copied = pb.string(forType: .string)
+        let captured: String? = (copied != prior && copied?.isEmpty == false) ? copied : nil
+
+        // Restore prior clipboard so the user's clipboard isn't trampled.
+        pb.clearContents()
+        if let p = prior { pb.setString(p, forType: .string) }
+
+        print("[VOICE-CP] getSelectedText Cmd+C fallback → \(captured?.count ?? 0) chars")
+        return captured
+    }
+
+    /// Replace the current selection in the frontmost app with newText.
+    /// Writes newText to the clipboard, sends Cmd+V (paste-over-selection),
+    /// then restores the prior clipboard contents after a short delay.
+    ///
+    /// Assumes the frontmost app has a text selection active — the selection
+    /// will be replaced by the paste. If there is no selection the text is
+    /// inserted at the cursor instead (standard paste behavior).
+    func replaceSelection(with newText: String) {
+        print("[VOICE-CP] replaceSelection: \(newText.count) chars")
+        let pb = NSPasteboard.general
+        let priorString = pb.string(forType: .string)
+        pb.clearContents()
+        pb.setString(newText, forType: .string)
+
+        // Tiny delay so target app's run loop sees the new pasteboard before Cmd+V.
+        usleep(20_000)
+
+        // Use isolated source so held hotkey modifiers don't pollute Cmd+V.
+        let src = makeIsolatedEventSource()
+        let vDown = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: true)
+        let vUp   = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: false)
+        vDown?.flags = .maskCommand
+        vUp?.flags   = .maskCommand
+        vDown?.post(tap: .cghidEventTap)
+        vUp?.post(tap: .cghidEventTap)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            let pb = NSPasteboard.general
+            if pb.string(forType: .string) == newText {
+                pb.clearContents()
+                if let p = priorString { pb.setString(p, forType: .string) }
             }
         }
     }

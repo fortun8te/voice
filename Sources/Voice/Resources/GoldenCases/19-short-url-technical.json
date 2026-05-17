@@ -1,0 +1,10 @@
+{
+  "id": "short-url-technical",
+  "title": "Short technical — URL formatted, API capitalized, no extra words",
+  "categories": ["short", "technical", "url", "regression"],
+  "raw": "the api is down check the status page at status dot anthropic dot com",
+  "reference": "The API is down. Check the status page at status.anthropic.com.",
+  "notes": "API capitalized (acronym). URL: 'status dot anthropic dot com' → 'status.anthropic.com' (no backticks — it's a plain URL in prose, not an identifier). Two sentences. Must NOT add 'I recommend' or 'Please visit'. Exact two sentences only.",
+  "cleanupLevel": "high",
+  "personality": "neutral"
+}

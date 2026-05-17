@@ -1,0 +1,10 @@
+{
+  "id": "short-utterance",
+  "title": "Short utterance (1.7B fast path)",
+  "categories": ["short", "routing"],
+  "raw": "yo send maya a quick message we're running late",
+  "reference": "yo send Maya a quick message, we're running late",
+  "notes": "Should route to 1.7B (<12 words). Preserve 'yo' casual register. Capitalize Maya. Fast.",
+  "cleanupLevel": "light",
+  "personality": "casual"
+}

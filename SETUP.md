@@ -1,6 +1,6 @@
-# Voice — Setup & Configuration Guide
+# VOICE — Setup & Configuration Guide
 
-Complete guide for building, configuring, and customizing Voice on macOS.
+Complete guide for building, configuring, and customizing VOICE on macOS.
 
 ---
 
@@ -23,7 +23,7 @@ cd Voice
 make install
 ```
 
-This runs `xcodegen` (regenerates project from `project.yml`), builds with `xcodebuild`, installs to `/Applications/Voice.app`, and launches it.
+This runs `xcodegen` (regenerates project from `project.yml`), builds with `xcodebuild`, installs to `/Applications/VOICE.app`, and launches it.
 
 **First time?** macOS will ask for Microphone and Accessibility permissions. Grant both.
 
@@ -45,8 +45,8 @@ This runs `xcodegen` (regenerates project from `project.yml`), builds with `xcod
    - Settings → Access Tokens → Create new token (read-only)
    - Copy your token
 
-2. **Configure Voice:**
-   - Open Voice settings (gear icon in menu bar)
+2. **Configure VOICE:**
+   - Open VOICE settings (gear icon in menu bar)
    - Go to "Advanced" tab
    - Toggle "Use Cloud Model" → ON
    - Paste your Hugging Face token
@@ -65,7 +65,7 @@ For maximum privacy + speed on your own hardware:
 brew install ollama
 ollama run qwen:235b
 
-# In Voice settings:
+# In VOICE settings:
 # Toggle "Use Cloud Model" → ON
 # API endpoint: http://localhost:11434 (default)
 # Leave token blank
@@ -78,7 +78,7 @@ Qwen3-235B is 15GB—needs 16GB+ RAM or GPU acceleration.
 Groq's inference is insanely fast (~50ms). If you want premium speed:
 
 1. Get API key from [groq.com](https://groq.com)
-2. In Voice settings:
+2. In VOICE settings:
    - API provider: Groq
    - Paste API key
    - Save
@@ -114,7 +114,7 @@ make install
 
 ### Automatic Model Selection (Advanced)
 
-Voice auto-routes based on input length:
+VOICE auto-routes based on input length:
 
 - **<6 words**: TextFormatter only (50ms)
 - **6-20 words**: Qwen3 1.7B (150ms)
@@ -136,10 +136,10 @@ Adjust `wordCount > 20` to whatever threshold makes sense for your use case.
 
 ### Add Your Own Vocabulary
 
-Voice includes 90+ AI model names, tech terms, and brand names by default. Add more:
+VOICE includes 90+ AI model names, tech terms, and brand names by default. Add more:
 
 **Via UI:**
-- Open Voice → Settings → "Vocabulary Input"
+- Open VOICE → Settings → "Vocabulary Input"
 - Paste terms (one per line): `Qwen`, `GraphQL`, `pytorch/lightning`
 - Press Save
 
@@ -158,7 +158,7 @@ static let seedTerms = [
 ]
 ```
 
-Rebuild and Voice will recognize these immediately.
+Rebuild and VOICE will recognize these immediately.
 
 ---
 
@@ -194,13 +194,13 @@ CODE_SIGN_IDENTITY: "Apple Development: your.name@example.com"
 
 ### Reset Permissions (Nuclear Option)
 
-If Voice is stuck asking for permissions repeatedly:
+If VOICE is stuck asking for permissions repeatedly:
 
 ```bash
 RESET_TCC=1 make install
 ```
 
-This removes old Voice entries from macOS' TCC (privacy) database and re-grants fresh. Only do this if the stable-signing fix doesn't work.
+This removes old VOICE entries from macOS' TCC (privacy) database and re-grants fresh. Only do this if the stable-signing fix doesn't work.
 
 ---
 
@@ -232,15 +232,15 @@ A post-build script automatically:
 ### Build Without Installing
 
 ```bash
-xcodebuild -project Voice.xcodeproj -scheme Voice -configuration Debug build
+xcodebuild -project Voice.xcodeproj -scheme VOICE -configuration Debug build
 ```
 
-Output app is in `build/Debug/Voice.app` (not installed to Applications).
+Output app is in `build/Debug/VOICE.app` (not installed to Applications).
 
 ### Build Release (For Distribution)
 
 ```bash
-xcodebuild -project Voice.xcodeproj -scheme Voice -configuration Release build
+xcodebuild -project Voice.xcodeproj -scheme VOICE -configuration Release build
 ```
 
 ### Check Codesign Status
@@ -253,10 +253,10 @@ Should show no errors and a stable designated requirement (not `cdhash H"..."` i
 
 ### View Console Logs
 
-While Voice is running:
+While VOICE is running:
 
 ```bash
-log stream --predicate 'eventMessage contains[cd] "Voice"' --level debug
+log stream --predicate 'eventMessage contains[cd] "VOICE"' --level debug
 ```
 
 Look for `[VOICE-*]` prefixes in logs:
@@ -268,8 +268,8 @@ Look for `[VOICE-*]` prefixes in logs:
 ### Uninstall Completely
 
 ```bash
-rm -rf /Applications/Voice.app
-rm -rf ~/Library/Application\ Support/Voice
+rm -rf /Applications/VOICE.app
+rm -rf ~/Library/Application\ Support/VOICE
 ```
 
 Then `make install` again for a clean slate.
@@ -280,7 +280,7 @@ Then `make install` again for a clean slate.
 
 ### Faster Startup (Prewarm Models)
 
-Voice pre-loads the Qwen3 1.7B model on launch so first dictation is instant. To check if prewarming is working:
+VOICE pre-loads the Qwen3 1.7B model on launch so first dictation is instant. To check if prewarming is working:
 
 ```bash
 log stream --predicate 'eventMessage contains[cd] "prewarm"' --level debug
@@ -299,7 +299,7 @@ If this doesn't appear, model loading happens on first use (adds 2-3s latency to
 Check resident set size:
 
 ```bash
-ps aux | grep Voice.app | grep -v grep
+ps aux | grep VOICE.app | grep -v grep
 ```
 
 On M1 Mac with 1.7B model loaded: ~600MB. With 4B model: ~1.2GB.
@@ -312,9 +312,9 @@ If memory is tight, stick with 1.7B or use cloud API.
 
 | Issue | Cause | Fix |
 |-------|-------|-----|
-| "Microphone permission denied" | Not granted in System Settings | Rm Voice from Privacy > Microphone, re-grant |
-| "Accessibility permission denied" | Not granted in System Settings | Rm Voice from Privacy > Accessibility, re-grant |
-| Hotkey doesn't work | Another app is using Cmd+Right | Change hotkey in Voice settings or uninstall conflicting app |
+| "Microphone permission denied" | Not granted in System Settings | Rm VOICE from Privacy > Microphone, re-grant |
+| "Accessibility permission denied" | Not granted in System Settings | Rm VOICE from Privacy > Accessibility, re-grant |
+| Hotkey doesn't work | Another app is using Cmd+Right | Change hotkey in VOICE settings or uninstall conflicting app |
 | Whispers too quiet | Microphone gain too low | Gain auto-bumps 5× for quiet input. If still quiet, check mic levels in System Settings > Sound |
 | "slash" stays literal | Utterance too short | The 4-word fast-path doesn't run LLM. Say it as a phrase: "github slash repo" (4+ words) |
 | Cloud API slow | Network/Hugging Face overloaded | Fall back to local (Qwen3 1.7B). Cloud is optional, not required. |
@@ -326,7 +326,7 @@ If memory is tight, stick with 1.7B or use cloud API.
 
 1. **Rebuild:** `make install`
 2. **Test:** Press Cmd+Right, speak, release
-3. **Customize:** Add vocabulary, pick personality (Settings gear icon)
+3. **Customize:** Add vocabulary, pick personality (VOICE settings gear icon)
 4. **Optional: Go cloud** — Add Hugging Face token for Qwen3-235B
 5. **Advanced:** Swap models, tweak thresholds, enable debug logging
 

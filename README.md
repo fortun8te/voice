@@ -1,18 +1,18 @@
-# Voice
+# VOICE
 
 **The fastest dictation app for macOS.** Press Cmd+Right, speak naturally, watch your words appear instantly. Works offline. No cloud latency. No nonsense.
 
 ```
 You: "Add this to the agenda for tomorrow's standup"
-Voice: ✓ Done. (150ms)
+VOICE: ✓ Done. (150ms)
 Wispr Flow Cloud: ⏳ Processing... (2-3s)
 ```
 
 ---
 
-## Why Voice Wins
+## Why VOICE Wins
 
-| Feature | Voice | Wispr Flow | Other Local Clones |
+| Feature | VOICE | Wispr Flow | Other Local Clones |
 |---------|-------|-----------|-------------------|
 | **Latency** | <200ms local | 2-3s cloud | Inconsistent |
 | **Works offline** | ✓ | ✗ | ✓ |
@@ -22,7 +22,7 @@ Wispr Flow Cloud: ⏳ Processing... (2-3s)
 | **Context window** | Full conversation memory per session | None | None |
 | **Cost** | $0 (or $0.50/mo cloud option) | $4.99/mo | Varies |
 
-**The real difference:** Voice understands *what you're saying*, not just *sounds*. Qwen3 handles complex homophones (Qwen→"queen"/"coin", DeepSeek→"deep seek"), adds smart formatting (paragraphs, bullets, em-dashes → commas), and learns your lingo.
+**The real difference:** VOICE understands *what you're saying*, not just *sounds*. Qwen3 handles complex homophones (Qwen→"queen"/"coin", DeepSeek→"deep seek"), adds smart formatting (paragraphs, bullets, em-dashes → commas), and learns your lingo.
 
 ---
 
@@ -87,7 +87,7 @@ Use **Qwen3-235B** via Hugging Face or local Ollama for more sophisticated dicta
          └──────────────────────┘
 ```
 
-**Key insight:** Most "Wispr clones" skip the rewriting step or use a tiny model. Voice uses **Qwen3** (a 1.7B-235B parameter LLM) to actually *understand* what you said—fixing real errors, not just adding punctuation.
+**Key insight:** Most "Wispr clones" skip the rewriting step or use a tiny model. VOICE uses **Qwen3** (a 1.7B-235B parameter LLM) to actually *understand* what you said—fixing real errors, not just adding punctuation.
 
 ---
 
@@ -104,9 +104,9 @@ VOICE_MODEL_TIER=cloud make install
 This swaps to **Qwen3-235B** (via Hugging Face API or local Ollama). Better quality, ~1.5s latency.
 
 ### Add Your Vocabulary
-**Settings > Vocabulary Input** → Paste model names, brand terms, or personal jargon. Voice learns them immediately.
+**Settings > Vocabulary Input** → Paste model names, brand terms, or personal jargon. VOICE learns them immediately.
 
-**For code terms**, add with slashes: `graphql-python`, `pytorch/lightning`, `aws-cdk`. Voice will recognize variations (GraphQL, graph-ql, graphql).
+**For code terms**, add with slashes: `graphql-python`, `pytorch/lightning`, `aws-cdk`. VOICE will recognize variations (GraphQL, graph-ql, graphql).
 
 ### Tweak Rewrite Intensity
 - **None** — Just transcribe, no fixes.

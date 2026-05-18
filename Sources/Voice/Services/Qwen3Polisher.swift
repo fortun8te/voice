@@ -1658,18 +1658,26 @@ final class Qwen3Polisher {
 
     If the input word is a real English word that fits the sentence, KEEP IT EXACTLY. Do not swap it for a synonym. Do not change tense. Do not "improve" word choice. Do not condense phrases.
 
+    CADENCE IS IDENTITY. Short punchy clauses are intentional. Do NOT merge them into longer compound sentences. If the speaker said "It's fast. It's simple. It works." — keep three short sentences, do not turn them into "It is fast, simple, and effective." The rhythm is part of who the speaker is.
+
+    INFORMAL SPEECH IS CORRECT SPEECH. "kinda", "gonna", "yeah", "like", "honestly", "tbh" are not errors — they are the speaker's voice. In Neutral mode, keep them. Only Formal mode removes them.
+
     EXAMPLES OF WHAT NOT TO DO:
     - "I just had an idea" \u{2192} "I have an idea"   (WRONG. Keep "just had".)
     - "I'm gonna go" \u{2192} "I will go"   (WRONG. Keep "gonna".)
     - "send him a message" \u{2192} "send him a note"   (WRONG. Keep "message".)
     - "the laptop battery keeps dropping" \u{2192} "the battery is depleting"   (WRONG. Keep the original phrasing.)
+    - "It's fast. It works." \u{2192} "It is fast and works well."   (WRONG. Merged cadence, formalized. Keep two short sentences.)
+    - "kinda makes sense" \u{2192} "rather makes sense"   (WRONG. "kinda" is the speaker's word.)
+
+    CONFIDENCE THRESHOLD FOR SUBSTITUTION: Only change a word when you are >95% certain it is an ASR error. If there is any reasonable interpretation where the original word fits, KEEP IT. Low confidence means preserve, not guess.
 
     Only substitute words when:
     1. The ASR token is NOT a real English word (e.g. "decreation" \u{2192} "degradation")
-    2. The ASR token is a real word but produces obvious gibberish in context (e.g. "Tokyo Soccer Seoul" \u{2192} "Tokyo, Osaka, Seoul")
+    2. The ASR token is a real word but produces complete gibberish in context — not just awkward, but literally impossible (e.g. "Tokyo Soccer Seoul" \u{2192} "Tokyo, Osaka, Seoul")
     3. The speaker self-corrects mid-sentence (use the corrected version, drop the abandoned one)
 
-    If unsure whether to change a word: DON'T.
+    If unsure whether to change a word: DON'T. Leave it exactly as spoken.
 
     == SPOKEN PUNCTUATION (convert when spoken as commands, not as part of a sentence) ==
     "period"/"full stop"\u{2192}. "comma"\u{2192}, "question mark"\u{2192}? "exclamation point"/"exclamation mark"/"bang"\u{2192}! "colon"\u{2192}: "semicolon"\u{2192}; "dash"/"hyphen"\u{2192}- "em dash"\u{2192}, (em-dashes are BANNED; convert spoken "em dash" to a comma instead) "ellipsis"/"dot dot dot"\u{2192}\u{2026} "open paren"/"close paren"\u{2192}() "open bracket"/"close bracket"\u{2192}[] "open brace"/"close brace"\u{2192}{} "open quote"/"close quote"/"quote unquote"\u{2192}\u{201C}\u{201D} "apostrophe"\u{2192}' "ampersand"\u{2192}& "at sign"/"at symbol"\u{2192}@ "hashtag"/"hash"/"pound sign"\u{2192}# "dollar sign"\u{2192}$ "percent sign"\u{2192}% "asterisk"/"star"\u{2192}* "underscore"\u{2192}_ "slash"/"forward slash"\u{2192}/ "backslash"\u{2192}\\ "pipe"\u{2192}| "tilde"\u{2192}~ "equals"/"equals sign"\u{2192}= "plus"/"plus sign"\u{2192}+ "less than"\u{2192}< "greater than"\u{2192}>
@@ -2438,7 +2446,7 @@ final class Qwen3Polisher {
 
         switch style?.lowercased() {
         case "neutral", nil:
-            return "Style: NEUTRAL. Copy the speaker's register exactly — same word choices, same contractions, same energy. Fix errors silently. Do not formalize, casualize, or editorialize. Output reads like the speaker typed it themselves. Preserve `!` exclamation marks when the speaker's energy clearly warranted them in the raw input (e.g., \"Ew!\", \"It's annoying!\")." + antiAI + absoluteTail
+            return "Style: NEUTRAL. Transcription assistant, not editor. Your only jobs: fix capitalization, add punctuation, correct clear ASR homophones (words that are literally impossible given context). KEEP everything else: word choices, contractions, slang, cadence, sentence length, informal phrasing. If a word could plausibly be what the speaker said, keep it. Output should be indistinguishable from the speaker typing it themselves — not cleaned up, not improved, not smoothed. Preserve `!` exclamation marks when the speaker's energy clearly warranted them." + antiAI + absoluteTail
 
         case "formal":
             return "Style: FORMAL. Professional register throughout. Expand every contraction (don't→do not, I'm→I am, we'll→we will). Replace slang (yeah→yes, gonna→going to, wanna→want to, kinda→rather). Full grammatical sentences. No exclamation marks unless quoting someone. If content is clearly a casual text to a friend, keep full sentences but drop the stiffest formality." + antiAI + absoluteTail
@@ -2465,7 +2473,7 @@ final class Qwen3Polisher {
             return "Cleanup mode: NONE. Output the input text verbatim. Do not edit, polish, or change anything except trivial whitespace fixes."
 
         case "light":
-            return "Cleanup mode: LIGHT. Strip obvious fillers (um, uh, like, you know) at clause boundaries. Capitalize sentence starts. Add basic punctuation. Do not restructure sentences. Do not change word choice."
+            return "Cleanup mode: LIGHT. Capitalization and punctuation only. Strip only the most obvious isolated fillers (um, uh) when they appear alone at a clause boundary — not 'like' or 'you know' (those carry meaning). Do NOT restructure sentences. Do NOT change word choice. Do NOT merge short sentences. Treat as near-verbatim transcription with minimal cleanup."
 
         case "high":
             return """
@@ -2509,16 +2517,19 @@ final class Qwen3Polisher {
             return """
             Cleanup mode: MEDIUM.
             REQUIRED:
-            - Strip fillers (um, uh, like, you know) at clause boundaries
+            - Strip fillers (um, uh) when isolated at clause boundaries — NOT "like", "you know", "honestly", "kinda" (those carry voice)
             - Normalize capitalization and punctuation
-            - Fix obvious grammar errors, proper nouns, and homophones from context
-            - Break run-on sentences into separate sentences
-            - Drop filler clauses that add no content
+            - Fix clear ASR homophones only when the original word makes NO sense in context
+            - Break obvious run-on sentences (two clearly independent clauses with no punctuation)
             PROHIBITED:
+            - Changing word choice when the original is a real word that fits
+            - Merging short sentences into compound ones — short cadence is intentional
+            - Normalizing informal speech ("gonna"→"going to", "yeah"→"yes") unless Formal mode
             - Adding factual claims or changing speaker intent
             - Em-dashes or en-dashes (use periods or commas)
-            - Paraphrasing — every meaningful clause survives
-            Output is cleaner than the input but preserves the speaker's voice and rhythm.
+            - Paraphrasing — every meaningful word survives
+            DEFAULT: when in doubt whether something is an error, keep the original.
+            Output is cleaner than the input but sounds like the same person said it.
             """
         }
     }
@@ -3212,7 +3223,7 @@ final class Qwen3Polisher {
         var out = "Uncertain words (low ASR confidence. first is what was heard, brackets list phonetically similar canonical spellings, pick the right one or keep as-is):\n"
         out += lines.joined(separator: "\n") + "\n"
         if lines.count >= 3 {
-            out += "NOTE: This dictation has multiple low-confidence words. The speaker may be mumbling or speaking softly. Prioritize semantic coherence over verbatim preservation when a suspect word does not fit the sentence. If a candidate from the [alt1, alt2, alt3] list makes the sentence parse cleanly, prefer it.\n"
+            out += "NOTE: Multiple low-confidence words detected. Be MORE conservative, not less. Only substitute a suspect word if the original is genuinely impossible in context (not a real word, or produces complete gibberish). If the original COULD be what the speaker said, keep it. Uncertainty means preserve, not guess.\n"
         }
         return out
     }

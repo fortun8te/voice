@@ -2461,7 +2461,7 @@ final class Qwen3Polisher {
             return "Style: CASUAL. Keep the speaker's raw voice. Preserve their contractions, slang, short sentences. 'yo', 'yeah', 'gonna', 'kinda', 'tbh', 'ngl' are fine — keep them if the speaker used them. Short punchy clauses over long compound ones. Drop 'um/uh' but keep the rhythm. If content is serious (medical, professional, bad news), soften slang ('yo'→'hey') but keep the casual structure." + antiAI + absoluteTail
 
         case "excited":
-            return "Style: EXCITED. Bring energy to good news, plans, ideas, wins. Punchy sentences. Keep exclamation marks where they fit. HARD STOP: if content is somber, factual, medical, or emotionally heavy — no exclamation marks, no amplification, flat professional tone. Never fake excitement. Never add energy that wasn't in the source." + antiAI + absoluteTail
+            return "Style: EXCITED. When content is positive (good news, wins, plans, ideas, hype, anything fun) — actually lean in. Use exclamation marks liberally where energy supports them. Short punchy sentences over long ones. Let enthusiasm show — 'this is great!' not 'this is great.' Match or slightly amplify the speaker's energy, don't dampen it. Keep their slang ('yo', 'yeah', 'lol', 'lets gooo') if they used it. SAFEGUARD: if content is genuinely somber (medical, death, loss, serious bad news, factual reporting) — drop the energy entirely, flat respectful tone, no exclamation marks. Read the room. Default to expressive when in doubt — that's what this mode is for." + antiAI + absoluteTail
 
         default:
             return "Style: NEUTRAL. Match the speaker's register exactly." + antiAI + absoluteTail
@@ -2484,7 +2484,9 @@ final class Qwen3Polisher {
         case "high":
             return """
             Cleanup mode: HIGH (deep rewrite, prose-grade output).
-            Target: reads like the speaker wrote it down deliberately, not dictated.
+            Target: reads like the speaker wrote it down deliberately on a good day — NOT like a corporate document, NOT like an AI assistant cleaned it up.
+
+            REGISTER MUST STAY HUMAN. Aggressive structural cleanup (lists, paragraphs, run-on splits, correction collapse), but the prose voice stays as casual or as formal as the speaker actually was. If they said "gonna" and "yeah" and "kinda", those stay (unless personality is Formal). The cleanup is about clarity and structure, not about formalizing tone. Output should never sound like a press release or LinkedIn post. No "leverage", no "utilize", no "facilitate", no "I'd be happy to" — keep their actual words. The reader should still feel the speaker's personality coming through.
 
             REQUIRED transformations:
             - OPENER FILLERS: Strip ONLY these exact discourse openers at the very start: "okay so", "okay hey", "hey so", "alright so", "so basically", "i mean", "you know". Do NOT strip "I think", "I want", "I need", "We should", "maybe", "probably" — those are content. Example: "okay hey i mean send john a message" → "Send John a message." NEVER: "i think we should push the deadline" → keep as is (not an opener, it's the content).

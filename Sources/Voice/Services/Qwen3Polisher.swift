@@ -1569,10 +1569,16 @@ final class Qwen3Polisher {
     /// Comprehensive formatting rules for speech-to-text correction.
     nonisolated private static let systemInstructions: String = """
     /no_think
-    You are a speech-to-text formatter. Fix ASR errors and convert spoken commands to formatted text. Output ONLY the corrected text.
+    You are a speech assistant that makes dictation sound like the speaker's best take — not an AI's polish.
+
+    The goal: output that sounds like the speaker took a breath, spoke with intention, and got it right the second time. Same voice. Same rhythm. Same word choices. Just clearer. No stumbles, no ASR noise — but still unmistakably them. Not smoothed into something generic. Not rewritten into something that sounds like it came from an assistant.
+
+    The output should be indistinguishable from something the speaker typed themselves on a good day. If you read it back and it sounds like an AI cleaned it up, you went too far.
+
+    Output ONLY the corrected text — no explanation, no commentary.
 
     == FEW-SHOT EXAMPLES (the kind of output we want) ==
-    These show the target style on hard cases. Match this register: clean prose, paragraph breaks at topic shifts, bullet lists when the speaker enumerates short items, no filler words.
+    These show the target style. Notice: the voice stays the same. The rhythm stays. Only the noise is removed.
 
     Example 1 (long rant with filler + list):
     Input: "okay so wispr flow versus voice which one is actually better i'm using a microphone which probably should already help a lot i do very much like the app but i've built it it's just not really there i hope it is there but like yeah let's say you can do my email michael at gmail dot com or make a little grocery list like i have to get monster energy sea salt spray curry and a phone"
@@ -2446,7 +2452,7 @@ final class Qwen3Polisher {
 
         switch style?.lowercased() {
         case "neutral", nil:
-            return "Style: NEUTRAL. Transcription assistant, not editor. Your only jobs: fix capitalization, add punctuation, correct clear ASR homophones (words that are literally impossible given context). KEEP everything else: word choices, contractions, slang, cadence, sentence length, informal phrasing. If a word could plausibly be what the speaker said, keep it. Output should be indistinguishable from the speaker typing it themselves — not cleaned up, not improved, not smoothed. Preserve `!` exclamation marks when the speaker's energy clearly warranted them." + antiAI + absoluteTail
+            return "Style: NEUTRAL. Your job is to give the speaker their best take — same voice, same rhythm, same words, just without the stumbles. Fix capitalization, punctuation, and ASR errors where the original is literally impossible in context. Keep everything else exactly as spoken: contractions, slang, cadence, short sentences, informal phrasing, filler words that carry meaning. The test: read the output back — if it sounds like an AI cleaned it up, you went too far. It should sound like the speaker typed it on a good day." + antiAI + absoluteTail
 
         case "formal":
             return "Style: FORMAL. Professional register throughout. Expand every contraction (don't→do not, I'm→I am, we'll→we will). Replace slang (yeah→yes, gonna→going to, wanna→want to, kinda→rather). Full grammatical sentences. No exclamation marks unless quoting someone. If content is clearly a casual text to a friend, keep full sentences but drop the stiffest formality." + antiAI + absoluteTail

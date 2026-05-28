@@ -393,7 +393,6 @@ struct PolishReplayView: View {
     // when a case loads, and on a NotificationCenter ping from the live
     // dictation path (see `.tripleASRCaptured` in VoiceApp).
     @State private var tripleASR: TripleASRCapture? = nil
-    @State private var showTripleASRPanel: Bool = false
 
     @State private var caseSearch: String = ""
     @State private var caseResults: [String: Double] = [:]
@@ -613,13 +612,6 @@ struct PolishReplayView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Reload last_triple_asr.json from disk")
-                Button {
-                    showTripleASRPanel = false
-                } label: {
-                    Image(systemName: "sidebar.right")
-                }
-                .buttonStyle(.plain)
-                .help("Hide triple-ASR panel")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)

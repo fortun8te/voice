@@ -247,6 +247,16 @@ enum StarterDictionary {
 
         // ========== APPLE ECOSYSTEM ==========
         "Apple", "macOS", "iOS", "iPadOS", "tvOS", "watchOS", "visionOS",
+        // === UI / DESIGN VOCAB (was decoding as "you eye" / "you ex" / etc) ===
+        "UI", "UX", "API", "SDK", "CLI", "GUI", "IDE", "OS", "CSS", "HTML",
+        "JSON", "YAML", "XML", "URL", "URI", "HTTP", "HTTPS", "TCP", "UDP",
+        "Liquid Glass", "Aurora", "WWDC", "SF Symbols", "AppKit", "UIKit",
+        "Tahoe", "Sonoma", "Ventura", "Monterey", "Sequoia",
+        "VS Code", "Cursor", "Xcode", "Tailwind", "Vite", "Next.js",
+        "TypeScript", "JavaScript", "TSX", "JSX", "ESM", "CommonJS",
+        "Cerebras", "Wispr", "Wispr Flow", "Granola", "Otter",
+        "Figma", "FigJam", "Sketch", "Notion", "Linear", "Slack",
+        "Voice", "Cmd-V", "Cmd-Z", "Cmd-C", "Cmd-S", "Cmd-Q",
         "iPhone", "iPad", "Mac", "MacBook", "iMac", "Mac mini",
         "Mac Studio", "Mac Pro", "Apple TV", "Apple Watch", "Vision Pro",
         "AirPods", "AirPods Pro", "AirPods Max", "Beats",

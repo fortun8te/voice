@@ -40,8 +40,8 @@
 //     the audio engine.
 //
 //   • Mid-flight state writes inside stopRecording (currentTranscript,
-//     skipPolishForCurrent, graniteTranscript, moonshineTranscript)
-//     would clobber each other for concurrent sessions, so we DO NOT
+//     skipPolishForCurrent) would clobber each other for concurrent
+//     sessions, so we DO NOT
 //     write them when our session is no longer the active one. The
 //     `currentRecordingSessionId` counter is the gate. Stale sessions
 //     still RETURN their segments to the caller — VoiceApp's pasteChain
@@ -68,7 +68,9 @@ class RecordingCoordinator {
     // Services
     let audioCapture = AudioCaptureService()
     let transcription = TranscriptionService()
-    private let storage = StorageService()
+    // Made internal (was `private`) so MeetingRecoveryService can use the same
+    // DB instance for orphan scan / draft checkpoint / re-transcribe paths.
+    let storage = StorageService()
 
     // State (shared with UI via RecordingState)
     var state: RecordingState
@@ -169,11 +171,20 @@ class RecordingCoordinator {
             }.value
             async let qwenReady: Void = Qwen3Polisher.shared.prewarm()
 
+            // Fire-and-forget CTC streaming model prewarm — downloads/loads
+            // the ~110MB vocabulary-boosting model in the background so the
+            // first streaming session doesn't pay the cold-start cost.
+            Task {
+                vlog("[VOICE-PREWARM] CTC streaming models — kicking off background prewarm")
+                try? await CtcModels.downloadAndLoad()
+                vlog("[VOICE-PREWARM] CTC streaming models — ready")
+            }
+
             // Await transcription (throwing) first; the other two are Void and
             // can be awaited unconditionally afterwards.
             try await txReady
             _ = await (audioReady, qwenReady)
-            print("[VOICE TIMINGS] prewarm-parallel: \(Int(Date().timeIntervalSince(prewarmStart) * 1000))ms")
+            vlog("[VOICE TIMINGS] prewarm-parallel: \(Int(Date().timeIntervalSince(prewarmStart) * 1000))ms")
             state.modelState = transcription.modelState
 
             // Granite/Moonshine subprocess transcribers are not in the current
@@ -196,7 +207,7 @@ class RecordingCoordinator {
             }
         } catch {
             state.modelState = .error(error.localizedDescription)
-            print("[VOICE] Initialization error: \(error.localizedDescription)")
+            vlog("[VOICE] Initialization error: \(error.localizedDescription)")
         }
     }
 
@@ -205,13 +216,13 @@ class RecordingCoordinator {
     /// Start recording from the configured audio source.
     func startRecording() {
         let enterTime = Date()
-        print("[VOICE-RC] startRecording() ENTER at \(enterTime) (already recording: \(state.isRecording))")
+        vlog("[VOICE-RC] startRecording() ENTER at \(enterTime) (already recording: \(state.isRecording))")
         guard !state.isRecording else {
-            print("[VOICE-RC] startRecording() EARLY-EXIT — already recording")
+            vlog("[VOICE-RC] startRecording() EARLY-EXIT — already recording")
             return
         }
 
-        print("[VOICE-RC] isRecording: false → true at \(Date()) (SYNC, before any Task)")
+        vlog("[VOICE-RC] isRecording: false → true at \(Date()) (SYNC, before any Task)")
         state.isRecording = true
         state.isPaused = false
         state.elapsedSeconds = 0
@@ -228,7 +239,7 @@ class RecordingCoordinator {
         // Bump the staleness counter so any in-flight pipeline from a
         // previous recording can detect it's been superseded and bail.
         currentRecordingSessionId &+= 1
-        print("[VOICE-RC] \(sessTag(sessionId)) phase=record-begin counter=\(currentRecordingSessionId)")
+        vlog("[VOICE-RC] \(sessTag(sessionId)) phase=record-begin counter=\(currentRecordingSessionId)")
         // The audio file is named by `sessionId` (a fresh UUID per call),
         // guaranteeing no collision with a still-transcribing prior recording.
         // Even if two `startRecording()` calls overlap conceptually, each gets
@@ -241,11 +252,11 @@ class RecordingCoordinator {
             // startWritingToFile threw, no file was created, so there is
             // nothing to track or leak.
             self.currentAudioFileURL = audioURL
-            print("[VOICE-RC] \(sessTag(sessionId)) phase=writer-open → \(audioURL.lastPathComponent)")
+            vlog("[VOICE-RC] \(sessTag(sessionId)) phase=writer-open → \(audioURL.lastPathComponent)")
         } catch {
             // Not fatal — dictation can run without retained audio,
             // we just won't be able to re-transcribe on recovery.
-            print("[VOICE-RC] \(sessTag(sessionId)) phase=writer-open-FAILED: \(error.localizedDescription)")
+            vlog("[VOICE-RC] \(sessTag(sessionId)) phase=writer-open-FAILED: \(error.localizedDescription)")
         }
 
         // Start elapsed timer
@@ -277,7 +288,7 @@ class RecordingCoordinator {
                 if lvl < quietThreshold {
                     quietTicks &+= 1
                     if quietTicks == quietTicksLimit && !self.state.noInputDetected {
-                        print("[VOICE-RC] no input detected for ~2s — surfacing mic hint")
+                        vlog("[VOICE-RC] no input detected for ~2s — surfacing mic hint")
                         self.state.noInputDetected = true
                     }
                 } else {
@@ -291,16 +302,16 @@ class RecordingCoordinator {
         // because feed() is a no-op (we transcribe from the retained file at stop time).
         // Delaying capture inside an async Task caused the first syllable to be clipped.
         let audioSource = UserDefaults.standard.string(forKey: "audioSource") ?? "microphone"
-        print("[VOICE-RC] audioSource = \(audioSource)")
+        vlog("[VOICE-RC] audioSource = \(audioSource)")
         if audioSource != "system" {
             do {
                 // feed() is a no-op; the capture service writes directly to file.
-                print("[VOICE-RC] AVAudioEngine.start (mic) at \(Date())")
+                vlog("[VOICE-RC] AVAudioEngine.start (mic) at \(Date())")
                 try audioCapture.startMicrophoneCapture { _ in }
-                print("[VOICE-RC] AVAudioEngine.start OK")
-                print("[VOICE-TIMING] AVAudioEngine.start() done at \(Date())")
+                vlog("[VOICE-RC] AVAudioEngine.start OK")
+                vlog("[VOICE-TIMING] AVAudioEngine.start() done at \(Date())")
             } catch {
-                print("[VOICE-RC] Microphone capture ERROR: \(error.localizedDescription)")
+                vlog("[VOICE-RC] Microphone capture ERROR: \(error.localizedDescription)")
                 Task { @MainActor in _ = await self.stopRecording() }
                 return
             }
@@ -308,18 +319,18 @@ class RecordingCoordinator {
 
         // transcription.start() is instant (marks session start) but must precede stop().
         // System audio capture is async so it lives here too.
-        print("[VOICE-RC] spawning startupTask (async transcription.start)")
+        vlog("[VOICE-RC] spawning startupTask (async transcription.start)")
         startupTask = Task { @MainActor in
             do {
                 try await transcription.start()
-                print("[VOICE-RC] transcription.start() OK in task")
+                vlog("[VOICE-RC] transcription.start() OK in task")
             } catch {
-                print("[VOICE-RC] transcription.start FAILED: \(error.localizedDescription)")
+                vlog("[VOICE-RC] transcription.start FAILED: \(error.localizedDescription)")
                 _ = await self.stopRecording()
                 return
             }
             guard self.state.isRecording else {
-                print("[VOICE-RC] startupTask: state.isRecording flipped false during await — aborting")
+                vlog("[VOICE-RC] startupTask: state.isRecording flipped false during await — aborting")
                 _ = await transcription.stop()
                 return
             }
@@ -327,12 +338,12 @@ class RecordingCoordinator {
                 do {
                     try await audioCapture.startSystemAudioCapture { _ in }
                 } catch {
-                    print("[VOICE-RC] System audio capture ERROR: \(error.localizedDescription)")
+                    vlog("[VOICE-RC] System audio capture ERROR: \(error.localizedDescription)")
                     _ = await self.stopRecording()
                 }
             }
         }
-        print("[VOICE-RC] startRecording() EXIT at \(Date()) — isRecording=\(state.isRecording) (elapsed \(Int(Date().timeIntervalSince(enterTime) * 1000))ms)")
+        vlog("[VOICE-RC] startRecording() EXIT at \(Date()) — isRecording=\(state.isRecording) (elapsed \(Int(Date().timeIntervalSince(enterTime) * 1000))ms)")
     }
 
     // MARK: - Sync claim (fixes the re-press race)
@@ -362,11 +373,11 @@ class RecordingCoordinator {
     /// Returns nil when no recording is active (nothing to claim).
     func claimRecordingSync() -> ClaimedRecording? {
         guard state.isRecording else {
-            print("[VOICE-RC] claimRecordingSync: not recording — nothing to claim")
+            vlog("[VOICE-RC] claimRecordingSync: not recording — nothing to claim")
             return nil
         }
         let tag = sessTag(currentSessionId)
-        print("[VOICE-RC] \(tag) phase=claim-begin")
+        vlog("[VOICE-RC] \(tag) phase=claim-begin")
 
         // Stop audio capture synchronously. This is safe to call here because
         // startRecording() already has a `guard !state.isRecording` guard, so
@@ -376,12 +387,21 @@ class RecordingCoordinator {
         // shared AVAudioInputNode immediately. A re-press that lands in the
         // next runloop iteration can call startRecording() and spin a fresh
         // engine without waiting for this session's transcribe to complete.
+        //
+        // LATENCY: this is a SYNCHRONOUS main-actor call at hotkey-release.
+        // AVAudioEngine.stop() can briefly block; this log surfaces how much
+        // of the release-to-paste budget is spent tearing the engine down. We
+        // keep it synchronous on purpose — the race fix depends on the engine
+        // being released before the next startRecording() can run.
+        let tStopCapture = CFAbsoluteTimeGetCurrent()
         audioCapture.stopCapture()
+        let stopCaptureMs = (CFAbsoluteTimeGetCurrent() - tStopCapture) * 1000
+        fputs("[LATENCY] claim: AVAudioEngine teardown (sync, on release): \(Int(stopCaptureMs))ms\n", stderr)
 
         elapsedTimer?.invalidate(); elapsedTimer = nil
         levelsTimer?.invalidate();  levelsTimer = nil
 
-        print("[VOICE-RC] claimRecordingSync: isRecording true → false")
+        vlog("[VOICE-RC] claimRecordingSync: isRecording true → false")
         state.isRecording = false
         state.isPaused = false
 
@@ -394,7 +414,7 @@ class RecordingCoordinator {
         currentSessionId    = nil
         startupTask         = nil
 
-        print("[VOICE-RC] \(sessTag(sid)) phase=claim-done — engine released, transcribe path can run concurrently with next recording")
+        vlog("[VOICE-RC] \(sessTag(sid)) phase=claim-done — engine released, transcribe path can run concurrently with next recording")
         return ClaimedRecording(
             audioURL:           url,
             sessionId:          sid,
@@ -413,8 +433,8 @@ class RecordingCoordinator {
     @discardableResult
     func stopRecording(claiming: ClaimedRecording? = nil) async -> [TranscriptSegment] {
         let enterTag = sessTag(claiming?.sessionId ?? currentSessionId)
-        print("[VOICE-RC] \(enterTag) phase=stop-enter isRecording=\(state.isRecording) claiming=\(claiming != nil)")
-        print("[VOICE-TIMING] stopRecording entered at \(Date())")
+        vlog("[VOICE-RC] \(enterTag) phase=stop-enter isRecording=\(state.isRecording) claiming=\(claiming != nil)")
+        vlog("[VOICE-TIMING] stopRecording entered at \(Date())")
 
         // Per-stage timing for the [VOICE TIMINGS] greppable summary printed
         // at the end of this method. nil = stage didn't run / didn't land.
@@ -424,9 +444,6 @@ class RecordingCoordinator {
         let tCaptureStart: Date
         var tCaptureEnd:    Date? = nil
         var tParakeetDone:  Date? = nil
-        var tGraniteDone:   Date? = nil
-        var tMoonshineDone: Date? = nil
-        var tExtraWaitDone: Date? = nil
         let mySessionId = currentRecordingSessionId  // for log parity
 
         if let ctx = claiming {
@@ -444,7 +461,7 @@ class RecordingCoordinator {
         } else {
             // === Normal path ===
             guard state.isRecording else {
-                print("[VOICE-RC] stopRecording() EARLY-EXIT — not recording (returning \(state.currentTranscript.count) cached segments)")
+                vlog("[VOICE-RC] stopRecording() EARLY-EXIT — not recording (returning \(state.currentTranscript.count) cached segments)")
                 return state.currentTranscript
             }
 
@@ -467,7 +484,7 @@ class RecordingCoordinator {
             }
             startupTask = nil
 
-            print("[VOICE-RC] isRecording: true → false at \(Date())")
+            vlog("[VOICE-RC] isRecording: true → false at \(Date())")
             state.isRecording = false
             state.isPaused = false
             elapsedTimer?.invalidate()
@@ -475,7 +492,7 @@ class RecordingCoordinator {
             levelsTimer?.invalidate()
             levelsTimer = nil
             // Stop the audio engine.
-            print("[VOICE-RC] AVAudioEngine.stop at \(Date())")
+            vlog("[VOICE-RC] AVAudioEngine.stop at \(Date())")
             audioCapture.stopCapture()
         }
 
@@ -485,26 +502,40 @@ class RecordingCoordinator {
         // with the I/O thread — tap buffers may still land for a short
         // window. Rather than paying a flat 200ms tax on every dictation,
         // poll `audioFileBytesWritten` until it goes quiet for two
-        // consecutive samples (or the safety cap fires). On a quiet
-        // system this typically completes in <30ms; the cap is 250ms.
+        // consecutive samples (or the safety cap fires).
+        //
+        // LATENCY: in the CLAIMED path (every real dictation), stopCapture()
+        // already ran synchronously inside claimRecordingSync() — typically
+        // several ms before this Task body executes — so the I/O thread is
+        // usually already quiet by the time we get here. We sample bytes
+        // ONCE up front and, if the very next sample after one poll interval
+        // is unchanged, break immediately (1 interval instead of a fixed 2).
+        // Poll interval tightened 15ms → 8ms; the 2-stable-sample guarantee
+        // is preserved for the rare case where a buffer is still in flight,
+        // so the audio tail is never clipped. Floor drops ~30ms → ~8ms.
         do {
-            let pollIntervalNs: UInt64 = 15_000_000   // 15ms
-            let maxWaitNs: UInt64 = 250_000_000       // 250ms safety cap
+            let drainStart = CFAbsoluteTimeGetCurrent()
+            let pollIntervalNs: UInt64 = 8_000_000    // 8ms (was 15ms)
+            let maxWaitNs: UInt64 = 80_000_000        // 80ms safety cap (trailing pad reduced — long tail unnecessary)
             let stableNeeded = 2                      // consecutive stable samples
             let start = DispatchTime.now().uptimeNanoseconds
             var lastBytes: Int64 = audioCapture.audioFileBytesWritten
-            var stableCount = 0
+            var stableCount = 1                       // count the up-front sample
+            var iterations = 0
             while DispatchTime.now().uptimeNanoseconds &- start < maxWaitNs {
                 try? await Task.sleep(nanoseconds: pollIntervalNs)
+                iterations += 1
                 let now = audioCapture.audioFileBytesWritten
                 if now == lastBytes {
                     stableCount += 1
                     if stableCount >= stableNeeded { break }
                 } else {
-                    stableCount = 0
+                    stableCount = 1                   // reset, keep counting the new baseline
                     lastBytes = now
                 }
             }
+            let drainMs = (CFAbsoluteTimeGetCurrent() - drainStart) * 1000
+            fputs("[LATENCY] Drain (tap-flush wait): \(Int(drainMs))ms (\(iterations) polls, claimed=\(claiming != nil))\n", stderr)
         }
         audioCapture.stopWritingToFile()
         tCaptureEnd = Date()
@@ -520,7 +551,7 @@ class RecordingCoordinator {
         let entryCounter = currentRecordingSessionId
         let tag = sessTag(sessionId)
         func isStillActive() -> Bool { currentRecordingSessionId == entryCounter }
-        print("[VOICE-RC] \(tag) phase=drain-done counter=\(entryCounter)")
+        vlog("[VOICE-RC] \(tag) phase=drain-done counter=\(entryCounter)")
 
         // Transcribe from the retained audio file — macparakeet approach.
         // The file is fully written and closed by stopWritingToFile() above.
@@ -547,19 +578,8 @@ class RecordingCoordinator {
             if isStillActive() {
                 state.skipPolishForCurrent = willSkipPolish
             }
-            print("[VOICE-RC] \(tag) phase=transcribe-begin file=\(audioURL.lastPathComponent) bytes=\(fileSize) skipPolish=\(willSkipPolish) active=\(isStillActive())")
+            vlog("[VOICE-RC] \(tag) phase=transcribe-begin file=\(audioURL.lastPathComponent) bytes=\(fileSize) skipPolish=\(willSkipPolish) active=\(isStillActive())")
             do {
-                // Run Parakeet v2, Granite 4.0, and Moonshine Tiny in parallel.
-                // transcribe() returns nil immediately if a model is unavailable.
-                //
-                // Wait-for-extras-with-shared-deadline pattern:
-                // - Parakeet is the guaranteed path; always await it fully.
-                // - Granite/Moonshine run as detached Tasks. After Parakeet
-                //   returns, we give BOTH up to 2000ms (shared deadline) to
-                //   complete. As soon as both finish we proceed; whichever
-                //   misses the deadline is treated as nil (but NOT cancelled
-                //   — let it finish in the background so the Python
-                //   subprocess state stays consistent).
                 let asrStart = Date()
                 let fileSegments = try await transcription.transcribeFile(url: audioURL)
                 tParakeetDone = Date()
@@ -573,15 +593,11 @@ class RecordingCoordinator {
                 // (VoiceApp.swift pasteChain).
                 _ = mySessionId  // intentionally unused — kept for log/debug parity
 
-                // Granite + Moonshine subprocess transcribers disabled in this build.
-                tGraniteDone = Date()
-                tMoonshineDone = Date()
-                tExtraWaitDone = Date()
                 let graniteResult: String? = nil
                 let moonshineResult: String? = nil
 
-                print("[VOICE] ASR timings — parakeet: \(parakeetMs)ms (granite/moonshine disabled)")
-                print("[VOICE-RC] \(tag) phase=transcribe-done segments=\(fileSegments.count) active=\(isStillActive())")
+                vlog("[VOICE] ASR timings — parakeet: \(parakeetMs)ms")
+                vlog("[VOICE-RC] \(tag) phase=transcribe-done segments=\(fileSegments.count) active=\(isStillActive())")
                 if !fileSegments.isEmpty {
                     // Mirror to shared state only when our session is still
                     // the active one. Stale (superseded) sessions still
@@ -607,7 +623,7 @@ class RecordingCoordinator {
                         lastDictationAudioURL = audioURL
                     }
                 } else {
-                    print("[VOICE-RC] transcribeFile returned EMPTY result")
+                    vlog("[VOICE-RC] transcribeFile returned EMPTY result")
                     // Empty transcript — KEEP audio on disk so the user
                     // can retry / re-process later. No DB row is written
                     // for the empty case, so the file becomes "orphaned"
@@ -619,7 +635,7 @@ class RecordingCoordinator {
                     )
                 }
             } catch {
-                print("[VOICE-RC] transcribeFile FAILED: \(error.localizedDescription)")
+                vlog("[VOICE-RC] transcribeFile FAILED: \(error.localizedDescription)")
                 // KEEP audio on disk so the user can retry. Size-pruner
                 // will eventually reap it if nothing else does.
                 NotificationCenter.default.post(
@@ -631,7 +647,7 @@ class RecordingCoordinator {
         } else {
             let exists = audioURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
             let size = audioURL.flatMap { (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0 } ?? 0
-            print("[VOICE-RC] No audio to transcribe — url=\(audioURL?.lastPathComponent ?? "nil") exists=\(exists) size=\(size)")
+            vlog("[VOICE-RC] No audio to transcribe — url=\(audioURL?.lastPathComponent ?? "nil") exists=\(exists) size=\(size)")
             // Too-small clip (sub-300ms). Drop it — there's no meaningful
             // audio to preserve, and these add up fast on accidental taps.
             if let audioURL, exists {
@@ -643,7 +659,7 @@ class RecordingCoordinator {
                 userInfo: ["message": "Didn't catch that — hold to record"]
             )
         }
-        print("[VOICE-RC] \(tag) phase=stopRecording-exit segments=\(segments.count) active=\(isStillActive())")
+        vlog("[VOICE-RC] \(tag) phase=stopRecording-exit segments=\(segments.count) active=\(isStillActive())")
 
         // Replace any partial-derived segments with the engine's final view.
         // Only mirror to shared state when our session is still the active
@@ -664,19 +680,23 @@ class RecordingCoordinator {
                   FileManager.default.fileExists(atPath: url.path) else { return nil }
             return url.path
         }()
+        // BUGFIX (double-paste race): persist THIS session's own `segments`,
+        // not the shared `state.currentTranscript`. For a superseded session
+        // the shared field holds a newer recording's text — saving that under
+        // this session's `sessionId` would mislabel the Meeting row.
         let meeting = Meeting(
             id: sessionId,
             title: generateMeetingTitle(),
             date: tCaptureStart,
             duration: TimeInterval(state.elapsedSeconds),
-            segments: state.currentTranscript,
+            segments: segments,
             audioFilePath: audioFilePathToSave
         )
 
         do {
             try storage.saveMeeting(meeting)
         } catch {
-            print("[VOICE] Storage error: \(error.localizedDescription)")
+            vlog("[VOICE] Storage error: \(error.localizedDescription)")
         }
 
         // Structured per-stage timing summary (greppable: [VOICE TIMINGS]).
@@ -686,15 +706,31 @@ class RecordingCoordinator {
             guard let a, let b else { return "—" }
             return "\(Int(b.timeIntervalSince(a) * 1000))ms"
         }
-        let captureMs    = ms(tCaptureStart, tCaptureEnd)
-        let parakeetMs2  = ms(tCaptureEnd, tParakeetDone)
-        let graniteMs2   = ms(tParakeetDone, tGraniteDone)
-        let moonshineMs2 = ms(tParakeetDone, tMoonshineDone)
-        let extraMs2     = ms(tParakeetDone, tExtraWaitDone)
-        let totalMs      = Int(Date().timeIntervalSince(tCaptureStart) * 1000)
-        print("[VOICE TIMINGS] capture: \(captureMs) | parakeet: \(parakeetMs2) | granite: \(graniteMs2) | moonshine: \(moonshineMs2) | extraWait: \(extraMs2) | TOTAL: \(totalMs)ms")
+        let captureMs   = ms(tCaptureStart, tCaptureEnd)
+        let parakeetMs2 = ms(tCaptureEnd, tParakeetDone)
+        let totalMs     = Int(Date().timeIntervalSince(tCaptureStart) * 1000)
+        vlog("[VOICE TIMINGS] capture: \(captureMs) | parakeet: \(parakeetMs2) | TOTAL: \(totalMs)ms")
 
-        return state.currentTranscript
+        // BUGFIX (double-paste race — root cause): return THIS session's own
+        // locally-transcribed `segments`, NOT the shared `state.currentTranscript`.
+        //
+        // The double-paste: with recordings A then B overlapping, A's finish
+        // task can pass VoiceApp's session guard (its body started before B's
+        // press) and then call stopRecording(claiming: A). A transcribes A's
+        // audio into the local `segments`, but if B's stopRecording wrote
+        // `state.currentTranscript = segmentsB` first (B is the active session),
+        // returning the shared field handed A's finish task B's TEXT. A then
+        // pasted B's text and B pasted it again → the same message twice, and
+        // A's real transcript was silently dropped ("forgets the first").
+        //
+        // The local `segments` is always exactly this audio file's transcript,
+        // immune to any concurrent session's state mutation. Shared-state
+        // mirroring above stays gated on isStillActive() for the live UI; the
+        // return value is now decoupled from it.
+        if !isStillActive() {
+            vlog("[VOICE-RACE] stopRecording returning OWN segments for superseded session=\(sessTag(sessionId)) count=\(segments.count) (shared state.currentTranscript belongs to active session — not used)")
+        }
+        return segments
     }
 
     /// Pause/resume recording (keeps audio engine running but stops feeding).
@@ -710,6 +746,11 @@ class RecordingCoordinator {
 
     func searchMeetings(query: String) -> [Meeting] {
         (try? storage.searchTranscripts(query: query)) ?? []
+    }
+
+    /// Persist a Meeting created outside of the coordinator (e.g. from MeetingCaptureService).
+    func saveMeeting(_ meeting: Meeting) throws {
+        try storage.saveMeeting(meeting)
     }
 
     // MARK: - Private
@@ -748,7 +789,7 @@ class RecordingCoordinator {
         if let url = lastDictationAudioURL {
             try? FileManager.default.removeItem(at: url)
             lastDictationAudioURL = nil
-            print("[VOICE-RC] released dictation audio early: \(url.lastPathComponent)")
+            vlog("[VOICE-RC] released dictation audio early: \(url.lastPathComponent)")
         }
     }
 
@@ -902,14 +943,14 @@ class RecordingCoordinator {
         }
 
         if skippedSize + skippedTooBig + quarantinedStale + quarantinedOverflow > 0 {
-            print("[VOICE-RC] orphan recovery: pre-filter skipped=\(skippedSize) too-small, \(skippedTooBig) too-big; quarantined=\(quarantinedStale) stale, \(quarantinedOverflow) overflow")
+            vlog("[VOICE-RC] orphan recovery: pre-filter skipped=\(skippedSize) too-small, \(skippedTooBig) too-big; quarantined=\(quarantinedStale) stale, \(quarantinedOverflow) overflow")
         }
 
         guard !orphans.isEmpty else {
-            print("[VOICE-RC] orphan recovery: none found")
+            vlog("[VOICE-RC] orphan recovery: none found")
             return
         }
-        print("[VOICE-RC] orphan recovery: found \(orphans.count) crashed recording(s) — transcribing")
+        vlog("[VOICE-RC] orphan recovery: found \(orphans.count) crashed recording(s) — transcribing")
 
         for url in orphans {
             // Defer per-file when the user starts using the app.
@@ -936,9 +977,9 @@ class RecordingCoordinator {
                         .appendingPathComponent("quarantine", isDirectory: true)
                         .appendingPathComponent("empty", isDirectory: true)
                     if moveToQuarantine(url, dest: emptyDir) {
-                        print("[VOICE-RC] orphan recovery: \(url.lastPathComponent) → empty transcript, moved to quarantine/empty/")
+                        vlog("[VOICE-RC] orphan recovery: \(url.lastPathComponent) → empty transcript, moved to quarantine/empty/")
                     } else {
-                        print("[VOICE-RC] orphan recovery: \(url.lastPathComponent) → empty transcript, quarantine move FAILED")
+                        vlog("[VOICE-RC] orphan recovery: \(url.lastPathComponent) → empty transcript, quarantine move FAILED")
                     }
                     continue
                 }
@@ -956,12 +997,12 @@ class RecordingCoordinator {
                     audioFilePath: url.path
                 )
                 try storage.saveMeeting(meeting)
-                print("[VOICE-RC] orphan recovery: saved \(url.lastPathComponent) → '\(title)' (\(segments.count) segments)")
+                vlog("[VOICE-RC] orphan recovery: saved \(url.lastPathComponent) → '\(title)' (\(segments.count) segments)")
             } catch {
-                print("[VOICE-RC] orphan recovery: \(url.lastPathComponent) FAILED: \(error.localizedDescription) — leaving on disk")
+                vlog("[VOICE-RC] orphan recovery: \(url.lastPathComponent) FAILED: \(error.localizedDescription) — leaving on disk")
             }
         }
-        print("[VOICE-RC] orphan recovery: pass complete")
+        vlog("[VOICE-RC] orphan recovery: pass complete")
     }
 
     /// Move `url` into `dest`, creating `dest` if needed. On filename
@@ -973,7 +1014,7 @@ class RecordingCoordinator {
         do {
             try fm.createDirectory(at: dest, withIntermediateDirectories: true)
         } catch {
-            print("[VOICE-RC] quarantine: mkdir failed for \(dest.path): \(error.localizedDescription)")
+            vlog("[VOICE-RC] quarantine: mkdir failed for \(dest.path): \(error.localizedDescription)")
             return false
         }
         var target = dest.appendingPathComponent(url.lastPathComponent)
@@ -990,7 +1031,7 @@ class RecordingCoordinator {
             try fm.moveItem(at: url, to: target)
             return true
         } catch {
-            print("[VOICE-RC] quarantine: move \(url.lastPathComponent) → \(target.path) failed: \(error.localizedDescription)")
+            vlog("[VOICE-RC] quarantine: move \(url.lastPathComponent) → \(target.path) failed: \(error.localizedDescription)")
             return false
         }
     }
@@ -1016,7 +1057,7 @@ class RecordingCoordinator {
         // Models must be loaded for this to work. If not ready, fail silently —
         // the final batch transcription is unaffected.
         guard let models = transcription.asrModels else {
-            print("[VOICE-LP] startLivePartials: asrModels not available, skipping live preview")
+            vlog("[VOICE-LP] startLivePartials: asrModels not available, skipping live preview")
             return
         }
 
@@ -1042,13 +1083,13 @@ class RecordingCoordinator {
                         vocabulary: CombinedDictionary.vocabularyContext(),
                         ctcModels: ctcModels
                     )
-                    print("[VOICE-LP] vocabulary boosting configured (\(CombinedDictionary.terms().count) terms)")
+                    vlog("[VOICE-LP] vocabulary boosting configured (\(CombinedDictionary.terms().count) terms)")
                 } catch {
-                    print("[VOICE-LP] vocabulary boosting unavailable: \(error.localizedDescription)")
+                    vlog("[VOICE-LP] vocabulary boosting unavailable: \(error.localizedDescription)")
                 }
                 try await manager.startStreaming(source: .microphone)
             } catch {
-                print("[VOICE-LP] Failed to start sliding window: \(error.localizedDescription)")
+                vlog("[VOICE-LP] Failed to start sliding window: \(error.localizedDescription)")
                 return
             }
 
@@ -1075,7 +1116,7 @@ class RecordingCoordinator {
             Task { await manager.streamAudio(pcmBuffer) }
         }
 
-        print("[VOICE-LP] Live partials started")
+        vlog("[VOICE-LP] Live partials started")
     }
 
     /// Stop the sliding-window live preview and clear partial text.
@@ -1093,6 +1134,6 @@ class RecordingCoordinator {
         state.livePartialText = ""
         state.livePartialIsVolatile = true
 
-        print("[VOICE-LP] Live partials stopped")
+        vlog("[VOICE-LP] Live partials stopped")
     }
 }

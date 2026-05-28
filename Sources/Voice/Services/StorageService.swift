@@ -180,6 +180,38 @@ class StorageService {
             }
         }
 
+        // -------- v5: participantNames + speakerEventsJson --------
+        // We use raw ALTER TABLE statements wrapped in try/catch so this
+        // migration is idempotent on databases that may have had the
+        // columns added out-of-band (e.g. by an earlier development build).
+        // GRDB's `db.alter { t.add(...) }` would fail loudly if the column
+        // already exists; raw SQL gives us the duplicate-column escape.
+        migrator.registerMigration("v5_meeting_participants_and_events") { db in
+            do {
+                try db.execute(sql: "ALTER TABLE meetings ADD COLUMN participantNamesJson TEXT")
+            } catch {
+                // Already added — safe to ignore.
+            }
+            do {
+                try db.execute(sql: "ALTER TABLE meetings ADD COLUMN speakerEventsJson TEXT")
+            } catch {
+                // Already added — safe to ignore.
+            }
+        }
+
+        // -------- v6: sourceApp persistence --------
+        // Used by the dedup heuristic (rows within 30s of each other sharing
+        // the same sourceApp are the same meeting captured twice) and by the
+        // UI to show a friendly app label ("Meet", "Zoom", …) on the row.
+        // Same idempotent ALTER pattern as v5.
+        migrator.registerMigration("v6_meeting_source_app") { db in
+            do {
+                try db.execute(sql: "ALTER TABLE meetings ADD COLUMN sourceApp TEXT")
+            } catch {
+                // Already added — safe to ignore.
+            }
+        }
+
         try migrator.migrate(db)
     }
 
@@ -272,21 +304,98 @@ class StorageService {
 
     /// Insert or replace a meeting plus all of its segments and summary.
     /// Atomic: a failure on any row rolls back the whole save.
+    ///
+    /// DEDUP at save time (added to fight the "two rows for the same call"
+    /// bug from stop/start races and bridge double-fires):
+    ///   - If another meeting row already references this exact audioFilePath
+    ///     under a DIFFERENT id, we adopt that row's id so this save updates
+    ///     instead of inserting a sibling. The other row is left alone (we
+    ///     can't merge segments here without re-querying — the launch-time
+    ///     dedupeMeetings() handles full merges).
+    ///   - If another meeting was saved within 30s of this one with the same
+    ///     sourceApp, that's a near-certain double-fire — same adoption logic.
+    /// Both rules NO-OP when there's no match. Both log under [VOICE-DEDUP].
     func saveMeeting(_ meeting: Meeting) throws {
         guard let db = dbPool else { return }
 
+        // Resolve the id we'll actually write under. Defaults to the incoming
+        // id; gets overwritten if a duplicate row is detected. Outside the
+        // write block because the read can use a read connection.
+        var writeId = meeting.id
+
+        do {
+            try db.read { db in
+                // Rule 1: same audioFilePath under a different id.
+                if let path = meeting.audioFilePath, !path.isEmpty {
+                    if let existingId = try String.fetchOne(
+                        db,
+                        sql: "SELECT id FROM meetings WHERE audioFilePath = ? AND id != ? LIMIT 1",
+                        arguments: [path, meeting.id.uuidString]
+                    ), let uuid = UUID(uuidString: existingId) {
+                        print("[VOICE-DEDUP] save: collapsing \(meeting.id) into \(existingId) (reason: shared audioFilePath \(path))")
+                        writeId = uuid
+                        return
+                    }
+                }
+
+                // Rule 2: another meeting saved within 30s with same sourceApp.
+                // SourceApp must be non-empty for the rule to fire — otherwise
+                // unrelated quick-tap dictations from the same minute would
+                // get glued together.
+                if let app = meeting.sourceApp, !app.isEmpty {
+                    let windowStart = meeting.date.addingTimeInterval(-30)
+                    let windowEnd = meeting.date.addingTimeInterval(30)
+                    if let existingId = try String.fetchOne(
+                        db,
+                        sql: """
+                        SELECT id FROM meetings
+                        WHERE sourceApp = ?
+                          AND id != ?
+                          AND date >= ?
+                          AND date <= ?
+                        ORDER BY ABS(STRFTIME('%s', date) - STRFTIME('%s', ?)) ASC
+                        LIMIT 1
+                        """,
+                        arguments: [
+                            app,
+                            meeting.id.uuidString,
+                            windowStart,
+                            windowEnd,
+                            meeting.date
+                        ]
+                    ), let uuid = UUID(uuidString: existingId) {
+                        print("[VOICE-DEDUP] save: collapsing \(meeting.id) into \(existingId) (reason: <30s gap with same sourceApp=\(app))")
+                        writeId = uuid
+                    }
+                }
+            }
+        } catch {
+            // A read failure here is non-fatal — we just lose the dedup
+            // benefit for this save and proceed with the original id.
+            print("[VOICE-DEDUP] save: lookup failed, proceeding without dedup: \(error)")
+        }
+
         try db.write { db in
             let tagsJson = (try? String(data: JSONEncoder().encode(meeting.tags), encoding: .utf8)) ?? "[]"
+            // v5: JSON-encode participant names. Empty list serializes as
+            // "[]" so the column is never NULL on writes from this code
+            // path (older rows may still be NULL — the fetch side handles
+            // that with a `decodeIfPresent`-style fallback).
+            let participantNamesJson = (try? String(
+                data: JSONEncoder().encode(meeting.participantNames),
+                encoding: .utf8
+            )) ?? "[]"
 
             try db.execute(
                 sql: """
                 INSERT OR REPLACE INTO meetings
                     (id, title, date, duration, audioFilePath,
-                     kind, markdownExportPath, tagsJson, pinnedNote)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     kind, markdownExportPath, tagsJson, pinnedNote,
+                     participantNamesJson, speakerEventsJson, sourceApp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 arguments: [
-                    meeting.id.uuidString,
+                    writeId.uuidString,
                     meeting.title,
                     meeting.date,
                     meeting.duration,
@@ -294,9 +403,28 @@ class StorageService {
                     meeting.kind.rawValue,
                     meeting.markdownExportPath,
                     tagsJson,
-                    meeting.pinnedNote
+                    meeting.pinnedNote,
+                    participantNamesJson,
+                    meeting.speakerEventsJson,
+                    meeting.sourceApp
                 ]
             )
+
+            // Segments + summary write under the resolved writeId (which
+            // equals meeting.id unless dedup folded this save into an
+            // existing row). When dedup fired, we DELETE the prior
+            // segments/summary for that id first so the row reflects the
+            // freshly-arrived state instead of accumulating stale rows.
+            if writeId != meeting.id {
+                try db.execute(
+                    sql: "DELETE FROM segments WHERE meetingId = ?",
+                    arguments: [writeId.uuidString]
+                )
+                try db.execute(
+                    sql: "DELETE FROM summaries WHERE meetingId = ?",
+                    arguments: [writeId.uuidString]
+                )
+            }
 
             for segment in meeting.segments {
                 try db.execute(
@@ -308,7 +436,7 @@ class StorageService {
                     """,
                     arguments: [
                         segment.id.uuidString,
-                        meeting.id.uuidString,
+                        writeId.uuidString,
                         segment.speaker,
                         segment.text,
                         segment.startTime,
@@ -334,7 +462,7 @@ class StorageService {
                     """,
                     arguments: [
                         UUID().uuidString,
-                        meeting.id.uuidString,
+                        writeId.uuidString,
                         summary.overview,
                         String(data: decisionsJson, encoding: .utf8),
                         String(data: actionsJson, encoding: .utf8),
@@ -395,6 +523,17 @@ class StorageService {
             if let path = audioPath, !path.isEmpty {
                 try? FileManager.default.removeItem(atPath: path)
             }
+        }
+    }
+
+    /// Delete a meeting row (and its segments/summary via cascade) WITHOUT
+    /// touching the audio file on disk. Used by the dedup pass when two
+    /// rows share a WAV: only one row should disappear, the file stays
+    /// because the winner row still references it.
+    func deleteMeetingRowKeepingAudio(id: UUID) throws {
+        guard let db = dbPool else { return }
+        try db.write { db in
+            try db.execute(sql: "DELETE FROM meetings WHERE id = ?", arguments: [id.uuidString])
         }
     }
 
@@ -715,6 +854,7 @@ class StorageService {
         let summary = try fetchSummary(for: meetingId, in: db)
         let tags = decodeTags(row["tagsJson"] as String?)
         let kind = MeetingKind(rawValue: (row["kind"] as String?) ?? "") ?? .meeting
+        let participantNames = decodeStringArray(row["participantNamesJson"] as String?)
 
         return Meeting(
             id: UUID(uuidString: meetingId) ?? UUID(),
@@ -727,7 +867,10 @@ class StorageService {
             kind: kind,
             markdownExportPath: row["markdownExportPath"],
             tags: tags,
-            pinnedNote: row["pinnedNote"]
+            pinnedNote: row["pinnedNote"],
+            sourceApp: row["sourceApp"] as String?,
+            participantNames: participantNames,
+            speakerEventsJson: row["speakerEventsJson"] as String?
         )
     }
 
@@ -737,6 +880,7 @@ class StorageService {
         let meetingId = row["id"] as String
         let tags = decodeTags(row["tagsJson"] as String?)
         let kind = MeetingKind(rawValue: (row["kind"] as String?) ?? "") ?? .meeting
+        let participantNames = decodeStringArray(row["participantNamesJson"] as String?)
 
         return Meeting(
             id: UUID(uuidString: meetingId) ?? UUID(),
@@ -749,11 +893,21 @@ class StorageService {
             kind: kind,
             markdownExportPath: row["markdownExportPath"],
             tags: tags,
-            pinnedNote: row["pinnedNote"]
+            pinnedNote: row["pinnedNote"],
+            sourceApp: row["sourceApp"] as String?,
+            participantNames: participantNames,
+            speakerEventsJson: row["speakerEventsJson"] as String?
         )
     }
 
     private func decodeTags(_ json: String?) -> [String] {
+        guard let json, !json.isEmpty else { return [] }
+        return (try? JSONDecoder().decode([String].self, from: Data(json.utf8))) ?? []
+    }
+
+    /// Decode a JSON-encoded `[String]` column. Returns `[]` for nil, empty,
+    /// or unparseable values so pre-v5 rows continue to load cleanly.
+    private func decodeStringArray(_ json: String?) -> [String] {
         guard let json, !json.isEmpty else { return [] }
         return (try? JSONDecoder().decode([String].self, from: Data(json.utf8))) ?? []
     }

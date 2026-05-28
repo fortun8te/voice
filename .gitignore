@@ -1,5 +1,6 @@
 .DS_Store
 /.build
+/build
 /Packages
 xcuserdata/
 DerivedData/
@@ -10,3 +11,6 @@ DerivedData/
 # Secrets — never commit.
 Sources/Voice/Services/CerebrasKey.swift
 harness-results.txt
+
+# Local bench helper — contains a hardcoded API key, do not commit.
+Tests/bench_cloud_vs_local.py

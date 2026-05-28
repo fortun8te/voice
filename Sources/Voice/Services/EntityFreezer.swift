@@ -24,6 +24,32 @@ import Foundation
 
 public enum EntityFreezer {
 
+    /// How aggressively to freeze fragile spans.
+    ///
+    /// `.aggressive` (legacy): freezes everything we have a pattern for —
+    /// emails, URLs, domains, backtick spans, file paths, AND contractions.
+    /// Designed for small local models (Qwen3 1.7B, Apple FM) that mangle
+    /// these spans during polish.
+    ///
+    /// `.minimal` (cloud path): freezes ONLY the truly fragile spans the
+    /// cloud model gains nothing from re-formatting — emails, URLs, domains,
+    /// backtick code, and file paths. Contractions are left in the open
+    /// text because the cloud model handles them fine AND benefits from
+    /// seeing them in context (it can decide "let's" vs "lets" from
+    /// surrounding tense). Names, dates, times, money, percentages, and
+    /// numbers in general were never frozen by this class but the docstring
+    /// here is the authoritative place to record that intent: in `.minimal`
+    /// mode we keep that hands-off stance.
+    public enum Mode {
+        case aggressive
+        case minimal
+        /// Don't freeze anything. Used by the raw cloud path — the cloud
+        /// model is trusted to handle emails, URLs, code, contractions, and
+        /// every other fragile span natively. Returns an empty entity map,
+        /// so the corresponding `unfreeze` is a no-op.
+        case skip
+    }
+
     /// Result of freezing: the modified text plus the map needed to restore
     /// the original spans.
     public struct Frozen {
@@ -58,16 +84,33 @@ public enum EntityFreezer {
         ("contraction", #"\b[A-Za-z]+'[A-Za-z]+\b"#),
     ]
 
+    /// Pattern names that are SAFE to freeze even on the cloud path.
+    /// Anything not in this set is skipped when mode is `.minimal`.
+    private static let minimalModePatterns: Set<String> = [
+        "email", "url", "domain", "backtick", "path"
+    ]
+
     /// Freeze fragile spans. Returns the frozen text and a map for
     /// unfreezing. Iterates patterns in priority order; later patterns
     /// won't re-match content already replaced with a sentinel because
     /// sentinels contain `⟦` and `⟧`, which none of the patterns match.
-    public static func freeze(_ input: String) -> Frozen {
+    ///
+    /// `mode` controls how much we freeze. Cloud callers should pass
+    /// `.minimal` so the model sees natural contractions in context.
+    public static func freeze(_ input: String, mode: Mode = .aggressive) -> Frozen {
+        // .skip short-circuits: no freezing, no entity map. The cloud path
+        // uses this so the model sees emails/URLs/code/contractions in their
+        // natural surrounding context, and reasons about them as a smart
+        // editor would, rather than ingesting opaque sentinel tokens.
+        if mode == .skip {
+            return Frozen(text: input, entities: [:])
+        }
         var working = input
         var entities: [String: String] = [:]
         var counter = 0
 
-        for (_, pattern) in patterns {
+        for (name, pattern) in patterns {
+            if mode == .minimal, !minimalModePatterns.contains(name) { continue }
             guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
             let ns = working as NSString
             let range = NSRange(location: 0, length: ns.length)
@@ -122,9 +165,10 @@ public enum EntityFreezer {
     /// polished version (which should preserve sentinel tokens verbatim).
     public static func roundTrip(
         _ input: String,
+        mode: Mode = .aggressive,
         transform: (String) async -> String
     ) async -> String {
-        let frozen = freeze(input)
+        let frozen = freeze(input, mode: mode)
         if frozen.isEmpty {
             return await transform(input)
         }

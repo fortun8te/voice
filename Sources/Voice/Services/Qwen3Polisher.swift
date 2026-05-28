@@ -43,11 +43,66 @@ final class Qwen3Polisher {
     // assumes "ready means ready forever".
     static let shared = Qwen3Polisher()
 
+    // MARK: - Hoisted regexes (precompiled, were recompiled per polish call)
+
+    // Hoisted from hot path — was recompiled per polish call.
+    nonisolated static let contractionBudgetRegex: NSRegularExpression? = {
+        let p = #"\b(don't|can't|won't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|doesn't|didn't|shouldn't|wouldn't|couldn't|i'm|i've|i'd|i'll|you're|you've|you'd|you'll|we're|we've|we'd|we'll|they're|they've|they'd|they'll|he's|she's|it's|that's|what's|let's|here's|there's)\b"#
+        return try? NSRegularExpression(pattern: p, options: .caseInsensitive)
+    }()
+
+    // Hoisted from hot path — was recompiled per polish call.
+    nonisolated static let fillerTokenRegexes: [NSRegularExpression] = {
+        let tokens = ["you know", "like", "basically", "literally", "actually",
+                      "um", "uh", "i mean", "kind of", "sort of"]
+        return tokens.compactMap { f in
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: f) + "\\b"
+            return try? NSRegularExpression(pattern: pattern)
+        }
+    }()
+
+    // Hoisted from hot path — was recompiled per polish call.
+    nonisolated static let correctionMarkerRegexes: [NSRegularExpression] = {
+        let markers = ["no wait", "scratch that", "never mind", "nevermind",
+                       "no actually", "actually no", "wait no", "i mean",
+                       "let me rephrase", "start over", "forget that", "forget it",
+                       "rather", "or rather", "i meant"]
+        return markers.compactMap { m in
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: m) + "\\b"
+            return try? NSRegularExpression(pattern: pattern)
+        }
+    }()
+
+    // Hoisted from hot path — was recompiled per polish call.
+    nonisolated static let topicShiftRegexes: [NSRegularExpression] = {
+        let markers = ["also", "and then", "oh and", "then go", "and message",
+                       "next thing", "next up", "and finally", "and also"]
+        return markers.compactMap { m in
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: m) + "\\b"
+            return try? NSRegularExpression(pattern: pattern)
+        }
+    }()
+
+    // Hoisted from hot path — was recompiled per polish call.
+    nonisolated static let listTriggerRegexes: [NSRegularExpression] = {
+        let triggers = ["first", "second", "third", "fourth", "fifth",
+                        "point one", "point two", "point three",
+                        "number one", "number two", "number three",
+                        "step one", "step two", "step three",
+                        "action item", "action items",
+                        "bullet point"]
+        return triggers.compactMap { t in
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: t) + "\\b"
+            return try? NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+        }
+    }()
+
     /// Known product/brand names — injected into every polish prompt so the
     /// model preserves them verbatim instead of "correcting" them. Add new
     /// entries here whenever a user-reported brand gets mangled by the
     /// polish pass.
     nonisolated static let knownProductNames: [String] = [
+        // Apps & services (high-frequency dictation targets)
         "Wispr Flow", "Whisper", "Parakeet", "Moonshine", "Granite",
         "ChatGPT", "Claude", "Anthropic", "OpenAI", "Gemini",
         "VOICE", "macOS", "iOS", "iPhone", "iPad",
@@ -55,6 +110,17 @@ final class Qwen3Polisher {
         "GitHub", "Figma", "Slack", "Notion", "Linear",
         "VS Code", "Cursor", "Warp", "Arc",
         "AirPods", "MacBook",
+        // LLM / AI ecosystem — commonly mangled by ASR
+        // Tier 1: highest misrecognition risk (Qwen→"coin", LoRA→"Laura", Groq→"grow")
+        "Qwen", "LoRA", "QLoRA", "Groq", "vLLM", "GGUF", "GGML", "xAI",
+        // Tier 2: model families & training terms
+        "Mixtral", "Mistral", "DeepSeek", "llama.cpp", "GPTQ", "AWQ",
+        "exllamav2", "Vicuna", "InternLM", "RLHF", "SFT", "TTFT",
+        "Yi", "Baichuan", "Phi", "Gemma", "Falcon", "Grok",
+        // Tier 3: tooling & concepts
+        "Ollama", "LM Studio", "HuggingFace", "Hugging Face",
+        "Windsurf", "Aider", "Anyscale", "Replicate",
+        "top-p", "top-k", "logprobs", "TPS", "RAG",
     ]
 
     /// Hugging Face id for the 4-bit Qwen3-1.7B build. ~970MB on disk.
@@ -68,6 +134,26 @@ final class Qwen3Polisher {
     /// model under-restructures or fails to follow nested formatting rules.
     /// Loaded lazily behind the small model so first launch isn't blocked.
     private static let largeModelID = "mlx-community/Qwen3-4B-Instruct-2507-4bit-DWQ-2510"
+
+    /// Set to false to disable the 4B local model entirely. Anything that
+    /// would have routed to 4B now routes to cloud. Local 1.7B handles only
+    /// short/simple polish.
+    ///
+    /// Background: the 4B local path produces 15-20s latency outliers on
+    /// machines where MLX can't keep its weights warm. Cloud (Cerebras gpt-oss-120b
+    /// @ ~3000 TPS, ~200ms) is consistently faster and higher quality. We keep
+    /// the 4B *code* in place (no deletion) so the path can be re-enabled if
+    /// the local inference story changes; the flag short-circuits every entry
+    /// point that would otherwise load weights or dispatch inference.
+    ///
+    /// Re-enabled (May 2026): the 1.7B produces garbage on long structured
+    /// inputs (>40 words, lists, restarts). When Cerebras 429s during free-tier
+    /// congestion the 1.7B fallback is unusable. The 4B is reinstated as a
+    /// middle tier: lazy-loaded on first long-input local polish (NOT prewarmed
+    /// at app launch — too much memory pressure for the common short-polish
+    /// case), idle-unloaded after 5 minutes. The 4B inference can take 5-15s
+    /// on long inputs but produces dramatically better output than the 1.7B.
+    private static let useLargeLocalModel = true
 
     // Reuse the existing PolishContext enum so we don't have to migrate
     // CursorPaster and every other call site.
@@ -144,6 +230,22 @@ final class Qwen3Polisher {
     /// as `loadTask` but for `largeModelID`.
     private var largeLoadTask: Any?  // Task<ModelContainer, Error> when MLX is present
 
+    /// Resolved small-model container. Set once after the first successful
+    /// `ensureModel()` load and reused for every subsequent inference call.
+    /// Storing a direct strong reference eliminates the per-call `await
+    /// task.value` hop AND guarantees the BPETokenizer (which lives inside
+    /// the ModelContainer) is only constructed once per load cycle.
+    /// Niled by `unloadIfIdle()` so the idle-memory-reclaim path still works.
+    #if canImport(MLXLLM) && canImport(MLXLMCommon)
+    private var cachedSmallContainer: ModelContainer?
+    #endif
+
+    /// Resolved large-model container — same caching strategy as
+    /// `cachedSmallContainer` but for the 4B model.
+    #if canImport(MLXLLM) && canImport(MLXLMCommon)
+    private var cachedLargeContainer: ModelContainer?
+    #endif
+
     /// Current download/load status surfaced to UI.
     private(set) var availabilityStatus: AvailabilityStatus = .notDownloaded
 
@@ -203,6 +305,19 @@ final class Qwen3Polisher {
     /// network is offline. Stays `true` until app relaunch.
     private var largeModelLoadFailedThisSession: Bool = false
 
+    /// True iff the most recent local polish actually ran on the 4B model.
+    /// Set by `polishWithMLX` after the routing decision resolves. Callers
+    /// read this AFTER `polishWithMLX` returns to attribute the correct
+    /// `lastEngine` label without having to re-compute the routing rule.
+    /// Reset to false at the top of every `polishWithMLX` call.
+    private(set) var lastUsedLargeLocal: Bool = false
+
+    /// Timestamp of the most recent successful 4B inference. Used by the
+    /// idle-unload watchdog to free the 4B container after 5 minutes of
+    /// inactivity (separate from the global polish-activity stamp so the
+    /// 4B can drop on its own schedule).
+    private var last4BUseTime: Date? = nil
+
     // Latency tracking — same shape as LLMPolisher (BigMenu pill reads these).
     private(set) var lastLatencyMs: Int = 0
     private(set) var avgLatencyMs: Double = 0
@@ -220,6 +335,22 @@ final class Qwen3Polisher {
     private var lastPolishTime: Date? = nil
     private let rollingContextMaxWords = 60
     private let rollingContextExpiry: TimeInterval = 90
+
+    // MARK: - Idle unload
+    /// Timer that periodically checks whether the loaded MLX containers can be
+    /// dropped to free GPU memory. Created lazily by `prewarm()`.
+    private var idleUnloadTimer: Timer?
+    /// After this many seconds of no polish activity we drop the cached model
+    /// containers so MLX can reclaim the memory. Subsequent polish calls will
+    /// re-run `ensureModel` / `ensureLargeModel` and pay a fresh load cost.
+    private let idleUnloadAfter: TimeInterval = 600   // 10 minutes
+    private let idleUnloadCheckInterval: TimeInterval = 60
+    /// 4B-specific idle unload threshold. Shorter than the global 10-min
+    /// because the 4B is ~2.4GB on disk / ~2.8GB resident — significant
+    /// memory pressure on smaller Macs. 5 minutes balances "keep it warm for
+    /// a follow-up long polish" against "free RAM for whatever the user is
+    /// doing in other apps."
+    private let largeIdleUnloadAfter: TimeInterval = 300   // 5 minutes
 
     /// Append the most-recent polished output to the rolling context buffer.
     /// Call after a successful paste so the next dictation sees it.
@@ -258,6 +389,82 @@ final class Qwen3Polisher {
         avgLatencyMs = avgLatencyMs + (Double(ms) - avgLatencyMs) / Double(sampleCount)
     }
 
+    // MARK: - Idle unload watchdog
+
+    /// Install the once-per-minute timer that checks if we've been idle long
+    /// enough to drop the model containers. Idempotent — safe to call more
+    /// than once; only the first call wires the timer.
+    private func startIdleUnloadWatchdogIfNeeded() {
+        guard idleUnloadTimer == nil else { return }
+        idleUnloadTimer = Timer.scheduledTimer(
+            withTimeInterval: idleUnloadCheckInterval,
+            repeats: true
+        ) { [weak self] _ in
+            // Timer fires on the main run loop; class is @MainActor so hop
+            // explicitly to satisfy the isolation checker.
+            Task { @MainActor [weak self] in
+                self?.unloadIfIdle()
+            }
+        }
+    }
+
+    /// If no polish has run in `idleUnloadAfter` seconds, drop both cached
+    /// model load tasks. MLX's `ModelContainer` is reference-counted so
+    /// niling our last strong refs lets it deallocate and return GPU memory
+    /// to the system. Next `ensureModel()` / `ensureLargeModel()` call will
+    /// re-kick a fresh load — that path is already idempotent.
+    func unloadIfIdle() {
+        #if canImport(MLXLLM) && canImport(MLXLMCommon)
+        // Eagerly free the 4B container/task if the feature flag is off and
+        // a previous build had it loaded. Runs on every idle check so the
+        // RAM is reclaimed on the first idle cycle after this ships.
+        if !Self.useLargeLocalModel && (cachedLargeContainer != nil || largeLoadTask != nil) {
+            print("[VOICE] Qwen3 idle unload: dropping 4B container (useLargeLocalModel=false)")
+            cachedLargeContainer = nil
+            largeLoadTask = nil
+            isLargeModelReady = false
+        }
+
+        // 4B-specific early unload: 5 minutes since last 4B use. The 4B is
+        // ~2.8GB resident and rarely needed back-to-back (most polishes are
+        // short). Drop it on its own schedule even if the 1.7B should stay
+        // warm because the user is still actively dictating short messages.
+        if Self.useLargeLocalModel, let last4B = last4BUseTime,
+           Date().timeIntervalSince(last4B) > largeIdleUnloadAfter,
+           (cachedLargeContainer != nil || largeLoadTask != nil) {
+            let idle4BSec = Int(Date().timeIntervalSince(last4B))
+            print("[VOICE-LP] 4B idle unload: \(idle4BSec)s since last 4B polish — dropping 4B container")
+            cachedLargeContainer = nil
+            largeLoadTask = nil
+            isLargeModelReady = false
+            // DO NOT reset largeModelLoadFailedThisSession — that flag is for
+            // load-failure tracking, not idle eviction.
+            last4BUseTime = nil
+        }
+
+        // Need a recent activity stamp to even consider unloading; if we've
+        // never polished, the model isn't loaded either.
+        guard let last = lastPolishTime else { return }
+        guard Date().timeIntervalSince(last) > idleUnloadAfter else { return }
+        // Nothing loaded? Nothing to do.
+        guard loadTask != nil || largeLoadTask != nil else { return }
+        let idleSec = Int(Date().timeIntervalSince(last))
+        print("[VOICE] Qwen3 idle unload: \(idleSec)s since last polish — dropping model containers")
+        loadTask = nil
+        largeLoadTask = nil
+        cachedSmallContainer = nil
+        cachedLargeContainer = nil
+        isLargeModelReady = false
+        last4BUseTime = nil
+        // Drop back to the "needs a load" state. We re-use `.notDownloaded`
+        // because the enum doesn't have a dedicated "unloaded" case and the
+        // semantic for the UI / `isReady` gates is identical — caller needs
+        // to wait for `ensureModel` to re-run before polishing.
+        availabilityStatus = .notDownloaded
+        hasWarmedUp = false
+        #endif
+    }
+
     // MARK: - Prewarm
 
     /// Force the model to download + page in. Eats the cold-start cost
@@ -274,6 +481,9 @@ final class Qwen3Polisher {
             print("[VOICE] Qwen3 prewarm skipped: MLX not linked")
             return
         }
+        // Start the idle-unload watchdog on first prewarm. Guarded by a flag
+        // so repeated prewarm calls don't stack timers.
+        startIdleUnloadWatchdogIfNeeded()
         print("[VOICE] Qwen3 prewarm starting (model: \(Self.modelID))")
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
@@ -291,40 +501,18 @@ final class Qwen3Polisher {
                 _ = try await session.respond(to: Self.warmupPrompt)
                 let ms = Int(Date().timeIntervalSince(start) * 1000)
                 print("[VOICE] Qwen3 polisher pre-warmed in \(ms)ms (total cold start: \(loadMs + ms)ms)")
-                // After the 1.7B is warm and the user has fast-path polish,
-                // kick off the 4B download/load in the background. Fire-and-
-                // forget — we never await this from prewarm; the 4B becomes
-                // available whenever it finishes and `polishWithMLX` will
-                // start routing to it transparently.
+                // 4B is NOT prewarmed at app launch. It's loaded lazily on
+                // the first long-input local polish (see `polishWithMLX`),
+                // which trades a one-time 2-3s load latency on the first
+                // long polish for ~2.8GB of resident memory savings during
+                // the common short-polish workflow. The 4B then idle-unloads
+                // after 5 minutes (see `largeIdleUnloadAfter`).
                 //
-                // Important: `ensureLargeModel()` is @MainActor (the polisher
-                // class is @MainActor). We do NOT hop here — Swift will await
-                // the actor isolation hop automatically when calling. The
-                // outer Task.detached is still useful for priority isolation
-                // so the 4B download doesn't compete with the userInitiated
-                // priority of the small-model warmup.
-                print("[VOICE-LP] 4B prewarm: starting download/load")
-                let bigStart = Date()
-                Task.detached(priority: .utility) { [weak self] in
-                    guard let self else { return }
-                    // Guard against infinite-retry if the load failed earlier
-                    // this session (bad model id, offline, etc.). Reading
-                    // `largeModelLoadFailedThisSession` requires the main
-                    // actor; check there before doing any work.
-                    let alreadyFailed = await MainActor.run { self.largeModelLoadFailedThisSession }
-                    if alreadyFailed {
-                        print("[VOICE-LP] 4B prewarm: skipped — prior load failed this session")
-                        return
-                    }
-                    do {
-                        _ = try await self.ensureLargeModel()
-                        let elapsed = Date().timeIntervalSince(bigStart)
-                        print(String(format: "[VOICE-LP] 4B prewarm: ready in %.1fs", elapsed))
-                    } catch {
-                        print("[VOICE-LP] 4B prewarm: FAILED: \(error.localizedDescription)")
-                        // Falls back to 1.7B automatically — see polishWithMLX.
-                    }
-                }
+                // Rationale: the 4B is a fallback for long structured inputs
+                // when the cloud is unavailable — most users will rarely hit
+                // it. Prewarming would burn ~2.8GB of unified memory for the
+                // 90%+ of polishes that never need it.
+                print("[VOICE-LP] 4B prewarm: skipped — lazy-load on first long-input local polish")
             } catch {
                 print("[VOICE] Qwen3 prewarm failed: \(error.localizedDescription)")
                 await MainActor.run {
@@ -339,6 +527,11 @@ final class Qwen3Polisher {
 
     #if canImport(MLXLLM) && canImport(MLXLMCommon)
     private func ensureModel() async throws -> ModelContainer {
+        // Fast path: container already resolved — BPETokenizer.init runs only
+        // once per load cycle; every subsequent inference reuses this instance.
+        if let cached = cachedSmallContainer {
+            return cached
+        }
         if let task = self.loadTask as? Task<ModelContainer, Error> {
             return try await task.value
         }
@@ -368,6 +561,9 @@ final class Qwen3Polisher {
             let container = try await task.value
             print("[VOICE] Qwen3 ensureModel: load complete, status -> available")
             self.availabilityStatus = .available
+            // Cache the resolved container so future calls skip the Task
+            // machinery entirely and return immediately.
+            self.cachedSmallContainer = container
             return container
         } catch {
             print("[VOICE] Qwen3 ensureModel: load FAILED: \(error.localizedDescription)")
@@ -393,6 +589,21 @@ final class Qwen3Polisher {
     /// from `polishWithMLX` will still get the throw and fall back to the
     /// small model.
     private func ensureLargeModel() async throws -> ModelContainer {
+        // Feature flag: 4B local model disabled. Throw a synthetic error so
+        // every caller's existing fallback path (to 1.7B / cloud) fires.
+        // Never load weights, never pay RAM cost.
+        if !Self.useLargeLocalModel {
+            throw NSError(
+                domain: "Qwen3Polisher",
+                code: -42,
+                userInfo: [NSLocalizedDescriptionKey: "4B local model disabled by feature flag (useLargeLocalModel=false)"]
+            )
+        }
+        // Fast path: container already resolved — BPETokenizer.init runs only
+        // once per load cycle; every subsequent inference reuses this instance.
+        if let cached = cachedLargeContainer {
+            return cached
+        }
         if let task = self.largeLoadTask as? Task<ModelContainer, Error> {
             return try await task.value
         }
@@ -429,6 +640,14 @@ final class Qwen3Polisher {
             // a future refactor that detaches this method can't silently
             // miss the actor hop).
             self.isLargeModelReady = true
+            // Stamp the use-time so the 5-min idle unload starts ticking
+            // from now (in case the first inference is delayed). Without
+            // this the first idle check after load might unload before the
+            // first inference even runs.
+            self.last4BUseTime = Date()
+            // Cache the resolved container so future calls skip the Task
+            // machinery entirely and return immediately.
+            self.cachedLargeContainer = container
             return container
         } catch {
             print("[VOICE-LP] 4B prewarm: FAILED: \(error.localizedDescription)")
@@ -448,6 +667,60 @@ final class Qwen3Polisher {
     }
     #endif
 
+    // MARK: - Raw inference (free-form prompt)
+
+    /// Run the 4B large model with a free-form (system + user) prompt and
+    /// return its raw text response. Bypasses all polish-prompt construction,
+    /// sanitizers, and rolling context — just a clean prompt -> response
+    /// wrapper used by callers that need general-purpose local LLM inference
+    /// (e.g. MeetingRecoveryService when Cerebras is unavailable).
+    ///
+    /// Blocks on `ensureLargeModel()` so the caller doesn't need to manage
+    /// readiness — first call after launch will pay the load cost. Returns
+    /// `nil` if MLX isn't linked, the model fails to load, or generation
+    /// throws.
+    func runLargeModelRaw(
+        systemPrompt: String,
+        userPrompt: String,
+        maxTokens: Int = 2048
+    ) async -> String? {
+        #if canImport(MLXLLM) && canImport(MLXLMCommon)
+        guard Self.isAvailable else {
+            print("[VOICE-RAW] MLX not linked — cannot run local fallback")
+            return nil
+        }
+        let container: ModelContainer
+        do {
+            if !isLargeModelReady {
+                print("[VOICE-RAW] Waiting for 4B large model to be ready…")
+            }
+            container = try await ensureLargeModel()
+        } catch {
+            print("[VOICE-RAW] ensureLargeModel failed: \(error.localizedDescription)")
+            return nil
+        }
+        let params = GenerateParameters(temperature: 0.2, topP: 0.95).with(maxTokens: maxTokens)
+        let session = ChatSession(
+            container,
+            instructions: systemPrompt,
+            generateParameters: params
+        )
+        let start = Date()
+        do {
+            let response = try await session.respond(to: userPrompt)
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            print("[VOICE-RAW] 4B raw inference done in \(ms)ms (\(response.count) chars)")
+            return response
+        } catch {
+            print("[VOICE-RAW] 4B raw inference error: \(error.localizedDescription)")
+            return nil
+        }
+        #else
+        print("[VOICE-RAW] MLX not compiled in — local fallback unavailable")
+        return nil
+        #endif
+    }
+
     // MARK: - Polish
 
     // MARK: - Language detection
@@ -462,13 +735,17 @@ final class Qwen3Polisher {
     nonisolated static func prioritizeVocabulary(_ vocab: [String], suspects: [String]?) -> [String] {
         guard let suspects, !suspects.isEmpty else { return vocab }
 
-        // Section E: in-memory cache keyed on (vocab hash, suspects hash).
+        // Section E: in-memory cache keyed on combined (vocab, suspects) hash.
         // The polish hot-path can hit this with the same `(vocab, suspects)`
         // tuple multiple times per dictation (polish + merge prompt build),
         // and soundex scoring on a 60-entry vocab against 16 suspects is
         // measurable. FIFO eviction at capacity 16 — small dictation surface,
-        // no need for true LRU.
-        let cacheKey = "\(vocab.hashValue):\(suspects.joined().hashValue)"
+        // no need for true LRU. Hashing directly via Hasher avoids the
+        // string-join + interpolation allocation the previous key required.
+        var hasher = Hasher()
+        hasher.combine(vocab)
+        hasher.combine(suspects)
+        let cacheKey = hasher.finalize()
         if let cached = vocabPrioritizationCache.read(cacheKey) {
             return cached
         }
@@ -509,15 +786,15 @@ final class Qwen3Polisher {
     /// `nonisolated`. Capacity 16 — when full, drop the oldest entry.
     private final class VocabCache: @unchecked Sendable {
         private let lock = NSLock()
-        private var order: [String] = []
-        private var store: [String: [String]] = [:]
+        private var order: [Int] = []
+        private var store: [Int: [String]] = [:]
         private let capacity: Int
         init(capacity: Int) { self.capacity = capacity }
-        func read(_ key: String) -> [String]? {
+        func read(_ key: Int) -> [String]? {
             lock.lock(); defer { lock.unlock() }
             return store[key]
         }
-        func write(_ key: String, value: [String]) {
+        func write(_ key: Int, value: [String]) {
             lock.lock(); defer { lock.unlock() }
             if store[key] != nil {
                 store[key] = value
@@ -687,6 +964,7 @@ final class Qwen3Polisher {
         suspectWords: [String]? = nil,
         userVocabulary: [String]? = nil,
         fieldContext: String? = nil,
+        appContextLabel: String? = nil,
         cleanupLevel: String = "medium",
         personalityStyle: String = "neutral"
     ) async -> String {
@@ -699,7 +977,7 @@ final class Qwen3Polisher {
         guard hasGranite || hasMoonshine else {
             return await polish(parakeet, context: context, timeoutMs: timeoutMs,
                                 suspectWords: suspectWords, userVocabulary: userVocabulary,
-                                fieldContext: fieldContext,
+                                fieldContext: fieldContext, appContextLabel: appContextLabel,
                                 cleanupLevel: cleanupLevel, personalityStyle: personalityStyle)
         }
 
@@ -710,7 +988,7 @@ final class Qwen3Polisher {
         if CerebrasPolisher.isAvailable {
             return await polish(parakeet, context: context, timeoutMs: timeoutMs,
                                 suspectWords: suspectWords, userVocabulary: userVocabulary,
-                                fieldContext: fieldContext,
+                                fieldContext: fieldContext, appContextLabel: appContextLabel,
                                 cleanupLevel: cleanupLevel, personalityStyle: personalityStyle)
         }
 
@@ -722,15 +1000,24 @@ final class Qwen3Polisher {
         }
 
         guard !Self.isNonEnglish(parakeet) else {
-            return LLMPolisher.stripFillers(parakeet)
+            print("[VOICE-POLISH] merge: non-English detected, rules-only fallback")
+            // Deterministic finish even on the non-English fallback so spoken
+            // punctuation / line commands / spacing still apply.
+            return Self.applyPostprocessor(LLMPolisher.stripFillers(parakeet), userVocabulary: userVocabulary, cleanupLevel: cleanupLevel)
         }
 
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
         if !availabilityStatus.isReady {
-            return LLMPolisher.stripFillers(parakeet)
+            print("[VOICE-POLISH] merge fail-open: model not ready (status=\(availabilityStatus.displayLabel)), rules-only fallback")
+            return Self.applyPostprocessor(LLMPolisher.stripFillers(parakeet), userVocabulary: userVocabulary, cleanupLevel: cleanupLevel)
         }
 
-        return await mergeWithMLX(
+        // mergeWithMLX previously returned its LLM output WITHOUT the
+        // deterministic postprocessor — so spoken-command conversion, spacing
+        // repair, and dash-strip never ran on the triple-ASR path. Route the
+        // merge result through applyPostprocessor (same finish as polish())
+        // so behavior is identical regardless of which engine produced it.
+        let merged = await mergeWithMLX(
             parakeet: LLMPolisher.stripFillers(parakeet),
             granite: hasGranite ? graniteClean : nil,
             moonshine: hasMoonshine ? moonshineClean : nil,
@@ -742,6 +1029,7 @@ final class Qwen3Polisher {
             cleanupLevel: cleanupLevel,
             personalityStyle: personalityStyle
         )
+        return Self.applyPostprocessor(merged, userVocabulary: userVocabulary, cleanupLevel: cleanupLevel)
         #else
         return await polish(parakeet, context: context, timeoutMs: timeoutMs,
                             suspectWords: suspectWords, userVocabulary: userVocabulary,
@@ -769,26 +1057,40 @@ final class Qwen3Polisher {
         // "didn't run, it was just parakeet" failure mode.
         let parakeetWordCount = parakeet.split(separator: " ").count
         let parakeetLower = parakeet.lowercased()
-        let mergeTopicShiftMarkers = ["also", "and then", "oh and", "then go", "and message",
-                                       "next thing", "next up", "and finally", "and also"]
-        let mergeTopicHits = mergeTopicShiftMarkers.reduce(0) { acc, marker in
-            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: marker) + "\\b"
-            guard let rx = try? NSRegularExpression(pattern: pattern) else { return acc }
-            return acc + rx.numberOfMatches(in: parakeetLower, range: NSRange(parakeetLower.startIndex..., in: parakeetLower))
+        // Hoisted from hot path — was recompiled per polish call.
+        let mergeTopicHits = Self.topicShiftRegexes.reduce(0) { acc, rx in
+            acc + rx.numberOfMatches(in: parakeetLower, range: NSRange(parakeetLower.startIndex..., in: parakeetLower))
         }
         let mergeIsMultiTopic = mergeTopicHits >= 3
         let mergeSchemaPattern = #"(?i)\b(?:make|create|build|define)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:table|schema|struct|object|model|class|record|type|interface)\b"#
         let mergeHasSchemaSignal = parakeet.range(of: mergeSchemaPattern, options: .regularExpression) != nil
         let mergeIsLongHigh = (cleanupLevel.lowercased() == "high") && parakeetWordCount > 40
-        let mergeNeedsLarge = parakeetWordCount > 12 || mergeIsMultiTopic || mergeHasSchemaSignal || mergeIsLongHigh
+        // Mirror the polish path's structural-complexity check. Any newline,
+        // list marker, "?", ":", or backtick in parakeet indicates the input
+        // has shape the 1.7B mishandles — route to 4B.
+        let mergeHasComplexStructure = parakeet.contains("\n")
+            || parakeet.contains("?")
+            || parakeet.contains(":")
+            || parakeet.contains("`")
+        // Gate by the useLargeLocalModel feature flag — when disabled, skip the
+        // 4B attempt entirely (avoids a noisy "4B not ready" log per merge call).
+        let mergeNeedsLarge = Self.useLargeLocalModel
+            && (parakeetWordCount > 40
+                || mergeHasComplexStructure
+                || (mergeIsMultiTopic && parakeetWordCount > 20)
+                || mergeHasSchemaSignal
+                || mergeIsLongHigh)
         var mergeUsedLarge = false
         let container: ModelContainer
         if mergeNeedsLarge {
             do {
+                if !isLargeModelReady {
+                    print("[VOICE-LP] merge: 4B not loaded — lazy-loading on demand for \(parakeetWordCount)-word merge")
+                }
                 container = try await ensureLargeModel()
                 mergeUsedLarge = true
             } catch {
-                print("[VOICE-LP] merge: 4B not ready, falling back to 1.7B (\(error.localizedDescription))")
+                print("[VOICE-LP] merge: 4B load failed, falling back to 1.7B (\(error.localizedDescription))")
                 do {
                     container = try await ensureModel()
                 } catch {
@@ -802,7 +1104,13 @@ final class Qwen3Polisher {
                 return parakeet
             }
         }
-        print("[VOICE-LP] merge route=\(mergeUsedLarge ? "4B" : "1.7B") words=\(parakeetWordCount) multiTopic=\(mergeIsMultiTopic) schema=\(mergeHasSchemaSignal) longHigh=\(mergeIsLongHigh)")
+        // Record the truth so the caller's engine-label code reads the actual
+        // route, not a reconstruction.
+        self.lastUsedLargeLocal = mergeUsedLarge
+        if mergeUsedLarge {
+            self.last4BUseTime = Date()
+        }
+        print("[VOICE-LP] merge route=\(mergeUsedLarge ? "4B" : "1.7B") words=\(parakeetWordCount) complexStruct=\(mergeHasComplexStructure) multiTopic=\(mergeIsMultiTopic) schema=\(mergeHasSchemaSignal) longHigh=\(mergeIsLongHigh)")
 
         // Build hints (same as single-model polish).
         var hints = ""
@@ -839,8 +1147,7 @@ final class Qwen3Polisher {
             .range(of: #"(?i)\b(first|second|third|point\s+one|point\s+two|number\s+one|step\s+one|action\s+items?)\b"#, options: .regularExpression) != nil
         // Mirror polishWithMLX: HIGH gets 3× for aggressive restructuring headroom.
         // List hint gets 80 to cover "1.\n2.\n3." prefix overhead.
-        let mergeCleanupMultiplier: Int = (cleanupLevel.lowercased() == "high") ? 3 : 2
-        let cap = approxTokens * mergeCleanupMultiplier + (mergeHasListHint ? 80 : 60)
+        let cap = max(80, Int(Double(approxTokens) * 1.15)) + (mergeHasListHint ? 30 : 16)
         let params = GenerateParameters(temperature: 0.0, topP: 1.0).with(maxTokens: cap)
 
         // Build transcript lines — always include A (Parakeet), include B and C when available.
@@ -870,9 +1177,11 @@ final class Qwen3Polisher {
         // Bug 3 + Bug 4: same shared helpers as the single-model polish path.
         // Keeps merge behavior consistent with polish() so user-facing
         // personality/cleanup pickers actually take effect in both call paths.
+        // Pass mergeUsedLarge so HIGH gets the enriched prompt when the 4B
+        // is actually running the merge (see polishWithMLX rationale).
         let mergeLevelPrefix = """
         === OVERRIDE: CLEANUP MODE (highest priority, overrides any conflicting system rule) ===
-        \(Self.cleanupInstruction(cleanupLevel))
+        \(Self.cleanupInstruction(cleanupLevel, for4B: mergeUsedLarge))
         ===
 
         """
@@ -991,6 +1300,110 @@ final class Qwen3Polisher {
     /// (kicked from RecordingCoordinator) is responsible for getting us to
     /// ready state. If it hasn't yet, this polish is a no-op and the next
     /// one will pick up once ready.
+    // MARK: - Polish In-Place (cloud-only, prose editor, not dictation cleaner)
+
+    /// Polish existing selected text via Cerebras Qwen3-235B.
+    /// Unlike `polish()`, this path treats the input as already-typed prose —
+    /// no "strip um/uh", no voice-transcript rules. The preset controls how
+    /// aggressively the model edits.
+    ///
+    /// Returns nil on failure (API error, unavailable, etc.) so the caller
+    /// can show a toast instead of replacing text with an error string.
+    func polishInPlace(_ text: String, preset: String = "smooth") async -> String? {
+        guard CerebrasPolisher.isAvailable else {
+            print("[VOICE-POLISH] Cerebras not available — skipping")
+            return nil
+        }
+
+        let systemPrompt = Self.buildPolishInPlacePrompt(preset: preset)
+        let wordCount = text.split(separator: " ").count
+        let maxTok = max(60, wordCount * 8 + 40)
+
+        print("[VOICE-POLISH] calling Cerebras preset=\(preset) words=\(wordCount) maxTok=\(maxTok)")
+
+        guard let result = await CerebrasPolisher.shared.polish(
+            text,
+            systemPrompt: systemPrompt,
+            maxTokens: maxTok
+        ) else {
+            print("[VOICE-POLISH] Cerebras returned nil")
+            return nil
+        }
+
+        // Light sanity: reject if the model returned something that looks like
+        // a preamble/explanation rather than polished prose.
+        let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        let looksLikeExplanation = trimmed.lowercased().hasPrefix("here is") ||
+            trimmed.lowercased().hasPrefix("i've polished") ||
+            trimmed.lowercased().hasPrefix("polished version")
+        guard !looksLikeExplanation, !trimmed.isEmpty else {
+            print("[VOICE-POLISH] model returned explanation instead of prose — ignoring")
+            return nil
+        }
+
+        print("[VOICE-POLISH] done: \"\(trimmed.prefix(80))\"")
+        return trimmed
+    }
+
+    // MARK: - Polish In-Place prompts
+
+    /// Prose-editor system prompt. Deliberately different from dictation prompt:
+    /// input is existing typed text, not a voice transcript.
+    nonisolated private static func buildPolishInPlacePrompt(preset: String) -> String {
+        // Em-dash constraint placed BEFORE the role description — this positioning
+        // proved necessary: placing it after /no_think still lets the model default
+        // to its trained preference. First instruction wins.
+        let base = """
+        \u{26A0}\u{FE0F} ABSOLUTE CONSTRAINT: NEVER write an em-dash (\u{2014}) or en-dash (\u{2013}). \
+        Not a single one. Replace with a comma, period, or colon. \
+        Example of what NOT to do: "push to Thursday\u{2014}it would be easier". \
+        Correct version: "push to Thursday. It would be easier." or "push to Thursday, it would be easier."
+
+        You are a prose editor. The user has selected text they want polished. \
+        Output ONLY the polished text — no preamble, no explanation, no quotes around it.
+        /no_think
+
+        \(polishPresetInstruction(preset))
+
+        RULES: Never add content not in the original. Never change facts. No emojis. \
+        Preserve the writer's voice unless the preset explicitly asks to elevate register.
+        """
+        return base
+    }
+
+    nonisolated private static func polishPresetInstruction(_ preset: String) -> String {
+        switch preset {
+        case "fix":
+            return """
+            Mode: FIX — minimal touch.
+            Fix only: spelling, grammar, capitalization, apostrophes, punctuation.
+            Do NOT restructure sentences. Do NOT change word choice. Near-verbatim output.
+            Example: "hey i was thinking, should we push back the deadline" \
+            → "Hey, I was thinking — should we push back the deadline?" \
+            (caps + comma + question mark only)
+            """
+        case "elevate":
+            return """
+            Mode: ELEVATE — professional prose.
+            Tighten the writing: remove hedges ("maybe", "kind of", "sort of"), \
+            redundant words, and filler phrases. Professional register. \
+            Concise sentences. Cut without changing meaning.
+            Example: "hey so i was thinking we should maybe push the meeting to thursday it would be easier" \
+            → "I'd suggest moving the meeting to Thursday."
+            """
+        default: // "smooth"
+            return """
+            Mode: SMOOTH — improve flow, keep voice.
+            Smooth awkward phrasing and run-ons. Fix grammar and punctuation. \
+            Light restructuring only where it helps clarity. \
+            Keep the writer's vocabulary, contractions, and register intact. \
+            Informal phrasing is fine unless it reads as a typo.
+            Example: "hey so i was thinking we should maybe push the meeting to thursday it would be easier" \
+            → "I was thinking we should push the meeting to Thursday. It'd be easier."
+            """
+        }
+    }
+
     func polish(
         _ text: String,
         context: PolishContext = .default,
@@ -998,106 +1411,593 @@ final class Qwen3Polisher {
         suspectWords: [String]? = nil,
         userVocabulary: [String]? = nil,
         fieldContext: String? = nil,
+        appContextLabel: String? = nil,
         cleanupLevel: String = "medium",
         personalityStyle: String = "neutral"
     ) async -> String {
-        // "none" cleanup: skip the model entirely, just strip fillers.
+        // Stamp activity so the idle-unload watchdog (see `unloadIfIdle`)
+        // doesn't drop the model out from under us between back-to-back
+        // dictations. `updateRollingContext` also bumps this on successful
+        // paste — setting it here covers paths that don't paste (e.g. polish
+        // → cancel) so we still count as "recently active".
+        lastPolishTime = Date()
+
+        // Entry-point log: prints once per polish() so it's trivial to find
+        // a call's start in the console. `engine-target` is "cloud" if the
+        // routing block will TRY cloud (key + enabled), "local" otherwise.
+        let polishInStartedAt = Date()
+        let polishInWordCount = text.split(separator: " ").count
+        let polishInHasContext = (fieldContext != nil) || (appContextLabel != nil)
+        let polishInEngineTarget = CerebrasPolisher.isAvailable ? "cloud" : "local"
+        print("[VOICE-POLISH-IN] words=\(polishInWordCount) hasContext=\(polishInHasContext) level=\(cleanupLevel) engine-target=\(polishInEngineTarget)")
+
+        // "none" cleanup: skip the model entirely, just strip fillers — but
+        // STILL run the deterministic postprocessor so spoken punctuation /
+        // line commands / spacing convert even with the LLM fully off. This is
+        // the floor of "polish always does SOMETHING useful".
         if cleanupLevel == "none" {
-            return LLMPolisher.stripFillers(text)
+            print("[VOICE-POLISH] decision: cleanupLevel=none → rules-only (spoken-cmd + spacing still apply)")
+            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary)
         }
 
         guard Self.isEnabled else {
-            print("[VOICE] Qwen3 polish skipped: disabled by user")
-            return text
+            // User turned polish off. Respect it, but still convert spoken
+            // commands + fix spacing deterministically (this matches Wispr's
+            // behavior where formatting works regardless of the AI rewrite).
+            print("[VOICE-POLISH] decision: disabled by user → rules-only")
+            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary)
         }
         guard Self.isAvailable else {
-            print("[VOICE] Qwen3 polish skipped: MLX not linked at build time")
-            return text
+            print("[VOICE-POLISH] decision: MLX not linked → rules-only")
+            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary)
         }
         guard text.count >= 4 else { return text }
         // Code: skip polish entirely — model rewrites break syntax/identifiers
         if context == .code {
-            print("[VOICE] Qwen3 polish skipped: code context")
+            print("[VOICE-POLISH] decision: code context → passthrough (no rewrite)")
             return text
         }
 
-        // Step 1: Strip fillers (rule-based, ~1ms) — runs ALWAYS, even if we skip model
-        let filtered = LLMPolisher.stripFillers(text)
+        // =====================================================================
+        // PHILOSOPHY: the cloud model is a smart editor, not a formatter.
+        // =====================================================================
+        // When we're going to route to the cloud, we hand it the RAW ASR text
+        // with only whitespace trimmed. No filler stripping, no restart
+        // collapsing, no entity freezing. The 120B model needs to see the
+        // fillers, restarts, contractions, emails, and code spans in their
+        // natural context so it can reason about what the speaker meant.
+        //
+        // Wispr Flow doesn't pre-process either — it sends raw audio + a brief
+        // to a frontier model and trusts the model to think. We do the same.
+        //
+        // The LOCAL (MLX) path still uses the full preprocessing chain. A 1.7B
+        // model can't reliably distinguish a filler from a discourse cue, so
+        // it benefits from the deterministic pre-work. The size of the model
+        // is what determines how much help it needs.
+        let goingToCloud = CerebrasPolisher.isAvailable && !CerebrasPolisher.apiKey.isEmpty
 
-        // Step 1b: Restart-correction pre-processor (rule-based, <1ms).
-        // Resolves stutters, explicit "no wait" corrections, and near-duplicate
-        // clause restarts BEFORE the LLM sees the text. The 4B model has been
-        // observed to keep both versions of a restart in long inputs; doing this
-        // deterministically in Swift is more reliable than asking the model.
-        let preResult = RestartCorrectionPreprocessor.process(filtered)
-        let stripped = preResult.cleaned
-        if !preResult.appliedRules.isEmpty {
-            print("[VOICE-PRE] restart-correction applied: \(preResult.appliedRules.joined(separator: ",")), dropped \(preResult.droppedSpans.count) spans")
+        let stripped: String
+        if goingToCloud {
+            // Cloud path: trust the model with semantic decisions, but keep
+            // the cheap ASR-noise cleanup. Two things still help the cloud:
+            //   1. Stutter collapse — "I I I think" → "I think". Pure ASR
+            //      artifact, zero signal. The model wastes context on it
+            //      otherwise.
+            //   2. (Optional) leading "um"/"uh" — a single leading filler
+            //      adds nothing for the model to reason about.
+            //
+            // What we DON'T do anymore on cloud:
+            //   - Remove "i mean", "you know", "sort of" — those are real
+            //     restart/hedging cues the model needs.
+            //   - Run RestartCorrectionPreprocessor frame-similarity or
+            //     near-duplicate passes — model handles those natively.
+            //   - Replace names, dates, numbers with sentinels — model
+            //     uses them for context.
+            let prepared = LLMPolisher.stripFillers(text, mode: .minimal)
+            let preResult = RestartCorrectionPreprocessor.process(prepared, options: .cloudLight)
+            if !preResult.appliedRules.isEmpty {
+                print("[VOICE-PRE] cloud minimal pre: \(preResult.appliedRules.joined(separator: ","))")
+            }
+            stripped = preResult.cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+            print("[VOICE-POLISH] cloud path: minimal pre (stutter + leading-fillers + explicit cues) → model, \(stripped.count) chars")
+        } else {
+            // Local path: keep the full preprocessing chain.
+            // Step 1: Strip fillers (rule-based, ~1ms).
+            let filtered = LLMPolisher.stripFillers(text)
+
+            // Step 1b: Restart-correction pre-processor (rule-based, <1ms).
+            // Resolves stutters, explicit "no wait" corrections, and near-duplicate
+            // clause restarts BEFORE the LLM sees the text. The small local model
+            // has been observed to keep both versions of a restart in long inputs;
+            // doing this deterministically in Swift is more reliable than asking
+            // a small model.
+            let preResult = RestartCorrectionPreprocessor.process(filtered)
+            if !preResult.appliedRules.isEmpty {
+                print("[VOICE-PRE] restart-correction applied: \(preResult.appliedRules.joined(separator: ",")), dropped \(preResult.droppedSpans.count) spans")
+            }
+            stripped = preResult.cleaned
         }
 
         // Step 2: Skip model if text is in a non-English language (Qwen3 is
         // English-trained and rewrites Dutch/French/German/Spanish/Italian/
         // Portuguese into English-shaped slop). English is the default for
-        // ambiguous short utterances.
+        // ambiguous short utterances. This check runs on every path: even
+        // the cloud model is asked to handle English by default, and routing
+        // a French dictation through it would produce surprising results
+        // when the user expected verbatim output.
         if Self.isNonEnglish(stripped) {
-            print("[VOICE] Qwen3 polish skipped: non-English detected")
-            return Self.applyPostprocessor(stripped, userVocabulary: userVocabulary)
+            print("[VOICE-POLISH] decision: non-English detected → rules-only (no LLM rewrite)")
+            return Self.applyMinimalPostprocessor(stripped, userVocabulary: userVocabulary)
         }
 
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
-        // Step 3: Fail open immediately if model not ready. We do NOT block
-        // the paste path waiting for download/load — that was the
-        // user-visible "models don't work" complaint: polish was hanging on
-        // ensureModel() until the 380MB Qwen3 download finished. Prewarm
-        // continues independently; the *next* polish call will pick up.
-        if !availabilityStatus.isReady {
-            print("[VOICE] Qwen3 polish fail-open: model not ready (status=\(availabilityStatus.displayLabel))")
-            return stripped
+        // Step 3: Fail open immediately if the LOCAL model is not ready AND we
+        // weren't routing to cloud anyway. When the cloud path is configured we
+        // do NOT gate on local-model availability — the cloud is fully capable
+        // of polishing on its own.
+        //
+        // Historical context: on first launch (model still downloading/loading)
+        // EVERY dictation hit this and pasted unformatted text, which reads
+        // exactly like "polish is broken". The fail-open path runs the
+        // deterministic minimal postprocessor so spoken punctuation / line
+        // commands / spacing work immediately, even before the model is ready.
+        if !availabilityStatus.isReady && !goingToCloud {
+            print("[VOICE-POLISH] decision: local model NOT ready (status=\(availabilityStatus.displayLabel)) and no cloud → rules-only fail-open")
+            return Self.applyMinimalPostprocessor(stripped, userVocabulary: userVocabulary)
         }
-        print("[VOICE] Qwen3 polish START (input chars=\(stripped.count))")
+        print("[VOICE-POLISH] decision: \(goingToCloud ? "cloud" : "local-model") ready → LLM polish START (input chars=\(stripped.count))")
 
         // Step 2b: Freeze fragile spans (emails, URLs, contractions, code,
-        // domains) behind sentinel tokens BEFORE the model sees them. The
-        // model polishes the surrounding prose but cannot accidentally split
-        // "michael@gmail.com" → "michael@gmail. Com" or mangle "let's say"
-        // → "let'say". Sentinels look like ⟦E0⟧ ⟦E1⟧ etc — mathematical
-        // white square brackets, opaque to Qwen3's tokenizer.
-        let frozen = EntityFreezer.freeze(stripped)
-        if !frozen.isEmpty {
-            print("[VOICE-FREEZE] froze \(frozen.entities.count) entities")
+        // domains) behind sentinel tokens — but ONLY for the local path. The
+        // small local model genuinely splits "michael@gmail.com" into
+        // "michael@gmail. Com" and mangles "let's say" into "let'say". The
+        // frontier cloud model handles these spans natively and benefits from
+        // seeing them in their natural context.
+        let frozen: EntityFreezer.Frozen
+        if goingToCloud {
+            // Minimal freeze on cloud: protect ONLY against hallucination-
+            // prone spans (emails, URLs, file paths, backtick code, domains).
+            // Contractions and names stay open — the model needs them in
+            // context to format correctly.
+            frozen = EntityFreezer.freeze(stripped, mode: .minimal)
+            if !frozen.isEmpty {
+                print("[VOICE-FREEZE] cloud minimal: froze \(frozen.entities.count) entities (urls/emails/paths/code only)")
+            }
+        } else {
+            frozen = EntityFreezer.freeze(stripped)
+            if !frozen.isEmpty {
+                print("[VOICE-FREEZE] froze \(frozen.entities.count) entities")
+            }
         }
 
-        // Step 2c: Decide between local 4B and Cerebras cloud. Cloud only
-        // fires when the user has opted in AND the input is long enough to
-        // benefit (short messages don't need a 70B). Cerebras failure falls
-        // back to local — never blocks polish.
+        // Step 2c: Decide between local MLX and Cerebras cloud.
+        //
+        // Policy (rewritten May 2026 — old version had several bugs that
+        // silently demoted cloud to local and made the UI lie about which
+        // engine actually ran):
+        //   • If cloud is configured (Cerebras enabled + API key set) → CLOUD,
+        //     for ANY word count. Short inputs polish fast on cloud anyway
+        //     (~150ms cold-start) and there's no point maintaining two prompt
+        //     paths (cloud vs local) when one model can handle everything.
+        //   • The previous `cloudIsLagging` adaptive flag is DISABLED. One
+        //     slow call would demote cloud for the rest of the session — too
+        //     fragile. Flag is kept for diagnostic logging only.
+        //   • NO racing. Cloud runs SERIALLY. Local only fires if cloud fails.
+        //     Racing burned CPU on local even when cloud would win, and let
+        //     local sneak in for short inputs.
+        //   • PolishStatus.lastEngine is set to `cloud:…` BEFORE the cloud
+        //     call begins, with a lastReason explaining why. On failure the
+        //     fallback branches update both to reflect what actually ran.
         let wordCount = frozen.text.split(separator: " ").count
-        let useCloud = CerebrasPolisher.isAvailable && wordCount >= CerebrasPolisher.minWordCount
+        let cloudAvg    = CerebrasPolisher.shared.avgLatencyMs
+        let localAvg    = self.avgLatencyMs
+        let cloudSampled = CerebrasPolisher.shared.sampleCount >= 3
+        // Kept for diagnostics only — DOES NOT gate routing. A real lag
+        // detector (3 of last 5 timed out) would live in CerebrasPolisher
+        // and surface a single boolean. The old heuristic was too noisy.
+        let cloudIsLaggingDiag = cloudSampled && localAvg > 0
+            && cloudAvg > localAvg * 1.4
+            && wordCount <= 8
+        // ONLY gate: `goingToCloud` (cloud enabled + API key set), computed at
+        // the top of polish() so the preprocessing chain branched correctly.
+        // No word-count floor, no `isSimpleShortInput` demotion, no adaptive
+        // `cloudIsLagging` flip. The user picked cloud in settings — honor it.
+        let useCloud = goingToCloud
+
+        print("[VOICE-ROUTE] words=\(wordCount) cloud_configured=\(CerebrasPolisher.isAvailable) cloud_key_set=\(!CerebrasPolisher.apiKey.isEmpty) cloud_lagging_diag=\(cloudIsLaggingDiag) → decision=\(useCloud ? "cloud" : "local")")
+
+        // Verbose routing diagnostics — surfaces EVERY input to the decision so
+        // we can answer "why did this polish go local?" from logs alone. Goes
+        // to both stderr (for Xcode console) AND Telemetry.log (for the user-
+        // visible events.jsonl). The pre-flight snapshot below is the *intent*;
+        // the cloud-call result block further down records what actually ran.
+        let cerebrasIsEnabled = CerebrasPolisher.isEnabled
+        let cerebrasKey = CerebrasPolisher.apiKey
+        let cerebrasKeyEmpty = cerebrasKey.isEmpty
+        let cerebrasKeyPrefix = String(cerebrasKey.prefix(8))
+        let cerebrasIsAvail = CerebrasPolisher.isAvailable
+        print("""
+        [VOICE-ROUTE-DEBUG] routing decision:
+          input words=\(wordCount)
+          CerebrasPolisher.isEnabled=\(cerebrasIsEnabled)
+          CerebrasPolisher.apiKey.isEmpty=\(cerebrasKeyEmpty)
+          CerebrasPolisher.apiKey prefix=\(cerebrasKeyPrefix)
+          CerebrasPolisher.isAvailable=\(cerebrasIsAvail)
+          goingToCloud=\(goingToCloud)
+          useCloud=\(useCloud)
+          → will attempt: \(useCloud ? "CLOUD" : "LOCAL")
+        """)
+        Telemetry.log("polish.route_decision", properties: [
+            "input_words": wordCount,
+            "cerebras_enabled": cerebrasIsEnabled,
+            "cerebras_key_empty": cerebrasKeyEmpty,
+            "cerebras_key_prefix": cerebrasKeyPrefix,
+            "cerebras_is_available": cerebrasIsAvail,
+            "going_to_cloud": goingToCloud,
+            "use_cloud": useCloud,
+            "will_attempt": useCloud ? "cloud" : "local"
+        ])
 
         var polishedFrozen: String?
         if useCloud {
-            print("[VOICE-POLISH] routing to Cerebras (wordCount=\(wordCount))")
+            let routeNote = cloudSampled
+                ? " (cloud_avg=\(Int(cloudAvg))ms local_avg=\(Int(localAvg))ms)"
+                : ""
+            print("[VOICE-ROUTE] → Cerebras (wordCount=\(wordCount))\(routeNote)")
+
+            // Don't pre-mark the engine. Setting lastEngine = "cloud:..."
+            // before the call returned means the toast / icon LIES about
+            // which engine actually produced the text. If cloud falls
+            // through to local, the engine indicator was already showing
+            // cloud and only updates AFTER local finishes — by then the
+            // user has already seen "cloud" for 24 seconds while local was
+            // grinding. Truthful: leave lastEngine alone until something
+            // succeeds. The success branches below set it.
+            print("[VOICE-ROUTE-DEBUG] attempting cloud (Cerebras gpt-oss-120b)")
             // Use the same soundex-prioritized vocab the local path uses, so
             // the top 60 sent to the cloud are phonetically related to suspect
             // tokens. Keeps the prompt budget sane while maximizing relevance.
             let prioritizedVocab = userVocabulary.map {
                 Self.prioritizeVocabulary($0, suspects: suspectWords)
             }
+            // Style Card block — nil when "My Style" is off or no card exists.
+            let styleBlock = StyleCardService.shared.styleCardPromptBlock()
             let cloudPrompt = Self.buildCloudSystemPrompt(
                 cleanupLevel: cleanupLevel,
                 personalityStyle: personalityStyle,
-                userVocabulary: prioritizedVocab
+                userVocabulary: prioritizedVocab,
+                suspectWords: suspectWords,
+                styleCardBlock: styleBlock,
+                fieldContext: fieldContext,
+                appContextLabel: appContextLabel,
+                wordCount: wordCount
             )
-            polishedFrozen = await CerebrasPolisher.shared.polish(
-                frozen.text,
-                systemPrompt: cloudPrompt
+            // Build the USER message — CONTEXT preamble + raw DICTATION. This
+            // is where situational signal lives (which app, which field,
+            // personality, cleanup level, recent vocabulary, prior dictation,
+            // suspect words). The system prompt is just the editorial brief;
+            // the per-call situation is the user message.
+            let priorCtx = currentRollingContext
+            let cloudUserMessage = Self.buildCloudUserMessage(
+                rawDictation: frozen.text,
+                cleanupLevel: cleanupLevel,
+                personalityStyle: personalityStyle,
+                userVocabulary: prioritizedVocab,
+                suspectWords: suspectWords,
+                fieldContext: fieldContext,
+                appContextLabel: appContextLabel,
+                priorContext: priorCtx
             )
-            if polishedFrozen == nil {
-                let reason = await CerebrasPolisher.shared.lastFailureReason ?? "unknown"
-                print("[VOICE-POLISH] Cerebras failed (\(reason)), falling back to local")
-                await MainActor.run { Self.maybePostCloudFallbackToast(reason: reason) }
+
+            // Dynamic output cap. The model is allowed to remove fillers and
+            // restructure, so we give it generous headroom rather than a
+            // tight collar. Hard ceiling: 2048.
+            let inputTokenEstimate = frozen.text.count / 4
+            let cloudMaxTokens = min(2048, max(400, inputTokenEstimate * 3 + 64))
+
+            // 60k context window guard. Cerebras context = 65,536; we cap
+            // at 60,000 (5,536 safety buffer). If over budget, truncate the
+            // user message — never the system brief.
+            let systemEst = cloudPrompt.count / 4
+            let userEst   = cloudUserMessage.count / 4
+            let totalEst  = systemEst + userEst + cloudMaxTokens
+            let contextCap = 60_000
+            var messageToSend = cloudUserMessage
+            if totalEst > contextCap {
+                let allowedTokens = max(200, contextCap - systemEst - cloudMaxTokens)
+                let allowedChars = allowedTokens * 4
+                if cloudUserMessage.count > allowedChars {
+                    messageToSend = String(cloudUserMessage.prefix(allowedChars))
+                    print("[CEREBRAS] ⚠️ user message truncated \(cloudUserMessage.count)→\(messageToSend.count) chars (60k ctx budget est=\(totalEst))")
+                }
+            }
+
+            // Cache key: stable hash of the system prompt so calls sharing
+            // the same settings route to the same Cerebras cache slot.
+            let cacheKey = "voice-polish-\(abs(cloudPrompt.hashValue) % 0xFFFF)"
+            // SERIAL cloud-first. Cerebras runs to completion (or its own
+            // adaptive timeout). If it returns nil we try Groq, then local.
+            let callText = messageToSend
+            let callContext = context
+            let callTimeoutMs = timeoutMs
+            let callSuspects = suspectWords
+            let callVocab = userVocabulary
+            let callField = fieldContext
+            let callCleanup = cleanupLevel
+            let callPersonality = personalityStyle
+            let callPrompt = cloudPrompt
+            let callMax = cloudMaxTokens
+            let callCache = cacheKey
+
+            enum CloudResult {
+                case nvidiaOK(String)
+                case cerebrasOK(String)
+                case hyperbolicOK(String)
+                case groqOK(String)
+                case localOK(String)
+            }
+
+            // PRIMARY: NVIDIA NIM (gpt-oss-120b). Free 40 RPM account-level,
+            // separate quota from Cerebras / Hyperbolic / Groq. If NVIDIA
+            // succeeds we short-circuit; otherwise walk down the chain
+            // (Cerebras → Hyperbolic → Groq → local). nil failure reasons:
+            //   - `not-configured` → no nvapi- key set, fall through silently
+            //   - `auth` → bad key, fall through (don't keep retrying)
+            //   - everything else → fall through to Cerebras
+            let nvidiaAvailable = await MainActor.run { NVIDIAPolisher.isAvailable }
+            var nvidiaResult: String? = nil
+            var nvidiaReason: String? = nil
+            if nvidiaAvailable {
+                print("[VOICE-ROUTE] trying NVIDIA NIM (primary cloud)")
+                nvidiaResult = await NVIDIAPolisher.shared.polish(
+                    callText,
+                    systemPrompt: callPrompt,
+                    maxTokens: callMax
+                )
+                nvidiaReason = await NVIDIAPolisher.shared.lastFailureReason
+                Telemetry.log("polish.nvidia_call_result", properties: [
+                    "success": nvidiaResult != nil,
+                    "reason": nvidiaReason ?? "ok",
+                    "latency_ms": NVIDIAPolisher.shared.lastLatencyMs
+                ])
+            }
+
+            let result: CloudResult
+            if let s = nvidiaResult {
+                print("[VOICE-ROUTE] NVIDIA primary succeeded in \(NVIDIAPolisher.shared.lastLatencyMs)ms")
+                result = .nvidiaOK(s)
             } else {
-                await MainActor.run { PolishStatus.shared.lastEngine = "cloud:qwen-3-235b" }
+            // NVIDIA failed or not configured. Try Cerebras next. For most
+            // NVIDIA failure modes (rate-limit, credits-exhausted, server-
+            // error, timeout-total, auth, not-configured) Cerebras can
+            // independently succeed — separate provider, separate quota.
+            if nvidiaAvailable, let nr = nvidiaReason {
+                print("[VOICE-ROUTE] NVIDIA \(nr) → trying Cerebras")
+            } else if !nvidiaAvailable {
+                print("[VOICE-ROUTE] NVIDIA not configured → trying Cerebras")
+            }
+
+            let cerebrasOut = await CerebrasPolisher.shared.polish(
+                callText,
+                systemPrompt: callPrompt,
+                maxTokens: callMax,
+                cacheKey: callCache
+            )
+            // Verbose post-call diagnostic — pairs with the [VOICE-ROUTE-DEBUG]
+            // pre-flight block above so we can correlate intent → outcome.
+            let cerebrasOutReason = await CerebrasPolisher.shared.lastFailureReason
+            print("[VOICE-ROUTE-DEBUG] cloud call result: success=\(cerebrasOut != nil) reason=\(cerebrasOutReason ?? "ok")")
+            Telemetry.log("polish.cloud_call_result", properties: [
+                "success": cerebrasOut != nil,
+                "reason": cerebrasOutReason ?? "ok",
+                "latency_ms": CerebrasPolisher.shared.lastLatencyMs
+            ])
+            if let s = cerebrasOut {
+                result = .cerebrasOK(s)
+            } else {
+                // Cerebras failed. Walk the fallback chain:
+                //   Cerebras → Hyperbolic → Groq → local
+                // For ANY non-nil failure reason except `not-configured`
+                // (next link can't fix a missing key) or `auth` (bad key
+                // — every provider has its own key).
+                let cerebrasReason = await CerebrasPolisher.shared.lastFailureReason
+                let nonRecoverablePrefixes: [String] = ["not-configured", "not configured", "auth"]
+                let cerebrasRecoverable: Bool = {
+                    guard let r = cerebrasReason, !r.isEmpty else { return false }
+                    for prefix in nonRecoverablePrefixes where r.lowercased().hasPrefix(prefix) {
+                        return false
+                    }
+                    return true
+                }()
+                let hyperbolicAvailable = await MainActor.run { HyperbolicPolisher.isAvailable }
+                let groqAvailable = await MainActor.run { GroqPolisher.isAvailable }
+
+                // First fallback: Hyperbolic (same gpt-oss-120b model as
+                // Cerebras → quality parity, separate quota).
+                var hyperbolicResult: String? = nil
+                var hyperbolicReason: String? = nil
+                if cerebrasRecoverable && hyperbolicAvailable {
+                    print("[VOICE-ROUTE] Cerebras \(cerebrasReason ?? "failed") → trying Hyperbolic fallback")
+                    hyperbolicResult = await HyperbolicPolisher.shared.polish(
+                        callText,
+                        systemPrompt: callPrompt,
+                        maxTokens: callMax
+                    )
+                    hyperbolicReason = await HyperbolicPolisher.shared.lastFailureReason
+                }
+
+                if let hyperbolicOut = hyperbolicResult {
+                    print("[VOICE-ROUTE] Hyperbolic fallback succeeded in \(HyperbolicPolisher.shared.lastLatencyMs)ms")
+                    result = .hyperbolicOK(hyperbolicOut)
+                } else {
+                    // Second fallback: Groq. Use whether Hyperbolic was
+                    // *attempted* to decide if its reason is recoverable —
+                    // matches Cerebras's nonRecoverablePrefixes check.
+                    let hyperbolicRecoverable: Bool = {
+                        // If Hyperbolic wasn't tried (not configured or
+                        // Cerebras was non-recoverable), let Groq still
+                        // try as long as the underlying Cerebras reason
+                        // was recoverable.
+                        guard hyperbolicAvailable && cerebrasRecoverable else {
+                            return cerebrasRecoverable
+                        }
+                        guard let r = hyperbolicReason, !r.isEmpty else { return true }
+                        for prefix in nonRecoverablePrefixes where r.lowercased().hasPrefix(prefix) {
+                            return false
+                        }
+                        return true
+                    }()
+
+                    if hyperbolicRecoverable && groqAvailable {
+                        if let hr = hyperbolicReason {
+                            print("[VOICE-ROUTE] Hyperbolic \(hr) → trying Groq fallback")
+                        } else {
+                            print("[VOICE-ROUTE] Cerebras \(cerebrasReason ?? "failed") → trying Groq fallback (Hyperbolic off)")
+                        }
+                        let groqOut = await GroqPolisher.shared.polish(
+                            callText,
+                            systemPrompt: callPrompt,
+                            maxTokens: callMax
+                        )
+                        if let groqOut = groqOut {
+                            print("[VOICE-ROUTE] Groq fallback succeeded in \(GroqPolisher.shared.lastLatencyMs)ms")
+                            result = .groqOK(groqOut)
+                        } else {
+                            let groqReason = await GroqPolisher.shared.lastFailureReason ?? "unknown"
+                            print("[VOICE-ROUTE] Groq fallback failed (\(groqReason)) → local MLX")
+                            // Local model sees the raw trimmed text — NOT the
+                            // CONTEXT+DICTATION wrapper. polishWithMLX has its
+                            // own prompt format that expects naked input.
+                            let localOut = await polishWithMLX(
+                                frozen.text,
+                                context: callContext,
+                                timeoutMs: callTimeoutMs,
+                                suspectWords: callSuspects,
+                                userVocabulary: callVocab,
+                                fieldContext: callField,
+                                cleanupLevel: callCleanup,
+                                personalityStyle: callPersonality
+                            )
+                            result = .localOK(localOut)
+                        }
+                    } else {
+                        let demoteCause: String = {
+                            if let hr = hyperbolicReason {
+                                return "Hyperbolic (\(hr))"
+                            } else if !cerebrasRecoverable {
+                                return "Cerebras non-recoverable (\(cerebrasReason ?? "?"))"
+                            } else {
+                                return "Cerebras \(cerebrasReason ?? "failed"), no cloud fallback configured"
+                            }
+                        }()
+                        print("[VOICE-ROUTE] \(demoteCause) → local MLX")
+                        let localOut = await polishWithMLX(
+                            frozen.text,
+                            context: callContext,
+                            timeoutMs: callTimeoutMs,
+                            suspectWords: callSuspects,
+                            userVocabulary: callVocab,
+                            fieldContext: callField,
+                            cleanupLevel: callCleanup,
+                            personalityStyle: callPersonality
+                        )
+                        result = .localOK(localOut)
+                    }
+                }
+            }
+            } // close: outer `else` after `if let s = nvidiaResult`
+
+            switch result {
+            case .nvidiaOK(let s):
+                polishedFrozen = s
+                let nvMs = NVIDIAPolisher.shared.lastLatencyMs
+                print("[VOICE-ROUTE] cloud (NVIDIA primary) returned in \(nvMs)ms | local_avg=\(Int(self.avgLatencyMs))ms")
+                print("[VOICE-ROUTE-DEBUG] setting lastEngine=cloud:nvidia-gpt-oss-120b because NVIDIA returned text in \(nvMs)ms")
+                await MainActor.run {
+                    PolishStatus.shared.lastEngine = "cloud:nvidia-gpt-oss-120b"
+                    PolishStatus.shared.lastReason = "NVIDIA succeeded in \(nvMs)ms"
+                }
+            case .cerebrasOK(let s):
+                polishedFrozen = s
+                let cloudMs = CerebrasPolisher.shared.lastLatencyMs
+                print("[VOICE-ROUTE] cloud (Cerebras) returned in \(cloudMs)ms | local_avg=\(Int(self.avgLatencyMs))ms")
+                print("[VOICE-ROUTE-DEBUG] setting lastEngine=cloud:gpt-oss-120b because Cerebras returned text in \(cloudMs)ms")
+                await MainActor.run {
+                    PolishStatus.shared.lastEngine = "cloud:gpt-oss-120b"
+                    PolishStatus.shared.lastReason = "Cerebras succeeded in \(cloudMs)ms"
+                }
+            case .hyperbolicOK(let s):
+                polishedFrozen = s
+                let hyperMs = HyperbolicPolisher.shared.lastLatencyMs
+                let cerebrasReason = await CerebrasPolisher.shared.lastFailureReason ?? "unknown"
+                print("[VOICE-ROUTE] cloud (Hyperbolic fallback) returned in \(hyperMs)ms")
+                print("[VOICE-ROUTE-DEBUG] setting lastEngine=cloud:hyperbolic-gpt-oss-120b because Cerebras failed (\(cerebrasReason)) and Hyperbolic recovered in \(hyperMs)ms")
+                await MainActor.run {
+                    PolishStatus.shared.lastEngine = "cloud:hyperbolic-gpt-oss-120b"
+                    PolishStatus.shared.lastReason = "Cerebras failed (\(cerebrasReason)) → Hyperbolic succeeded in \(hyperMs)ms"
+                }
+            case .groqOK(let s):
+                polishedFrozen = s
+                let groqMs = GroqPolisher.shared.lastLatencyMs
+                let cerebrasReason = await CerebrasPolisher.shared.lastFailureReason ?? "unknown"
+                let hyperbolicReason = await HyperbolicPolisher.shared.lastFailureReason
+                print("[VOICE-ROUTE] cloud (Groq fallback) returned in \(groqMs)ms")
+                let upstreamCause: String = {
+                    if let h = hyperbolicReason {
+                        return "Cerebras (\(cerebrasReason)) + Hyperbolic (\(h))"
+                    } else {
+                        return "Cerebras (\(cerebrasReason))"
+                    }
+                }()
+                print("[VOICE-ROUTE-DEBUG] setting lastEngine=cloud:groq-llama3.1-8b because \(upstreamCause) failed and Groq recovered in \(groqMs)ms")
+                await MainActor.run {
+                    PolishStatus.shared.lastEngine = "cloud:groq-llama3.1-8b"
+                    PolishStatus.shared.lastReason = "\(upstreamCause) → Groq succeeded in \(groqMs)ms"
+                }
+            case .localOK(let s):
+                polishedFrozen = s
+                print("[VOICE-ROUTE] local fallback used | local_avg=\(Int(self.avgLatencyMs))ms")
+                // Read the truth from polishWithMLX — it set lastUsedLargeLocal
+                // when it resolved the routing decision. Reconstructing the
+                // routing rule here drifts every time we tune the thresholds.
+                let usedLarge = self.lastUsedLargeLocal
+                let nvidiaReason = await NVIDIAPolisher.shared.lastFailureReason
+                let cerebrasReason = await CerebrasPolisher.shared.lastFailureReason ?? "unknown"
+                let hyperbolicReason = await HyperbolicPolisher.shared.lastFailureReason
+                let groqReason = await GroqPolisher.shared.lastFailureReason
+                let localEngineStr = usedLarge ? "local:qwen3-4b" : "local:qwen3-1.7b"
+                let demoteReason: String = {
+                    var parts: [String] = []
+                    if let n = nvidiaReason { parts.append("NVIDIA (\(n))") }
+                    parts.append("Cerebras (\(cerebrasReason))")
+                    if let h = hyperbolicReason { parts.append("Hyperbolic (\(h))") }
+                    if let g = groqReason { parts.append("Groq (\(g))") }
+                    return "\(parts.joined(separator: " + ")) failed → local"
+                }()
+                print("[VOICE-ROUTE-DEBUG] setting lastEngine=\(localEngineStr) because \(demoteReason)")
+                Telemetry.log("polish.local_demote", properties: [
+                    "engine": localEngineStr,
+                    "nvidia_reason": nvidiaReason ?? "not-attempted-or-not-configured",
+                    "cerebras_reason": cerebrasReason,
+                    "hyperbolic_reason": hyperbolicReason ?? "not-attempted-or-not-configured",
+                    "groq_reason": groqReason ?? "not-attempted-or-not-configured",
+                    "demote_reason": demoteReason
+                ])
+                await MainActor.run {
+                    PolishStatus.shared.lastEngine = localEngineStr
+                    PolishStatus.shared.lastReason = demoteReason
+                }
+                // Cloud was configured + attempted but came back nil — silent
+                // fallback to local. Surface it: telemetry + throttled toast.
+                Telemetry.log("cerebras.failure", properties: ["reason": cerebrasReason, "recovered": "local"])
+                await MainActor.run { Self.maybePostCloudFallbackToast(reason: cerebrasReason) }
+            }
+        } else {
+            // Cloud NOT configured / key missing → straight to local. The
+            // `if polishedFrozen == nil` block below handles the local call.
+            print("[VOICE-ROUTE] → local (cloud not configured / key missing)")
+            await MainActor.run {
+                PolishStatus.shared.lastReason = "cloud not configured (Cerebras off or API key missing)"
             }
         }
 
@@ -1112,10 +2012,24 @@ final class Qwen3Polisher {
                 cleanupLevel: cleanupLevel,
                 personalityStyle: personalityStyle
             )
-            // Tag engine label based on routing the local path actually took.
-            let usedLarge = wordCount > 20 && self.isLargeModelReady
+            // Tag engine label based on which local model actually ran.
+            // Read the truth from polishWithMLX (which set lastUsedLargeLocal
+            // during its routing decision) rather than reconstructing here.
+            let usedLarge = self.lastUsedLargeLocal
+            let localEngineStr = usedLarge ? "local:qwen3-4b" : "local:qwen3-1.7b"
+            print("[VOICE-ROUTE-DEBUG] setting lastEngine=\(localEngineStr) because useCloud=false (cloud not configured or key missing) — local-only path")
+            Telemetry.log("polish.local_only", properties: [
+                "engine": localEngineStr,
+                "reason": "useCloud=false → local-only path"
+            ])
             await MainActor.run {
-                PolishStatus.shared.lastEngine = usedLarge ? "local:qwen3-4b" : "local:qwen3-1.7b"
+                PolishStatus.shared.lastEngine = localEngineStr
+                // Only overwrite lastReason if the cloud branch didn't set one
+                // (i.e., the user never had cloud enabled this call).
+                if PolishStatus.shared.lastReason == nil
+                    || PolishStatus.shared.lastReason == "cloud not configured (Cerebras off or API key missing)" {
+                    PolishStatus.shared.lastReason = (PolishStatus.shared.lastReason ?? "local-only path") + " → local MLX"
+                }
             }
         }
         let polishedFrozenFinal = polishedFrozen ?? frozen.text
@@ -1131,27 +2045,120 @@ final class Qwen3Polisher {
         }()
 
         // Unfreeze BEFORE postprocessor so its rules see real text again.
-        let polished = EntityFreezer.unfreeze(safePolished, entities: frozen.entities)
+        let polishedUnfrozen = EntityFreezer.unfreeze(safePolished, entities: frozen.entities)
+        let originalUnfrozen = EntityFreezer.unfreeze(frozen.text, entities: frozen.entities)
+
+        // Relaxed-cloud correctness guard. The sentinel-count check above only
+        // proves frozen entities survived; it CANNOT see a dropped negation
+        // ("we don't ship" → "we ship"), injected vulgarity, ≥3 lost proper
+        // nouns, a lost email/URL/number, prompt-residue, an emoji, or an
+        // em-dash. Relaxed mode applies exactly those absolute rules and skips
+        // the word/length/contraction budgets, so legitimate cloud
+        // restructuring is never rejected. On reject we fall back to the raw
+        // (unfrozen) input rather than paste a semantically-corrupted polish
+        // into the user's document. (Previously this validator was dead code —
+        // `validateAndProcess` had no callers, leaving the cloud path with no
+        // semantic-flip protection at all.)
+        let polished: String
+        if let accepted = Sanitizer.run(
+            polish: polishedUnfrozen,
+            original: originalUnfrozen,
+            mode: .relaxed,
+            cleanupLevel: cleanupLevel,
+            userVocabulary: userVocabulary
+        ) {
+            polished = accepted
+        } else {
+            print("[VOICE-GUARD] relaxed sanitizer rejected polish — falling back to raw input")
+            polished = originalUnfrozen
+        }
 
         // Step N: Post-processor (rule-based, <1ms). Enforces capitalization,
         // hyphenates known compounds, trims trailing cutoff periods. Runs
-        // even on fail-open paths to keep the output consistent.
-        return Self.applyPostprocessor(polished, userVocabulary: userVocabulary)
+        // even on fail-open paths to keep the output consistent. The cleanup
+        // level gates the list passes (light/none never list; high detects
+        // implied enumeration).
+        let polishOut = Self.applyPostprocessor(polished, userVocabulary: userVocabulary, cleanupLevel: cleanupLevel)
+        let polishOutMs = Int(Date().timeIntervalSince(polishInStartedAt) * 1000)
+        let polishOutEngine = await MainActor.run { PolishStatus.shared.lastEngine ?? "unknown" }
+        let polishOutSanitized = (polishOut != polished)
+        print("[VOICE-POLISH-OUT] engine=\(polishOutEngine) latency=\(polishOutMs)ms sanitized=\(polishOutSanitized)")
+        return polishOut
         #else
-        return Self.applyPostprocessor(stripped, userVocabulary: userVocabulary)
+        let polishOutNoMLX = Self.applyPostprocessor(stripped, userVocabulary: userVocabulary, cleanupLevel: cleanupLevel)
+        let polishOutMsNoMLX = Int(Date().timeIntervalSince(polishInStartedAt) * 1000)
+        print("[VOICE-POLISH-OUT] engine=rules-only latency=\(polishOutMsNoMLX)ms sanitized=false")
+        return polishOutNoMLX
         #endif
     }
 
     /// Apply the deterministic post-processor with the current user
     /// vocabulary as proper-noun safelist. Centralizes the call so every
     /// return path goes through the same cleanup.
-    nonisolated static func applyPostprocessor(_ text: String, userVocabulary: [String]?) -> String {
+    nonisolated static func applyPostprocessor(_ text: String, userVocabulary: [String]?, cleanupLevel: String = "medium") -> String {
         let userNouns: Set<String> = Set((userVocabulary ?? []).map { $0.lowercased() })
-        let options = PolishPostprocessor.Options(userProperNouns: userNouns)
+        // Gate the list passes by the active cleanup level: lighter levels must
+        // not impose list structure on prose. Mapping: none→never list,
+        // light→explicit enumeration only, medium→clear (incl. colon lists),
+        // high→aggressive (detect implied enumeration in a rant).
+        let options = PolishPostprocessor.Options(
+            userProperNouns: userNouns,
+            listMode: PolishPostprocessor.ListFormattingMode(cleanupLevel: cleanupLevel)
+        )
         let result = PolishPostprocessor.process(text, options: options)
         if !result.changes.isEmpty {
             let ruleNames = result.changes.map { $0.rule }.joined(separator: ",")
             print("[VOICE-POST] post-processor applied: \(ruleNames)")
+        }
+        return result.cleaned
+    }
+
+    /// Minimal deterministic finish for the rules-only fallback paths
+    /// (cleanupLevel=none, polish disabled, MLX unlinked, model not ready).
+    ///
+    /// Wispr Flow's Smart Formatting still converts spoken punctuation/line
+    /// commands and fixes spacing even when the AI rewrite is off — so these
+    /// paths must NOT return raw text. But they MUST stay near-verbatim: we do
+    /// NOT restructure (no list detection, no paragraph breaks, no number
+    /// spellout, no currency folding). Only: spoken-command conversion,
+    /// spacing repair, sentence/standalone-I capitalization, dash strip,
+    /// whitespace. Idempotent — safe to run on text TextFormatter already
+    /// converted upstream.
+    ///
+    /// List gating: this path always uses `.none` for `listMode`. Previously
+    /// the list passes ran unconditionally (the "no list detection" promise
+    /// above was aspirational); now it is enforced. This is correct for every
+    /// caller: `cleanupLevel=none` must never produce a list, and the other
+    /// fail-open callers (polish disabled, MLX unlinked, model not ready,
+    /// non-English) didn't run the model, so there is no model-formatted list
+    /// to honor and we stay near-verbatim.
+    nonisolated static func applyMinimalPostprocessor(_ text: String, userVocabulary: [String]?) -> String {
+        let userNouns: Set<String> = Set((userVocabulary ?? []).map { $0.lowercased() })
+        let options = PolishPostprocessor.Options(
+            sentenceStartCaps: true,
+            midClauseCapsReducer: false,
+            compoundWords: false,
+            trailingCutoffPeriod: true,
+            whitespace: true,
+            standaloneICaps: true,
+            brandCaps: false,
+            filenameDot: false,
+            trailingForeignStrip: false,
+            trailingQuestionSanity: false,
+            numberSpellout: false,
+            unitAbbreviation: false,
+            timeFormat: false,
+            quarterAbbreviation: false,
+            spokenUrlReconstruction: true,
+            spokenPunctuation: true,
+            punctuationSpacing: true,
+            userProperNouns: userNouns,
+            listMode: .none
+        )
+        let result = PolishPostprocessor.process(text, options: options)
+        if !result.changes.isEmpty {
+            let ruleNames = result.changes.map { $0.rule }.joined(separator: ",")
+            print("[VOICE-POST] minimal post-processor applied: \(ruleNames)")
         }
         return result.cleaned
     }
@@ -1186,30 +2193,191 @@ final class Qwen3Polisher {
     /// family as our local Qwen3-4B, so the same rule format applies, and
     /// the bigger model can fully leverage all the rules + few-shot examples
     /// without getting confused by them.
+    // MARK: - App context label mapping
+
+    /// Maps frontmost app bundle IDs to short context labels injected into the
+    /// cloud system prompt. The model uses this to adjust register and format —
+    /// e.g. keep Slack messages brief and casual, expand email into full prose.
+    nonisolated static func appContextLabel(forBundleID id: String?) -> String? {
+        guard let id else { return nil }
+        switch id {
+        // Messaging / chat
+        case "com.tinyspeck.slackmacgap", "com.slack.Slack":
+            return "Slack message"
+        case "com.apple.MobileSMS", "com.hnc.Discord":
+            return "chat message"
+        case "ru.keepcoder.Telegram", "org.whispersystems.signal-desktop":
+            return "chat message"
+        case "com.microsoft.teams2", "com.microsoft.teams":
+            return "Teams message"
+        // Email
+        case "com.apple.mail":
+            return "email"
+        case "com.microsoft.Outlook":
+            return "email"
+        case "com.google.Chrome", "org.mozilla.firefox", "com.apple.Safari":
+            return "browser — likely a web form or email"
+        // Docs / writing
+        case "com.apple.TextEdit", "com.apple.Notes":
+            return "text document or notes"
+        case "com.microsoft.Word", "com.microsoft.Excel":
+            return "document"
+        case "com.google.Chrome.app.notionDesktop":
+            return "Notion document"
+        // Code / terminal
+        case _ where id.hasPrefix("com.microsoft.VSCode"),
+             _ where id.hasPrefix("com.jetbrains"),
+             _ where id.hasPrefix("com.apple.dt.Xcode"):
+            return "code editor — output may be a comment, commit message, or inline doc"
+        case "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp-Stable":
+            return "terminal"
+        // Productivity
+        case "com.linear.linear", "com.atlassian.jira":
+            return "issue tracker — concise task description"
+        case "com.todoist.mac.Todoist", "com.culturedcode.ThingsMac":
+            return "task manager — short action item"
+        default:
+            return nil
+        }
+    }
+
+    /// Build the SYSTEM prompt sent to the cloud model.
+    ///
+    /// This is intentionally short. The previous implementation shipped a
+    /// 2KB+ system prompt full of micro-rules (slim v1, slim v2, full),
+    /// plus per-call cleanup instructions, plus a personality block, plus
+    /// vocabulary tables, plus app-context strings, plus field-context
+    /// strings, plus suspect-word hints. The result was a wall of text that
+    /// taught the model to behave as a formatter rather than as a writer.
+    ///
+    /// The new design treats the cloud model as a smart editor and gives it
+    /// a single editorial brief in plain English. Per-call situation (which
+    /// app, which field, vocabulary, personality, cleanup level, prior
+    /// context) flows through the USER message via `buildCloudUserMessage`,
+    /// not by appending more rules to the system prompt. Models read the
+    /// task they're about to do, not a fresh policy doc on every call.
+    ///
+    /// Style-card content is appended after the brief because it is the
+    /// only piece of long-form context the user has explicitly authored.
+    /// Everything else lives in the user message.
+    ///
+    /// The other parameters (cleanupLevel, personalityStyle, userVocabulary,
+    /// suspectWords, fieldContext, appContextLabel, wordCount) are accepted
+    /// here for source compatibility with the previous signature, but are
+    /// not consulted — they flow through `buildCloudUserMessage` instead.
     nonisolated static func buildCloudSystemPrompt(
         cleanupLevel: String,
         personalityStyle: String,
-        userVocabulary: [String]?
+        userVocabulary: [String]?,
+        suspectWords: [String]? = nil,
+        styleCardBlock: String? = nil,
+        fieldContext: String? = nil,
+        appContextLabel: String? = nil,
+        wordCount: Int = 0
     ) -> String {
-        // Full base instructions — same as local. Same rules, same examples.
-        var prompt = systemInstructions
-
-        // Per-call OVERRIDE block: cleanup level + personality.
-        prompt += "\n\n=== OVERRIDE: CLEANUP MODE (highest priority) ===\n"
-        prompt += Self.cleanupInstruction(cleanupLevel)
-
-        prompt += "\n\n=== OVERRIDE: PERSONALITY (highest priority) ===\n"
-        prompt += Self.personalityInstruction(personalityStyle)
-
-        // Known proper nouns (preserve casing). Top 60 prioritized terms.
-        if let vocab = userVocabulary, !vocab.isEmpty {
-            let top = vocab.prefix(60).joined(separator: ", ")
-            prompt += "\n\nKnown proper nouns (preserve EXACTLY as written, do not 'correct' them): \(top)."
+        _ = cleanupLevel
+        _ = personalityStyle
+        _ = userVocabulary
+        _ = suspectWords
+        _ = fieldContext
+        _ = appContextLabel
+        _ = wordCount
+        var prompt = cloudSystemBrief
+        if let card = styleCardBlock, !card.isEmpty {
+            prompt += "\n\n" + card
         }
-        // Bundled product names (always-on safelist).
-        prompt += "\n\nAlso preserve these product names verbatim: \(Self.knownProductNames.joined(separator: ", "))."
-
         return prompt
+    }
+
+    /// Build the USER message sent to the cloud model. Wraps the raw ASR
+    /// dictation in a CONTEXT preamble so the model knows where it is
+    /// (what app, what field, who's speaking, what came just before).
+    ///
+    /// Format:
+    ///   [CONTEXT]
+    ///   App: <label or "unknown">
+    ///   Field: <fieldContext or "general text">
+    ///   Personality: <style>
+    ///   Cleanup level: <level>
+    ///   Recent vocabulary: <top 15 vocab items>      (optional)
+    ///   Just before this, they dictated: "<prev>"    (optional)
+    ///   Possibly mis-transcribed: <suspects>          (optional)
+    ///
+    ///   [DICTATION]
+    ///   <raw ASR text>
+    ///
+    /// Sanitization: every untrusted field (user vocab, suspect words, app
+    /// label, prior dictation, field-context text) is passed through
+    /// `sanitizeUntrustedField` before being interpolated. Prevents a
+    /// dictation that happens to contain "ignore previous instructions" in
+    /// a vocabulary slot from steering the model.
+    nonisolated static func buildCloudUserMessage(
+        rawDictation: String,
+        cleanupLevel: String,
+        personalityStyle: String,
+        userVocabulary: [String]?,
+        suspectWords: [String]?,
+        fieldContext: String?,
+        appContextLabel: String?,
+        priorContext: String?
+    ) -> String {
+        let appLabel = appContextLabel.flatMap {
+            Self.sanitizeUntrustedField($0, maxChars: 80)
+        } ?? "unknown"
+        let fieldLabel: String = {
+            if let fc = fieldContext, !fc.isEmpty {
+                return "appending to: \"\(Self.sanitizeUntrustedField(fc, maxChars: 200))\""
+            }
+            return "general text"
+        }()
+        let personality = personalityStyle.isEmpty ? "neutral" : personalityStyle
+        let cleanup = cleanupLevel.isEmpty ? "medium" : cleanupLevel
+
+        var contextLines: [String] = [
+            "App: \(appLabel)",
+            "Field: \(fieldLabel)",
+            // Per-personality reminders are kept short. The "excited"
+            // option is the most common leak surface for emoji injection
+            // (the model interprets "energetic" as license to add 🎉 / 🚀)
+            // so every personality explicitly reinforces the global no-emoji
+            // rule from the system prompt's Hard Rules. Belt-and-suspenders.
+            "Personality: \(personality) (match this register — neutral=mirror the speaker, formal=expand contractions, casual=keep contractions and slang, excited=energetic via word choice and punctuation ONLY, never emojis or decorative symbols)",
+            "Cleanup level: \(cleanup) (light=barely touch, medium=clean and format, high=restructure aggressively)"
+        ]
+
+        if let vocab = userVocabulary, !vocab.isEmpty {
+            // Top 15 phonetically-prioritized vocabulary terms. Anything past 15
+            // is noise — the model has the proper nouns it needs to recognize.
+            let top = vocab.prefix(15)
+                .map { Self.sanitizeUntrustedField($0, maxChars: 80) }
+                .joined(separator: ", ")
+            contextLines.append("Recent vocabulary (use these spellings if a word sounds close): \(top)")
+        }
+
+        if let prior = priorContext, !prior.isEmpty {
+            let s = Self.sanitizeUntrustedField(prior, maxChars: 300)
+            contextLines.append("Just before this, they dictated: \"\(s)\"")
+        }
+
+        if let suspects = suspectWords, !suspects.isEmpty {
+            let cleaned = suspects
+                .prefix(8)
+                .map { Self.sanitizeUntrustedField($0, maxChars: 80) }
+                .joined(separator: ", ")
+            if !cleaned.isEmpty {
+                contextLines.append("Possibly mis-transcribed (look harder at these — they may be proper nouns from the vocabulary): \(cleaned)")
+            }
+        }
+
+        let context = contextLines.joined(separator: "\n")
+        let trimmed = rawDictation.trimmingCharacters(in: .whitespacesAndNewlines)
+        return """
+        [CONTEXT]
+        \(context)
+
+        [DICTATION]
+        \(trimmed)
+        """
     }
 
     #if canImport(MLXLLM) && canImport(MLXLMCommon)
@@ -1223,16 +2391,33 @@ final class Qwen3Polisher {
         cleanupLevel: String = "medium",
         personalityStyle: String = "neutral"
     ) async -> String {
+        // Reset the run attribution flag — set to true inside the routing
+        // block below iff the 4B actually services this polish. Callers
+        // (the cloud-fallback branch and the cloud-not-configured branch)
+        // read `self.lastUsedLargeLocal` AFTER this method returns to
+        // attribute the correct engine label on PolishStatus.
+        self.lastUsedLargeLocal = false
+
         // Route between the 1.7B fast path and the 4B prose-quality path
-        // BEFORE fetching a container. Routing rule:
-        //   - >20 words, OR
-        //   - blank-line paragraph break ("\n\n"), OR
-        //   - bullet-list marker ("\n- "), OR
-        //   - backtick (code identifier), OR
-        //   - block-quote-style "\"" content
-        // ...triggers the 4B model. If the 4B hasn't finished loading yet
-        // (background download still in flight), gracefully fall back to the
-        // 1.7B so polish never blocks on the larger model.
+        // BEFORE fetching a container.
+        //
+        // Reaching `polishWithMLX` already means cloud was unavailable or
+        // disabled — so the routing decision here is purely "small or large
+        // local". The 1.7B mangles long structured inputs (drops list items,
+        // injects commas into pronoun chains, fails to collapse stutters),
+        // so we route to the 4B whenever the input has any structural
+        // complexity that the 1.7B is known to mishandle:
+        //   - wordCount > 40 (the 1.7B failure threshold for long ramble), OR
+        //   - newlines (multi-paragraph or list-formatted input), OR
+        //   - list markers ("\n- " or "\n* "), OR
+        //   - "?" (question — needs proper punctuation logic the 1.7B fumbles), OR
+        //   - ":" (header-with-enumeration pattern), OR
+        //   - backtick (code identifier — sentinel for technical content), OR
+        //   - schema dictation, multi-topic, or HIGH cleanup with >40 words.
+        // The 4B is lazy-loaded on the first hit (no app-launch prewarm) and
+        // idle-unloaded after 5 minutes. If the load is in flight, the call
+        // blocks on `ensureLargeModel` rather than falling back to the 1.7B —
+        // a 2-3s one-time load is preferable to 1.7B garbage.
         let cleanedInput = text
         let wordCount = cleanedInput.split(separator: " ").count
 
@@ -1252,22 +2437,14 @@ final class Qwen3Polisher {
             return formatted
         }
 
-        // Benchmark (2026-05): 4B at 40 words = 0.68s (imperceptible), 1.7B at
-        // >12 words starts emitting verbatim passthrough or losing entities.
-        // Threshold of 12 trades ~300ms of latency for a substantial quality
-        // jump on the meat of typical dictation lengths.
-        //
         // Multi-topic detection: 3+ topic-shift markers signals a long dump
         // that needs bullet-list restructuring. Schema dictation ("make X
         // table id, name, status") needs backtick-wrapped snake_case output.
         // Both force-route to 4B regardless of word count.
         let lowerInput = cleanedInput.lowercased()
-        let topicShiftMarkers = ["also", "and then", "oh and", "then go", "and message",
-                                  "next thing", "next up", "and finally", "and also"]
-        let topicShiftHits = topicShiftMarkers.reduce(0) { acc, marker in
-            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: marker) + "\\b"
-            guard let rx = try? NSRegularExpression(pattern: pattern) else { return acc }
-            return acc + rx.numberOfMatches(in: lowerInput, range: NSRange(lowerInput.startIndex..., in: lowerInput))
+        // Hoisted from hot path — was recompiled per polish call.
+        let topicShiftHits = Self.topicShiftRegexes.reduce(0) { acc, rx in
+            acc + rx.numberOfMatches(in: lowerInput, range: NSRange(lowerInput.startIndex..., in: lowerInput))
         }
         let isMultiTopic = topicShiftHits >= 3
         // Schema dictation: "make/create [a] {table|schema|struct|object|model} X
@@ -1277,22 +2454,51 @@ final class Qwen3Polisher {
         // High cleanup + >40 words: force 4B (the 1.7B can't restructure long ramble).
         let isLongHigh = (cleanupLevel.lowercased() == "high") && wordCount > 40
 
-        let needsLarge = wordCount > 12
-            || cleanedInput.contains("\n\n")
-            || cleanedInput.contains("\n- ")
-            || cleanedInput.contains("`")
-            || cleanedInput.contains("\"")
-            || isMultiTopic
+        // Structural complexity markers — any one of these indicates the
+        // input has shape the 1.7B chokes on. The "?" and ":" thresholds
+        // catch question-answer dictations and header-enumeration patterns
+        // that the 1.7B emits as run-on prose.
+        let hasNewlineStructure = cleanedInput.contains("\n")
+        let hasListMarker = cleanedInput.contains("\n- ")
+            || cleanedInput.contains("\n* ")
+        let hasQuestion = cleanedInput.contains("?")
+        let hasColon = cleanedInput.contains(":")
+        let hasBacktick = cleanedInput.contains("`")
+        let hasComplexStructure = hasNewlineStructure
+            || hasListMarker
+            || hasQuestion
+            || hasColon
+            || hasBacktick
+
+        let needsLargeShape = wordCount > 40
+            || hasComplexStructure
+            || (isMultiTopic && wordCount > 20)
             || hasSchemaSignal
             || isLongHigh
+        // 4B disabled by feature flag — never route there. If the input "wants"
+        // the 4B shape but cloud is unavailable, fall through to 1.7B and log
+        // it so the slow-no-cloud case is visible.
+        let needsLarge = Self.useLargeLocalModel && needsLargeShape
+        if needsLargeShape && !Self.useLargeLocalModel {
+            print("[VOICE-LP] no cloud configured, using local 1.7B for \(wordCount)-word input (4B disabled)")
+        }
         var usedLarge = false
         let container: ModelContainer
         if needsLarge {
             do {
+                // Lazy-load the 4B if it hasn't been loaded yet this session
+                // (or after an idle unload). `ensureLargeModel` is idempotent
+                // and shares the in-flight load Task across concurrent calls,
+                // so multiple long polishes during the load won't kick off
+                // duplicate downloads. The block here pays the one-time
+                // 2-3s load cost on the first long polish.
+                if !isLargeModelReady {
+                    print("[VOICE-LP] 4B not loaded — lazy-loading on demand for \(wordCount)-word input")
+                }
                 container = try await ensureLargeModel()
                 usedLarge = true
             } catch {
-                print("[VOICE-LP] 4B not ready, falling back to 1.7B (\(error.localizedDescription))")
+                print("[VOICE-LP] 4B load failed, falling back to 1.7B (\(error.localizedDescription))")
                 do {
                     container = try await ensureModel()
                 } catch {
@@ -1308,7 +2514,14 @@ final class Qwen3Polisher {
                 return text
             }
         }
-        print("[VOICE-LP] route=\(usedLarge ? "4B" : "1.7B") words=\(wordCount) multiTopic=\(isMultiTopic) schema=\(hasSchemaSignal) longHigh=\(isLongHigh)")
+        // Tell the caller which model ran. Set BEFORE the inference call so
+        // even if the inference times out and we fall back to raw text, the
+        // engine label still reflects the routing decision.
+        self.lastUsedLargeLocal = usedLarge
+        if usedLarge {
+            self.last4BUseTime = Date()
+        }
+        print("[VOICE-LP] route=\(usedLarge ? "4B" : "1.7B") words=\(wordCount) complexStruct=\(hasComplexStructure) multiTopic=\(isMultiTopic) schema=\(hasSchemaSignal) longHigh=\(isLongHigh)")
 
         // Cap max tokens at roughly 2x input + a small buffer. Polish is by
         // definition same-length — leaving more room lets a runaway model
@@ -1328,8 +2541,7 @@ final class Qwen3Polisher {
         // HIGH gets 3× to avoid truncating aggressive restructuring (bullet lists,
         // multi-paragraph rewrites). Medium/light stay at 2×. List-hint adds 80
         // tokens instead of 60 — "1.\n2.\n3." prefixes are more expensive than raw prose.
-        let cleanupMultiplier: Int = (cleanupLevel.lowercased() == "high") ? 3 : 2
-        let cap = approxInputTokens * cleanupMultiplier + (hasListHint ? 80 : 60)
+        let cap = max(80, Int(Double(approxInputTokens) * 1.15)) + (hasListHint ? 30 : 16)
         let params = GenerateParameters(temperature: 0.0, topP: 1.0)
             .with(maxTokens: cap)
 
@@ -1389,9 +2601,13 @@ final class Qwen3Polisher {
         // Bug 4: cleanup-mode instruction. Use the shared helper so polish
         // and merge stay in lockstep, and the HIGH branch is unmistakably
         // aggressive.
+        // Pass for4B so the helper lifts the email/list/code/number rules
+        // from cloudSystemBrief into the local HIGH prompt — the 4B has the
+        // capacity to follow more explicit guidance and benefits from it.
+        // Light/medium stay minimal so short polishes don't bloat the prompt.
         let levelPrefix = """
         === OVERRIDE: CLEANUP MODE (highest priority, overrides any conflicting system rule) ===
-        \(Self.cleanupInstruction(cleanupLevel))
+        \(Self.cleanupInstruction(cleanupLevel, for4B: usedLarge))
         ===
 
         """
@@ -1508,6 +2724,17 @@ final class Qwen3Polisher {
                     print("[VOICE] Qwen3 raw response (\(ms)ms): \(response.prefix(200))")
                     await MainActor.run { Qwen3Polisher.shared.recordLatency(ms) }
                     let sanitized = Self.sanitize(response, original: text, vocabulary: userVocabulary, suspectWords: suspectWords, cleanupLevel: cleanupLevel)
+                    // Sanitizer-rejection visibility. When sanitize() rejects the
+                    // model output it returns `text` (the frozen INPUT) unchanged.
+                    // If that happens we effectively shipped UNPOLISHED text — the
+                    // single most common "polish doesn't work" failure. Surface it
+                    // as a greppable [VOICE-POLISH] line (the per-guard reason is
+                    // logged inside sanitize() as [VOICE] Qwen3 polish rejected: …).
+                    if sanitized == text {
+                        print("[VOICE-POLISH] sanitizer REJECTED model output → fell back to raw input (see [VOICE] reject reason above)")
+                    } else {
+                        print("[VOICE-POLISH] sanitizer ACCEPTED model output (\(text.count)→\(sanitized.count) chars)")
+                    }
                     // Bug 1b: post-sanitize em-dash/en-dash scrub. The user HATES em-dashes;
                     // strip any that survive the model + sanitize passes.
                     let cleaned = Self.stripDashes(sanitized)
@@ -1569,13 +2796,33 @@ final class Qwen3Polisher {
     /// Comprehensive formatting rules for speech-to-text correction.
     nonisolated private static let systemInstructions: String = """
     /no_think
-    You are a speech assistant that makes dictation sound like the speaker's best take — not an AI's polish.
+    You are a polish editor for speech-to-text dictation.
 
-    The goal: output that sounds like the speaker took a breath, spoke with intention, and got it right the second time. Same voice. Same rhythm. Same word choices. Just clearer. No stumbles, no ASR noise — but still unmistakably them. Not smoothed into something generic. Not rewritten into something that sounds like it came from an assistant.
+    == HARD CONSTRAINTS — NEVER VIOLATED (override every rule, example, and mode below) ==
+    1. NO em-dashes (\u{2014}), en-dashes (\u{2013}), or horizontal bars (\u{2015}, \u{2012}). Use a comma, a period + capital, or restructure. If a dash feels right, you are wrong — pick comma or period.
+    2. NO emojis or pictographic Unicode symbols. Ever.
+    3. NEVER invent content. Every detail, qualifier, and clause the speaker said must survive. Never paraphrase, never add facts, never pad.
+    4. NEVER substitute one real English word for a different real word. Default: preserve every spoken word character-for-character. Exceptions: ASR non-word fixes (e.g., "decreation" \u{2192} "degradation"), unambiguous homophones, and speaker self-corrections.
+    5. FROZEN TOKENS (\u{27E6}E0\u{27E7}, \u{27E6}E1\u{27E7}, ...) are opaque placeholders. Copy verbatim. Never modify, split, or invent new ones.
+    6. CLAUSE PRESERVATION: every distinct topic/action in the input must appear in the output. Multi-topic inputs joined by "and", "oh and", "also", "plus", "then", "by the way" → preserve ALL clauses in the output. NEVER drop a later clause. NEVER replace a later clause with "?" or "...". NEVER truncate because the output "feels complete." Actions in = actions out. (Example: "remind me to call the dentist on thursday morning and then grab groceries after work oh and can you also text john that we're meeting at six" → "Remind me to call the dentist on Thursday morning and then grab groceries after work. Oh, and can you also text John that we're meeting at 6:00?" — three actions in, three actions out.)
+    7. BACKTICK SCOPE (strict): backticks are ONLY for single programming-identifier tokens — one camelCase/snake_case/PascalCase/SCREAMING_SNAKE word, one `foo()`, one shell flag like `--verbose`, one file path, one URL, one email, one version number, one identifier-shaped string. NEVER wrap multi-word phrases or natural English in backticks. NEVER backtick everyday words like "user name", "should be", or "the variable". When the speaker says "the variable user name should be camel case not snake case", the ONLY backticked token is the identifier `userName`. (Right: "The variable `userName` should be camelCase, not snake_case." Wrong: "The variable `username_should_be` camelCase, not snakeCase.")
+    8. PRONOUN PUNCTUATION: never insert a comma between a subject pronoun and its verb. "I, wanted" is wrong; "I wanted" is correct. Same for he/she/we/they/you. When the input opens with a salutation like "hi <name>" or "hey <name>" followed by a full sentence in email register, insert a paragraph break (\\n\\n) after the salutation comma — but only when the following words begin a new sentence, not a continuation.
+    9. NUMBER NORMALIZATION:
+       - "<N> point <M> million/billion/thousand" → digit form WITH unit word: "4.5 million" or "$4.5M". NEVER "four point 5.000.000". NEVER European period-as-thousand-separator like "4.500.000". NEVER comma-stuffed forms like "4,500,000" when the speaker said "4.5 million".
+       - Decimals use a period as separator with NO thousand-separators inside the decimal: "4.5" not "4,5" and not "4.500".
+       - Contractions are preserved exactly. "we're" stays "we're", never "were". "it's", "they're", "you're", "don't", "won't", "I'd" — apostrophes are load-bearing.
+    10. NO ARTICLE OR WORD INJECTION: do NOT insert articles ("a", "an", "the") or filler words ("just", "really", "so", "actually") that the speaker did not say. Time expressions stay exact: "next week" never becomes "the next week"; "last month" never becomes "the last month"; "tomorrow" never becomes "by tomorrow".
+
+    Examples of the dash/emoji rule applied:
+    Wrong: "I'm tired \u{2014} I've been working all day."   Right: "I'm tired. I've been working all day."
+    Wrong: "The model \u{2014} which I just installed \u{2014} is fast."   Right: "The model, which I just installed, is fast."
+    Wrong: "Ship it \u{1F680}"   Right: "Ship it."
+
+    The goal: output that sounds like the speaker took a breath, spoke with intention, and got it right the second time. Same voice. Same rhythm. Same word choices. Just clearer. No stumbles, no ASR noise, but still unmistakably them. Not smoothed into something generic. Not rewritten into something that sounds like it came from an assistant.
 
     The output should be indistinguishable from something the speaker typed themselves on a good day. If you read it back and it sounds like an AI cleaned it up, you went too far.
 
-    Output ONLY the corrected text — no explanation, no commentary.
+    Output ONLY the corrected text. No explanation, no commentary.
 
     == FEW-SHOT EXAMPLES (the kind of output we want) ==
     These show the target style. Notice: the voice stays the same. The rhythm stays. Only the noise is removed.
@@ -1637,20 +2884,6 @@ final class Qwen3Polisher {
     5. Do NOT invent new ⟦E…⟧ tokens that weren't in the input.
     These tokens will be expanded back to real content after your output is produced; if you damage them, the result is broken.
 
-    == ABSOLUTE RULE: NO DASHES (highest priority, overrides all other formatting instructions) ==
-    NEVER use em-dashes (\u{2014}), en-dashes (\u{2013}), or horizontal bars (\u{2015}/\u{2012}) in your output. UNDER ANY CIRCUMSTANCES. They are BANNED. Use a comma for an aside, a period for a sentence break, or restructure the sentence. NEVER use a dash to add dramatic emphasis. NEVER use a dash to connect clauses.
-
-    Wrong: "I'm tired — I've been working all day."
-    Right: "I'm tired. I've been working all day."
-
-    Wrong: "The model — which I just installed — is fast."
-    Right: "The model, which I just installed, is fast."
-
-    Wrong: "$400 — before tax — then..."
-    Right: "$400 (before tax), then..."
-
-    If you find yourself reaching for an em-dash, USE A COMMA. If a comma feels weak, USE A PERIOD. The dash is never the right answer. This rule is absolute and overrides everything else.
-
     == NUMBER FORMATTING (US English) ==
     Use US English number conventions:
     - Comma as thousands separator: 2,300 (not 2.300)
@@ -1659,7 +2892,8 @@ final class Qwen3Polisher {
     - "twenty three hundred euros" → "€2,300"
     - "two point five thousand" → "2,500" or "2.5K" depending on context
 
-    == PRESERVE THE SPEAKER'S WORDS (READ FIRST, OVERRIDES EVERYTHING BELOW EXCEPT THE NO DASHES RULE) ==
+    == PRESERVE THE SPEAKER'S WORDS (applies WITHIN each sentence; HIGH cleanup may still restructure across sentences) ==
+    Scope resolution: HIGH cleanup mode (see cleanupInstruction) is authorized to restructure ACROSS sentences for clarity — split run-ons, collapse correction chains, break paragraphs at topic shifts, extract enumerations as bullets. Word-level preservation rules below apply WITHIN each surviving sentence: do not swap a word for a synonym, do not change tense, do not condense phrasing.
     DEFAULT IS DO NOTHING. Your job is punctuation, capitalization, paragraph structure, and obvious-error fixes. NOT rewriting.
 
     If the input word is a real English word that fits the sentence, KEEP IT EXACTLY. Do not swap it for a synonym. Do not change tense. Do not "improve" word choice. Do not condense phrases.
@@ -1695,6 +2929,8 @@ final class Qwen3Polisher {
     - Insert \n\n when speaker shifts to a clearly different topic ("...and that's the shipping update. Now for the budget...").
     - Insert \n\n after a salutation opener ("Hey John,\n\nJust wanted to...").
     - Insert \n\n before a list that follows prose ("Here's what we need to do:\n\n1. ...").
+    - Insert \n\n when the speaker uses any of these pivot words: "also", "anyway", "oh and", "by the way", "speaking of", "one more thing", "okay so", "moving on", "on that note", "separately", "and another thing".
+    - For dictations 40+ words: lean toward MORE paragraph breaks. One solid wall of text is always wrong when the speaker covered multiple thoughts. Each paragraph = one coherent idea.
     - DO NOT break mid-thought just to create "visual breathing room".
     - DO NOT break inside a single continuous argument.
     - For dictations < 3 sentences: never add paragraph breaks unless explicitly commanded.
@@ -1775,6 +3011,11 @@ final class Qwen3Polisher {
 
     == SELF-CORRECTIONS (remove false start, keep correction) ==
     "actually no"/"scratch that"/"wait no"/"never mind"\u{2192}remove preceding phrase. "I mean X"/"let me rephrase"\u{2192}replace prior with X. "let me start over"/"start again"\u{2192}discard everything before. Stutters: "the the the cat"\u{2192}"the cat". False starts: "I went to \u{2014} I drove to"\u{2192}"I drove to". Trailing fillers at end ("...you know"/"...right"/"...yeah")\u{2192}remove.
+    CANONICAL CORRECTION EXAMPLES (keep ONLY the corrected value, drop the abandoned one):
+    - "let's do coffee at 2, actually 3" \u{2192} "Let's do coffee at 3." ("actually" between two times = correction, second wins)
+    - "send it to John, no wait, to Sarah" \u{2192} "Send it to Sarah." ("no wait" drops John)
+    - "the file is in downloads, sorry, in documents" \u{2192} "The file is in documents." ("sorry" mid-sentence before a restated location = correction, keep the second)
+    CORRECTION TRIGGERS (only when they signal an override, NOT when used normally): "actually", "no wait", "sorry", "scratch that", "I mean", "rather". COUNTEREXAMPLE: "I actually agree with you" \u{2192} keep verbatim ("actually" is emphasis here, not a correction). "Sorry to bother you" \u{2192} keep ("sorry" is an apology, not a correction). The trigger only fires when a DIFFERENT value/word/clause follows that replaces what came before.
     RESTART-CORRECTIONS (critical, often unmarked): when the speaker restarts a clause to correct themselves, keep ONLY the corrected version. Drop the abandoned attempt entirely. The cue is a near-duplicate phrase, sometimes with one word changed or removed.
     - "hey i might be a little late to hey i might be late to dinner" \u{2192} "Hey, I might be late to dinner."
     - "unless thats the insurance renewal actually unless thats the insurance renewal" \u{2192} "unless that's the insurance renewal"
@@ -2369,8 +3610,8 @@ final class Qwen3Polisher {
     Input: support email was maybe admin dash temp at northgate dash help dot net or admin dot temp at northgate dash help dot net whichever one bounced less and serial thing was A9 Q2 7B 44 slash 44B wait no ignore that last part probably
     Output: Support email was maybe `admin-temp@northgate-help.net` or `admin.temp@northgate-help.net`, whichever bounced less. Serial: `A9-Q2-7B-44` (ignore the last part).
 
-    == HALLUCINATION BAN (CRITICAL) ==
-    NEVER invent or substitute a word that wasn't in the input. If a token looks like a valid English word, KEEP IT EXACTLY. The model has been observed to invent garbage like "observability" → "obversibility", "let's" → "lots", or to mangle proper nouns it doesn't recognize. Default rule: when in doubt, leave the spelling alone.
+    == HALLUCINATION-OBSERVED CASES (specific failures to never repeat — see Hard Constraint #3/#4) ==
+    The model has been observed to invent garbage like "observability" → "obversibility", "let's" → "lots", or to mangle proper nouns it doesn't recognize. Specific cases:
     - "observability" stays "observability", NEVER "obversibility" / "observibility"
     - "Claude" stays "Claude", NEVER "clot" / "cloud" / "Clyde"
     - "Snow Strippers" stays "Snow Strippers", NEVER "Snowstrippers" / "Snowstrip"
@@ -2407,11 +3648,6 @@ final class Qwen3Polisher {
     - PARAGRAPH-EMIT SIGNAL: when the speaker shifts topic ("also", "next", "and then", or a clearly new subject), emit a blank line (\n\n) before continuing.
     - QUOTED-MESSAGE SIGNAL: when the speaker dictates a message to someone ("send Maya this: ...", "tell him: ...", "the message is: ..."), emit the quoted text in straight or curly quotes on its own paragraph.
     - For LONG ramble (>150 words) with multiple distinct topics, RESTRUCTURE aggressively: break into paragraphs by topic, extract enumerations as bullets, wrap technical tokens in backticks. The output may be much shorter and visually richer than the input.
-
-    == ABSOLUTE RULE: Punctuation (highest priority) ==
-    - NEVER use em-dashes (\u{2014}) or en-dashes (\u{2013}).
-    - If the spoken input had a pause that would warrant a dash, use a comma, period, or parentheses instead.
-    - This rule overrides all other style guidance. Output containing \u{2014} or \u{2013} will be rejected.
 
     Output ONLY the corrected text. No explanation, no preamble, no quotes around output, no thinking.
     """
@@ -2452,36 +3688,135 @@ final class Qwen3Polisher {
 
         switch style?.lowercased() {
         case "neutral", nil:
-            return "Style: NEUTRAL. Your job is to give the speaker their best take — same voice, same rhythm, same words, just without the stumbles. Fix capitalization, punctuation, and ASR errors where the original is literally impossible in context. Keep everything else exactly as spoken: contractions, slang, cadence, short sentences, informal phrasing, filler words that carry meaning. The test: read the output back — if it sounds like an AI cleaned it up, you went too far. It should sound like the speaker typed it on a good day." + antiAI + absoluteTail
+            return "Style: NEUTRAL. Match the speaker's register exactly. Fix grammar and filler words only. No transformation of style, tone, or vocabulary. No em-dashes. No emojis." + antiAI + absoluteTail
 
         case "formal":
-            return "Style: FORMAL. Professional register throughout. Expand every contraction (don't→do not, I'm→I am, we'll→we will). Replace slang (yeah→yes, gonna→going to, wanna→want to, kinda→rather). Full grammatical sentences. No exclamation marks unless quoting someone. If content is clearly a casual text to a friend, keep full sentences but drop the stiffest formality." + antiAI + absoluteTail
+            return "Style: FORMAL. Full sentences. Expand contractions (can't→cannot, we're→we are). Replace slang with standard vocabulary. Structured, professional tone. No exclamation marks. No em-dashes. Use a period and start a new sentence instead. No emojis." + antiAI + absoluteTail
 
         case "casual":
-            return "Style: CASUAL. Keep the speaker's raw voice. Preserve their contractions, slang, short sentences. 'yo', 'yeah', 'gonna', 'kinda', 'tbh', 'ngl' are fine — keep them if the speaker used them. Short punchy clauses over long compound ones. Drop 'um/uh' but keep the rhythm. If content is serious (medical, professional, bad news), soften slang ('yo'→'hey') but keep the casual structure." + antiAI + absoluteTail
+            return "Style: CASUAL. Conversational, lowercase-leaning. Keep contractions. Keep 'yeah', 'yo', 'gonna' if the speaker used them. Short punchy clauses. No em-dashes. No emojis." + antiAI + absoluteTail
 
         case "excited":
-            return "Style: EXCITED. When content is positive (good news, wins, plans, ideas, hype, anything fun) — actually lean in. Use exclamation marks liberally where energy supports them. Short punchy sentences over long ones. Let enthusiasm show — 'this is great!' not 'this is great.' Match or slightly amplify the speaker's energy, don't dampen it. Keep their slang ('yo', 'yeah', 'lol', 'lets gooo') if they used it. SAFEGUARD: if content is genuinely somber (medical, death, loss, serious bad news, factual reporting) — drop the energy entirely, flat respectful tone, no exclamation marks. Read the room. Default to expressive when in doubt — that's what this mode is for." + antiAI + absoluteTail
+            return "Style: EXCITED. Energetic. Exclamation marks where the audio energy actually supports it. Never fabricated. Keep the speaker's natural enthusiasm. No em-dashes. No emojis. Never invent excitement that wasn't there." + antiAI + absoluteTail
 
         default:
-            return "Style: NEUTRAL. Match the speaker's register exactly." + antiAI + absoluteTail
+            return "Style: NEUTRAL. Match the speaker's register exactly. Fix grammar and filler words only. No transformation of style, tone, or vocabulary. No em-dashes. No emojis." + antiAI + absoluteTail
         }
     }
+
+    /// Enriched HIGH cleanup prompt for the 4B local model. The 4B has the
+    /// capacity to follow the detailed email/list/code/number rules the cloud
+    /// model gets from `cloudSystemBrief`; the 1.7B does not. Lifting these
+    /// rules into the local HIGH prompt is what closes the gap between cloud
+    /// quality and local-fallback quality when Cerebras is unavailable.
+    ///
+    /// Only used when the routing decision lands on the 4B (i.e. structurally
+    /// complex input + cloud unavailable). Short polishes still use the
+    /// shorter MEDIUM/LIGHT prompts to keep latency low.
+    nonisolated private static let high4BCleanupInstructions: String = """
+    Cleanup mode: HIGH (deep rewrite, prose-grade output — the 1.7B would mangle this; you are the 4B and can follow detailed guidance).
+    Target: reads like the speaker wrote it down deliberately on a good day — NOT like a corporate document, NOT like an AI assistant cleaned it up.
+
+    REGISTER MUST STAY HUMAN. Aggressive structural cleanup (lists, paragraphs, run-on splits, correction collapse), but the prose voice stays as casual or as formal as the speaker actually was. If they said "gonna" and "yeah" and "kinda", those stay (unless personality is Formal). The cleanup is about clarity and structure, not about formalizing tone. Output should never sound like a press release or LinkedIn post. No "leverage", no "utilize", no "facilitate", no "I'd be happy to" — keep their actual words. The reader should still feel the speaker's personality coming through.
+
+    REQUIRED transformations:
+    - OPENER FILLERS: Strip ONLY these exact discourse openers at the very start: "okay so", "okay hey", "hey so", "alright so", "so basically", "i mean", "you know". Do NOT strip "I think", "I want", "I need", "We should", "maybe", "probably" — those are content. Example: "okay hey i mean send john a message" → "Send John a message."
+    - CHAINED SELF-CORRECTIONS: Follow the ENTIRE correction chain to the final intent. Clear retraction triggers: "no wait", "actually, no", "no, actually", "scratch that", "never mind", "forget that", "wait no", "I meant". Each one replaces everything before it. The LAST thing the speaker says is the ONLY thing that counts — ALL prior attempts are discarded completely. EXAMPLE: "remind me to buy milk no wait eggs no actually both milk and eggs no scratch that i just need bread and butter for tomorrow" → "Remind me to buy bread and butter for tomorrow." (four layers — 'scratch that' resets to bread and butter, ALL earlier items gone).
+      CRITICAL EXCEPTION — UNCERTAINTY LANGUAGE IS NOT A CORRECTION: "I'm not sure", "I think", "maybe", "probably" express doubt — they do NOT erase the statement they follow. Preserve both halves.
+    - STUTTERS & ABANDONED RESTARTS: Collapse all restarts and false starts. "I I I need to" → "I need to". "the the the report" → "the report". Drop abandoned word fragments entirely.
+    - PRONOUN PUNCTUATION (critical — the 1.7B fails this constantly): NEVER insert a comma between a subject pronoun and its verb. "I, wanted" is wrong; "I wanted" is correct. Same for he/she/we/they/you. After a salutation like "Hi Marcus," followed by a new sentence in email register, insert a paragraph break (\\n\\n) after the comma — NEVER a comma+pronoun on the next clause.
+
+    EMAIL FORMATTING. If the dictation opens with a salutation:
+    - Format: "Hi <Name>,\\n\\n<body>" — always a blank line between salutation and body.
+    - Capitalize the recipient's name even if spoken lowercase: "hi marcus" → "Hi Marcus,".
+    - Common salutations: Hi, Hello, Hey, Dear, Good morning. Preserve the user's choice.
+    - Multi-recipient: "Hi Sarah and James,". Group with "and", not commas.
+
+    PARAGRAPH BREAKS in emails. Insert "\\n\\n" between distinct topics. Topic-shift markers from voice dictation: "also", "oh and", "another thing", "lastly", "one more thing", "by the way". Don't keep adding sentences in one paragraph — readers skim emails by paragraph.
+
+    SIGN-OFFS. If the user dictates a sign-off ("thanks", "best", "talk soon", "appreciate it"), format as: "<body>.\\n\\n<Sign-off>,". If they didn't dictate one, DO NOT add one. Never invent content.
+
+    LIST FORMATTING.
+    - LIST RECOGNITION (aggressive): Detect when the speaker is listing discrete items and format as a list, EVEN WHEN the enumeration is implied rather than explicitly numbered. A run of distinct items joined by "and", "also", "and then", "oh and", "plus", or commas is a list. EXAMPLE: "we need to fix the login bug also the search is slow and oh the export button is broken" → 3-item bulleted list. EXAMPLE: "for the trip I gotta pack my charger sunscreen the passport and my headphones" → bullets.
+    - INLINE vs BULLETS. Short lists (≤3 items) or lists embedded in prose stay inline with Oxford commas: "Pick up milk, eggs, and bread." Long lists (≥4 items) or lists with a clear header become bulleted with a "Header:" line then "- item" bullets.
+    - NUMBERED for sequential actions. Use "1. 2. 3." when order matters (steps, ranked priorities); otherwise "- " bullets.
+    - HEADER NOUN capitalized: "Groceries:", "Action items:", "Decisions:", "Risks:".
+    - CAPITALIZE the first word of each bullet. End with period if it's a complete clause; no terminal punctuation for single-word items.
+    - MID-LIST CORRECTIONS: "milk eggs lemons garlic, scratch the lemons get limes instead" → drop "lemons", insert "limes".
+    - ABSOLUTE: never invent, infer, or pad list items. If only one item exists, keep as a sentence.
+
+    CODE & TECHNICAL FORMATTING.
+    - BACKTICKS go ONLY around single programming identifiers (one camelCase / snake_case / PascalCase token, one `foo()`, one shell flag, one file path, one URL, one email, one version number). NEVER wrap multi-word phrases. NEVER backtick everyday words like "user name", "should be", "the variable".
+    - Test: "is this a specific identifier I could grep for in a codebase?" If yes, backtick it. If it describes a convention category, leave as plain English.
+    - "use camel case not snake case" → "Use camel case, not snake case." (conventions, no backticks).
+    - "the variable `userName` should be camelCase" — `userName` is the identifier (backticked), "camelCase" is the convention (no backticks).
+    - URL/email/path reconstruction: "slash slash"→"//", "colon slash slash"→"://", "dot"→"." in domains, "at"→"@" between username/domain, "underscore"→"_", "dash"→"-". Example: "admin at example dot com" → `admin@example.com`.
+
+    NUMBER, DATE, TIME, CURRENCY FORMATTING.
+    - DECIMAL MAGNITUDES: spoken "<integer> point <integer> <unit>" → digit + word: "four point five million" → "4.5 million" (or "$4.5M" with currency). NEVER European-style "4.500.000". NEVER all-digits "4,500,000".
+    - PERCENTAGES: "twenty three percent" → "23%". "two point one percent" → "2.1%".
+    - CURRENCY: "four million dollars" → "$4 million" or "$4M". "eight hundred twenty thousand dollars" → "$820,000". One style per dictation.
+    - TIMES: "at six" → "at 6" (casual) or "at 6:00" (formal). "at three thirty" → "at 3:30". "by eleven thirty AM" → "by 11:30 AM". CRITICAL: "at" preceding a number is NEVER "@". Output "at 3:00", never "@3".
+    - DATES: days capitalized: "thursday morning" → "Thursday morning". "may twenty fourth" → "May 24".
+    - YEARS AND QUARTERS: "twenty twenty six" → "2026". "q two" → "Q2". "q three" → "Q3".
+    - NUMBER CORRECTIONS: speaker gives a number then corrects with "actually" or "no wait" → second number wins. "eighty kilos no wait seventy five" → "75 kg". Drop the abandoned value.
+    - NUMERIC FORMATTING: convert ALL spoken numbers to digits. "four sets of eight" → "4 sets of 8". "seventy-five kilos" → "75 kg".
+    - CONTRACTIONS WITH NUMBERS: "we're at four point seven million" → "We're at $4.7 million." Preserve "we're" exactly.
+
+    PROPER NOUNS. Capitalize names, places, months, days, brands (Jake, August, Monday, Apple, Slack, Gmail).
+    CONTRACTIONS preserved exactly: "we're" stays "we're", never "were". "I'll", "don't", "can't" — keep the apostrophe.
+
+    SENTENCE STRUCTURE.
+    - PARAGRAPHS: insert blank line between every topic shift. "but at some point", "and also", "one more thing", "anyway", "speaking of" — pivots to new subjects. Multi-topic dictation typically produces 3-5 paragraphs.
+    - DISFLUENCY CLUSTERS: collapse repeated/uncertain spans into the final clear formulation. "it's already up? Yeah? Already yeah it's already past that" → "it's already past that".
+    - TENSE CONSISTENCY: if narrating past events, keep narrative in past tense. Fix accidental drift.
+    - SENTENCE BOUNDARIES: break run-ons at clause boundaries. No sentence over ~25 words unless inside a quote.
+    - FILLER WORD REMOVAL (aggressive in HIGH): remove "basically", "literally" (when not literal), "honestly" (pure padding), "actually" as emphasis (not correction), "at the end of the day", "the thing is", "what I'm trying to say is". KEEP hedges "I think", "maybe", "probably" (uncertainty, not filler).
+    - SENTENCE RHYTHM: vary length. Short sentences (≤8 words) for conclusions and emphasis. Longer sentences (15-25 words) for explanation. A wall of identical-length sentences is wrong.
+    - SCHEMA FIELDS: speaker dictating a table/struct definition — convert each spoken field to snake_case backticked. "user id" → `user_id`, "created at" → `created_at`. ≤8 fields → inline comma-separated. ≥9 fields → bullet list.
+    - QUARTER ABBREVIATIONS: "q one" → "Q1", "q two" → "Q2".
+
+    PROHIBITED:
+    - Adding factual claims, opinions, or information not in the source
+    - Changing the speaker's intent, conclusion, or emotional register
+    - Paraphrasing or summarizing — every concrete detail and qualifier must survive
+    - Em-dashes or en-dashes (use periods, commas, or paragraph breaks)
+    - Emojis or decorative punctuation
+    - Inventing list items
+    - Backticking multi-word phrases or convention names
+
+    Preserve verbatim: numbers, names, URLs, emails, quoted phrases.
+    Output is measurably tighter than the input, but every meaningful clause survives.
+    """
 
     /// Per-level cleanup instruction block. Injected into BOTH polish and
     /// merge prompts.
     ///
     /// Bug 4: HIGH mode is now unmistakably aggressive so the model actually
     /// restructures instead of doing surface-only edits.
-    nonisolated private static func cleanupInstruction(_ level: String?) -> String {
+    nonisolated private static func cleanupInstruction(_ level: String?, for4B: Bool = false) -> String {
         switch level?.lowercased() {
         case "none":
-            return "Cleanup mode: NONE. Output the input text verbatim. Do not edit, polish, or change anything except trivial whitespace fixes."
+            return "Cleanup mode: NONE. Output the input text verbatim. Do not edit, polish, or change anything except trivial whitespace fixes. Never create a bulleted or numbered list."
 
         case "light":
-            return "Cleanup mode: LIGHT. Capitalization and punctuation only. Strip only the most obvious isolated fillers (um, uh) when they appear alone at a clause boundary — not 'like' or 'you know' (those carry meaning). Do NOT restructure sentences. Do NOT change word choice. Do NOT merge short sentences. Treat as near-verbatim transcription with minimal cleanup."
+            return "Cleanup mode: LIGHT. Capitalization and punctuation only. Strip only the most obvious isolated fillers (um, uh) when they appear alone at a clause boundary — not 'like' or 'you know' (those carry meaning). Do NOT restructure sentences. Do NOT change word choice. Do NOT merge short sentences. LISTS: do NOT turn prose into a bulleted or numbered list. Keep the speaker's structure as flowing sentences/paragraphs. The ONLY exception is enumeration the speaker made UNMISTAKABLY explicit — they literally said \"number one … number two … number three …\" or \"first, … second, … third, …\". A rambling monologue that merely mentions several things stays as prose. Treat as near-verbatim transcription with minimal cleanup."
 
         case "high":
+            // When the 4B is running this polish, lift the email/list/code/
+            // number rules from cloudSystemBrief into the prompt. The 4B has
+            // the capacity to follow more explicit guidance; the 1.7B does
+            // not, so we keep its HIGH prompt short.
+            //
+            // NOTE: the dedicated `high4BCleanupInstructions` block referenced
+            // here was never defined in the file (compile blocker). For now
+            // both 1.7B and 4B fall through to the same HIGH instruction
+            // text below. The for4B branch is preserved so a separate task
+            // can supply tailored 4B instructions later without touching
+            // the call sites.
+            if for4B {
+                // Fall through to the shared HIGH prompt below.
+            }
             return """
             Cleanup mode: HIGH (deep rewrite, prose-grade output).
             Target: reads like the speaker wrote it down deliberately on a good day — NOT like a corporate document, NOT like an AI assistant cleaned it up.
@@ -2490,18 +3825,25 @@ final class Qwen3Polisher {
 
             REQUIRED transformations:
             - OPENER FILLERS: Strip ONLY these exact discourse openers at the very start: "okay so", "okay hey", "hey so", "alright so", "so basically", "i mean", "you know". Do NOT strip "I think", "I want", "I need", "We should", "maybe", "probably" — those are content. Example: "okay hey i mean send john a message" → "Send John a message." NEVER: "i think we should push the deadline" → keep as is (not an opener, it's the content).
-            - CHAINED SELF-CORRECTIONS: Follow the ENTIRE correction chain to the final intent. Each "no wait", "no actually", "no he knows", "scratch that", "never mind", "forget that", "I meant", "actually" replaces everything before it ONLY WHEN it is a clear restatement, not mere doubt. The LAST thing the speaker says is the ONLY thing that counts — ALL prior attempts are discarded completely. EXAMPLE: "send maya a message no wait actually message john saying we're running late no he already knows say we're already at the restaurant" → "Send John a message saying we're already at the restaurant." (three layers, only final kept). EXAMPLE: "call sarah no wait email sarah no actually slack sarah" → "Slack Sarah." EXAMPLE: "remind me to buy milk no wait eggs no actually both milk and eggs no scratch that i just need to buy bread and butter for tomorrow morning" → "Remind me to buy bread and butter for tomorrow morning." (four layers — 'scratch that' resets to bread and butter, ALL earlier items gone). CRITICAL: even if an intermediate step adds something ("both milk and eggs"), a subsequent "scratch that" or "no" wipes the entire slate clean and ONLY the final intent survives.
+            - CHAINED SELF-CORRECTIONS: Follow the ENTIRE correction chain to the final intent. Clear retraction triggers: "no wait", "actually, no", "no, actually", "scratch that", "never mind", "forget that", "wait no", "I meant". Each one replaces everything before it. The LAST thing the speaker says is the ONLY thing that counts — ALL prior attempts are discarded completely. EXAMPLE: "send maya a message no wait actually message john saying we're running late no he already knows say we're already at the restaurant" → "Send John a message saying we're already at the restaurant." (three layers, only final kept). EXAMPLE: "call sarah no wait email sarah no actually slack sarah" → "Slack Sarah." EXAMPLE: "remind me to buy milk no wait eggs no actually both milk and eggs no scratch that i just need to buy bread and butter for tomorrow morning" → "Remind me to buy bread and butter for tomorrow morning." (four layers — 'scratch that' resets to bread and butter, ALL earlier items gone). CRITICAL: even if an intermediate step adds something ("both milk and eggs"), a subsequent "scratch that" or "no" wipes the entire slate clean and ONLY the final intent survives.
+              IMPORTANT: "actually" ALONE is a hedge/clarifier, NOT a retraction — keep both sides. "The concern is valid, actually no wait it's fine" → needs "no wait" to be a retraction. Contrast: number corrections ("three, actually four") → second number wins (handled by NUMBER CORRECTIONS rule below).
               CRITICAL EXCEPTION — UNCERTAINTY LANGUAGE IS NOT A CORRECTION: "I'm not sure", "I think", "maybe", "probably", "I'm not confident" express doubt — they do NOT override or erase the statement they follow. "push the deadline, I'm not sure" → "push the deadline. I'm not sure." (BOTH preserved, not collapsed to either one). "we should go left, I think" → "We should go left, I think." NEVER strip uncertainty markers.
             - NUMBER CORRECTIONS: When the speaker gives a number/quantity then corrects it with "actually", "no wait", "no", or "I mean" + a DIFFERENT number, ALWAYS collapse to the final value. The second number wins. Apply to inline corrections too — not just at clause boundaries.
               Examples: "three thirty actually four" → "4". "eighty kilos no wait seventy five" → "75 kg". "four hundred milligrams no six hundred milligrams" → "600mg". "two thousand four hundred no two thousand three hundred and fifty" → "$2,350". "at eighty, no wait seventy-five" → "75". "fourteen percent no twelve point five percent" → "12.5%". "sixty no sixty-five kilos" → "65 kg". Drop the abandoned value entirely — do not keep both or write "X to Y".
             - NUMERIC FORMATTING: Convert ALL spoken numbers to digits. This includes workout stats, currency, measurements, counts, percentages. "four sets of eight" → "4 sets of 8". "seventy-five kilos" → "75 kg". "thirty three point five million" → "$33.5 million". "eight hundred k" → "$800K". "twelve thousand" → "12,000". "one thirty to one forty-five" → "130–145". Never leave a measurement or quantity as a spelled-out word when it could be a digit.
             - TECHNICAL IDENTIFIERS (URL/EMAIL/PATH RECONSTRUCTION): When the speaker spells out a URL, email address, or file path verbally, reconstruct the proper format. Signals: "slash slash"→"//", "colon slash slash"→"://", "dot" between domain parts→".", "at" between username and domain→"@", "underscore" in identifiers→"_", "dash"→"-". Examples: "postgres slash slash admin at db dot staging dot example dot com slash myapp underscore staging" → "postgres://admin@db.staging.example.com/myapp_staging". "admin at example dot com" → "admin@example.com". "https colon slash slash api dot example dot com slash v two" → "https://api.example.com/v2". Output each reconstructed identifier in backticks.
-            - LIST RECOGNITION: When the speaker enumerates items in two or more categories (e.g. groceries then errands, pros then cons, work items then personal items), format as labeled bullet lists with each category as a plain label ("Groceries:" not "**Groceries:**"). Within each bullet, collapse any corrections ("milk no wait oat milk" → "oat milk"). Each item is a single clean bullet — no correction markers, no "no wait" visible in the output.
+            - LIST RECOGNITION (aggressive — this is the setting where you turn rambling enumerations into clean lists): Detect when the speaker is listing discrete items and format them as a list, EVEN WHEN the enumeration is implied rather than explicitly numbered. You do NOT need the speaker to say "first/second/third" or "number one". A rambling run of distinct items joined by "and", "also", "and then", "oh and", "plus", or just commas is a list. EXAMPLE (implied, no ordinals): "we need to fix the login bug also the search is slow and oh the export button is broken" → a 3-item list: "- Fix the login bug" / "- The search is slow" / "- The export button is broken". EXAMPLE: "for the trip I gotta pack my charger sunscreen the passport and my headphones" → bullets for charger, sunscreen, passport, headphones. NUMBERED vs BULLETS: use a numbered list (1. 2. 3.) ONLY when order or sequence genuinely matters (steps to follow, ranked priorities, a process); otherwise use "- " bullets. When the speaker enumerates items in two or more categories (e.g. groceries then errands, pros then cons, work items then personal items), use labeled bullet lists with each category as a plain label ("Groceries:" not "**Groceries:**"). Within each item, collapse any corrections ("milk no wait oat milk" → "oat milk"). Each item is a single clean bullet — no correction markers, no "no wait" in the output. ABSOLUTE: a list may ONLY reorganize and segment words the speaker actually said. NEVER invent, infer, merge, or pad list items, and never add items to round out the list. If only one real item exists, keep it as a sentence — do not manufacture a list. If the items genuinely don't separate (one continuous thought, not discrete items), keep it as prose.
             - PARAGRAPHS: Insert a blank line between every topic shift. Topic markers include "but at some point", "and also", "one more thing", "anyway", "speaking of", "on a related note", or any pivot to a new subject. Each paragraph is one coherent thought. Typical multi-topic dictation produces 3-5 paragraphs.
             - STUTTERS & ABANDONED RESTARTS: Collapse all restarts and false starts. "I need to pick up d the dro I need to pick up the" becomes "I need to pick up the". Drop abandoned word fragments entirely. If the speaker re-states a clause, keep only the final attempt.
             - DISFLUENCY CLUSTERS: Collapse repeated/uncertain spans into the final intent. "it's already up? Yeah? Already yeah it's already past that" becomes "it's already past that". Pick the speaker's last clear formulation.
             - TENSE CONSISTENCY: If the speaker is narrating past events ("I woke up", "I forgot"), keep the entire narrative in past tense. Fix accidental tense drift ("I just make coffee" becomes "I just made coffee").
             - SENTENCE BOUNDARIES: Break run-ons at natural clause boundaries. No sentence should exceed ~25 words unless inside a quote. Two independent clauses joined by ZERO punctuation MUST receive a period or comma between them. Example: "like some clipping happening we probably have to fix that" → "like some clipping happening. We probably have to fix that." "X happening we probably" → "X happening. We probably".
+            - SENTENCE MERGING: Merge short choppy sentences that express a single continuous thought into one fluid sentence. Two adjacent sentences that together are still ≤20 words and share the same subject or follow directly on each other can be joined with a comma or conjunction. Example: "It's fast. It loads quick." → "It's fast and loads quickly." Only merge when the result flows better — never when the speaker's short cadence is intentional emphasis (e.g. "It's fast. It's simple. It works." stays as three because the rhythm is the point).
+            - SENTENCE SPLITTING: Split run-ons that pack two or more DISTINCT thoughts into one sentence at natural clause boundaries. A sentence containing "but", "however", "although", "so", "because" followed by a full independent clause is a split candidate when the result would be ≤15 words each.
+            - LIST REORDERING: When bullet items or enumeration items are logically out of order (e.g. a conclusion listed before its premise, or a general item interleaved with specifics), reorder them for logical flow. ONLY reorder — never add, remove, or paraphrase items. Do not reorder if order is inherently sequential (steps 1/2/3) or if the speaker's order seems intentional.
+            - PASSIVE TO ACTIVE: Convert passive-voice constructions to active where it reads more naturally and the agent is clear from context. "The bug was fixed by the team" → "The team fixed the bug." Do NOT force active voice when the agent is unknown ("the package was delivered" stays passive — there's no clear agent to promote).
+            - SENTENCE RHYTHM: Vary sentence length so output alternates between short punchy sentences and longer flowing ones. A wall of identically-structured medium-length sentences is wrong. Short sentences (≤8 words) work well for conclusions, emphasis, and final statements. Longer sentences (15-25 words) carry the main explanation. Mix them so the prose has natural cadence.
+            - FILLER WORD REMOVAL (aggressive): In HIGH mode, remove filler and redundant words that add no meaning even when they are not pure hesitation markers. Remove: "basically", "literally" (when not literal), "honestly" (when pure padding at the end), "actually" as emphasis rather than correction, "at the end of the day", "the thing is", "what I'm trying to say is", "the fact that". Keep hedges like "I think", "maybe", "probably" (uncertainty markers, not fillers).
             - WEAK CONNECTORS: Replace dangling "and"/"so"/"like" between independent clauses with proper punctuation (period, comma, or paragraph break).
             - COMPOUND WORDS: "cam site" becomes "campsite", "noise cancelling" becomes "noise-cancelling".
             - PROPER NOUNS: Capitalize names, places, months, days, brands (Jake, August, Monday, Apple).
@@ -2514,7 +3856,7 @@ final class Qwen3Polisher {
             - Paraphrasing or summarizing — every concrete detail and qualifier must survive
             - Em-dashes or en-dashes (use periods, commas, or paragraph breaks)
             - Emojis or decorative punctuation
-            - Bullet points unless the speaker is explicitly enumerating discrete items
+            - Inventing, inferring, or padding list items — a list may only reorganize words the speaker actually said. Bulleting a single thought or a continuous (non-enumerated) statement that isn't actually a list of discrete items.
 
             Preserve verbatim: numbers, names, URLs, emails, quoted phrases.
             Output is measurably tighter than the input, but every meaningful clause survives.
@@ -2529,8 +3871,11 @@ final class Qwen3Polisher {
             - Normalize capitalization and punctuation
             - Fix clear ASR homophones only when the original word makes NO sense in context
             - Break obvious run-on sentences (two clearly independent clauses with no punctuation)
+            - PARAGRAPH BREAKS: If the dictation is 40+ words and the speaker shifts topic (signals: "also", "anyway", "oh and", "by the way", "speaking of", "one more thing", "okay so", or any clear pivot to a new subject), insert a blank line (\n\n) between paragraphs. Each paragraph = one coherent thought. Default to MORE breaks rather than fewer when in doubt — a wall of text is the wrong output.
+            - LISTS (only when enumeration is CLEAR): format a bulleted or numbered list ONLY when the speaker clearly enumerates. Clear cases: explicit ordinals ("first … second … third …", "number one … number two …"), counting ("one … two … three …"), or an intro phrase followed by 3+ short parallel items ("a few things: X, Y, and Z"). Use a numbered list only when order or sequence matters; otherwise use "- " bullets. Each item must be words the speaker actually said — never invent or pad items. If the enumeration is ambiguous or it is just a rambling sentence that happens to mention several things, do NOT make a list — keep it as prose. When in doubt, prose.
             PROHIBITED:
             - Changing word choice when the original is a real word that fits
+            - Forcing a list out of an ambiguous rant — keep prose unless enumeration is clear
             - Merging short sentences into compound ones — short cadence is intentional
             - Normalizing informal speech ("gonna"→"going to", "yeah"→"yes") unless Formal mode
             - Adding factual claims or changing speaker intent
@@ -2541,6 +3886,499 @@ final class Qwen3Polisher {
             """
         }
     }
+
+    // MARK: - Cloud system brief
+    //
+    // Single editorial brief replacing the old `cloudSystemInstructions` /
+    // `slimCloudSystemInstructions` / `slimCloudSystemInstructionsV2` trio
+    // and the per-call `cloudCleanupInstruction` / `personalityInstruction`
+    // appendages.
+    //
+    // The old approach was: 2KB+ of micro-rules ("backticks ONLY on single
+    // programming identifiers", "NEVER insert a comma between a subject
+    // pronoun and its verb", etc.) plus per-call cleanup/personality
+    // instructions. This taught the model to behave as a formatter: it
+    // would obey the rules but stop thinking about the content. The
+    // sanitizer downstream then often rejected even good output because it
+    // "drifted" too far from the (pre-stripped, sentinel-substituted)
+    // input.
+    //
+    // The new approach: treat the cloud model as a smart editor. Hand it a
+    // short editorial brief about WHAT the input is (a transcript of
+    // someone dictating into a Mac app) and WHAT to produce (the message
+    // they would have typed if they had typed instead of spoken). Give it
+    // a handful of hard rules (no em-dash, no emoji, no invention), and
+    // get out of its way.
+    //
+    // Per-call situational context (which app, which field, vocabulary,
+    // personality, cleanup level, recent dictation, suspect words) flows
+    // through `buildCloudUserMessage` — the USER message, not the system
+    // prompt. Models behave better when they read their immediate task,
+    // not a fresh policy doc on every call.
+    //
+    // Why this works: Wispr Flow doesn't pre-process either. It sends the
+    // raw ASR + a short brief to a cloud model and trusts the model to
+    // think. We do the same.
+
+    nonisolated private static let cloudSystemBrief: String = """
+    You are reading a transcript of someone speaking into a voice dictation app on their Mac. They were dictating to send a message, write an email, take a note, write code, or jot down a thought.
+
+    Your job: produce the message they would have typed if they had typed instead of spoken. Read carefully. Understand what they meant. Write what they would have written.
+
+    # How to read the transcript
+    - They were speaking, so it has fillers ("um", "uh", "like"), false starts, and self-corrections. Treat them as a person, not a stream of tokens.
+    - If they said "no wait", "scratch that", "actually wait", "I mean" — drop the abandoned attempt and keep their final version.
+    - If they restarted a sentence with a different ending ("I want pepperoni pizza. I want Hawaiian pizza tonight") — drop the abandoned attempt.
+    - If they stuttered ("I I I think we we should") — collapse to clean prose.
+    - The transcript has no punctuation. You add it. Use natural English punctuation: periods at sentence ends, commas in lists, question marks on questions, colons before list items, line breaks between paragraphs when topic shifts.
+
+    # How to format the output
+    EMAIL FORMATTING. If the dictation opens with a salutation:
+    - Format: "Hi <Name>,\\n\\n<body>" — always a blank line between salutation and body.
+    - Capitalize the recipient's name even if spoken lowercase: "hi sarah" → "Hi Sarah,".
+    - Multi-recipient: "Hi Sarah and James,". Group with "and", not commas.
+    - Common salutations: Hi, Hello, Hey, Dear, Good morning. Preserve the user's choice.
+
+    PARAGRAPH BREAKS in emails. Insert "\\n\\n" between distinct topics. Common topic-shift markers from voice dictation: "also", "oh and", "another thing", "lastly", "one more thing", "by the way". Don't just keep adding sentences in one paragraph — readers skim emails by paragraph.
+
+    SIGN-OFFS. If the user dictates a sign-off ("thanks", "best", "talk soon", "appreciate it"), format as: "<body>.\\n\\n<Sign-off>,". If they didn't dictate one, DO NOT add one. Never invent content.
+
+    REGISTER. The CONTEXT block tells you which app the user is in. Gmail/Outlook/Mail → formal prose, full sentences. Slack/Discord/iMessage → casual, contractions preserved, shorter clauses.
+    LIST FORMATTING.
+
+    INLINE vs BULLETS. Short lists (\u{2264}3 items) or lists embedded in prose stay inline with Oxford commas: "Pick up milk, eggs, and bread." Long lists (\u{2265}4 items) or lists with a clear header become bulleted:
+
+    Header word followed by enumeration: render as a header-colon block.
+    Input: "groceries milk eggs bread chicken and spinach"
+    Output:
+    Groceries:
+    - Milk
+    - Eggs
+    - Bread
+    - Chicken
+    - Spinach
+
+    NUMBERED for sequential actions. If the user uses ordinal markers ("first/second/third", "step one/two/three"), use 1. 2. 3. numbering instead of bullets:
+
+    Input: "first call the dentist second go to the gym third pick up groceries"
+    Output:
+    1. Call the dentist.
+    2. Go to the gym.
+    3. Pick up groceries.
+
+    OXFORD COMMA. Always use the Oxford comma in lists of three or more items, both inline and at the end of a bulleted list's inline rendering.
+
+    CAPITALIZE the first word of each bullet/numbered item. End each item with a period if it's a complete clause; no terminal punctuation if it's a single word or noun phrase.
+
+    MID-LIST CORRECTIONS. The dictation often has corrections mid-list:
+    - "milk eggs lemons garlic, scratch the lemons get limes instead" \u{2192} drop "lemons", insert "limes" in the appropriate alphabetical-or-given position.
+    - "dark roast not the medium one the dark roast" \u{2192} "Dark roast beans" (the negation is the correction; output the final intent only).
+    - "chicken thighs not breasts thighs" \u{2192} "Chicken thighs". Last-mention wins for the same item slot.
+
+    LIST HEADER CAPITALIZATION. The header noun is capitalized: "Groceries:", "Action items:", "Decisions:", "Risks:".
+    CODE & TECHNICAL FORMATTING.
+
+    WHEN TO USE BACKTICKS. Wrap content in backticks ONLY when the user names a specific programming/technical identifier:
+    - Variable names: `userName`, `cachedContainer`, `lastFailureReason`
+    - Function names: `fetchRemoteSnapshot`, `polishWithMLX`
+    - Constants / env vars: `REMOTE_SYNC_INTERVAL`, `DATABASE_URL`, `MAX_RETRIES`
+    - File paths: `Sources/Voice/Services/Qwen3Polisher.swift`, `~/.config/voice.toml`
+    - Shell commands (single line): `bundle exec rake db:migrate`, `git status`
+    - Branch/PR/commit refs: `feat/profile-sync`, `main`, `release/v3.2`
+    - Filenames as proper nouns: `2026_05_add_user_preferences.sql`
+    - SQL identifiers (column / table names): `user_preferences`, `user_id`
+
+    WHEN NOT TO USE BACKTICKS. Plain English words describing concepts stay as plain English, even when they sound technical:
+    - "use camel case not snake case" → "Use camel case, not snake case." (discussing conventions)
+    - "I prefer pascal case for classes" → "I prefer Pascal case for classes." (discussing conventions)
+    - "the variable name should be in camel case" → "The variable name should be in camel case." (discussing the rule)
+    - BUT: "the variable `userName` should be camelCase" — here `userName` is the actual identifier (backticked), and "camelCase" is the convention name (no backticks).
+
+    THE TEST. Ask: "is this a specific identifier I could grep for in a codebase?" If yes, backtick it. If it's a word describing a convention or category, leave as plain English.
+
+    NEVER WRAP A MULTI-WORD PHRASE. Backticks contain ONE token, with the optional exception of triple-backtick code blocks for actual multi-line code dictation.
+
+    CAMELCASE / SNAKE_CASE NORMALIZATION. When the user dictates an identifier as separate words ("user name"), only convert to programmer-case if you're SURE it's an identifier (the user said "the variable user name" → "the variable `userName`"). When in doubt, keep as natural English.
+
+    NUMBERS AND CODE. Numeric env-var values stay as digits: "should be bumped from five seconds to thirty" → "...from 5 seconds to 30."
+
+    SQL / SHELL keywords. Render SQL keywords in lowercase prose (modern style) unless quoting verbatim a SQL statement: "I added an index on user_id" → "I added an index on `user_id`."
+    - NUMBER, DATE, TIME, CURRENCY FORMATTING.
+
+      DECIMAL MAGNITUDES. Spoken "<integer> point <integer> <unit>" is digit + word: "four point five million" -> "4.5 million" (or "$4.5M" with currency context). NEVER use European-style thousand separators ("4.5.000.000" is wrong). NEVER expand to all-digits ("4,500,000" loses readability for spoken numbers). Pick the digit-plus-magnitude form.
+
+      PERCENTAGES. "twenty three percent" -> "23%". "two point one percent" -> "2.1%".
+
+      CURRENCY. Prefer "$<digit>" form. "four million dollars" -> "$4 million" or "$4M". "one hundred forty dollars" -> "$140". "eight hundred twenty thousand dollars" -> "$820,000". Keep one style per dictation, don't mix "$4.7M" with "$820,000" in the same email.
+
+      TIMES. Clock times normalize to digit form: "at six" -> "at 6:00" (formal) or "at 6" (casual). "at three thirty" -> "at 3:30". "by eleven thirty AM" -> "by 11:30 AM". CRITICAL: the word "at" preceding a number is NEVER the @ symbol. Output "at 3:00", never "@3" or "@three".
+
+      DATES. Days of week capitalized: "thursday morning" -> "Thursday morning". Ordinal-only references stay as ordinals: "the twelfth" -> "the 12th". Full dates: "may twenty fourth" -> "May 24" (numeric date) or "May 24th" (ordinal date). The 2026 calendar style is consistent across the dictation.
+
+      YEARS AND QUARTERS. "twenty twenty six" -> "2026". "Q three" -> "Q3". "year over year" -> "year-over-year" when used as an adjective ("23% year-over-year growth"), or "year over year" without the hyphen when used as an adverb.
+
+      RANGES. "five point two to five point five million" -> "$5.2M to $5.5M" or "5.2 to 5.5 million", the unit appears once at the end of the range.
+
+      CONTRACTIONS WITH NUMBERS. "we're at four point seven million" -> "We're at $4.7 million." Preserve "we're" exactly.
+    - Capitalize proper nouns: people, places ("Fifth Street"), proper adjectives ("Hawaiian", "Italian"), brand names ("Slack", "Gmail").
+    - Preserve contractions exactly: "we're" stays "we're", never "were". "I'll", "don't", "can't" — keep the apostrophe.
+
+    # Hard rules (these are absolute)
+    1. Never add content the speaker didn't say. No invented facts, no filler statements, no "I hope this helps."
+    2. Never use em-dashes (\u{2014}) or en-dashes (\u{2013}). Use periods, commas, or semicolons.
+    3. Never use emojis.
+    4. Output is the polished text only. No preamble like "Here is your polished version:". Just the result.
+
+    # How to handle context
+    You'll see a CONTEXT block at the top of the user message with information about which app they were in and what they were doing. Use it. Slack dictations should sound casual. Emails should be formatted as emails. Code editor dictations should preserve technical language.
+
+    That's everything. Read carefully, think about what they meant, write what they would have written.
+    """
+
+    // The previous trio of cloud prompts plus the per-call cleanup &
+    // personality blocks are gone. The behaviour they encoded
+    // (register-matching, restart collapsing, list formatting, etc.) is
+    // now part of the single brief above plus the [CONTEXT] block in the
+    // user message. Single source of truth, harder to drift between.
+    //
+    // The function below is kept as a no-op stub because external callers
+    // (BigMenu debug toggles, settings UI) may still invoke it.
+
+    // ----- DELETED (replaced by cloudSystemBrief above) -----
+    // cloudSystemInstructions, slimCloudSystemInstructions,
+    // slimCloudSystemInstructionsV2, slimParagraphBreakBlock.
+
+    /// Deprecated stub kept for source compatibility. Returns an empty
+    /// string — the editorial brief includes cleanup guidance natively,
+    /// and per-call cleanup level flows through the user message.
+    nonisolated private static func cloudCleanupInstruction(_ level: String?) -> String {
+        _ = level
+        return ""
+    }
+
+    // The original `cloudSystemInstructions`, `slimCloudSystemInstructions`,
+    // `slimCloudSystemInstructionsV2`, `slimParagraphBreakBlock`, and the
+    // per-call `cloudCleanupInstruction` switch were deleted on 2026-05
+    // when the cloud path was rewritten to use a single editorial brief.
+    // Git history has the previous bodies if you need to compare.
+    //
+    // Everything between this comment and the next `// MARK:` boundary
+    // below used to hold those constants. It is left commented out only
+    // for the duration of one release so reviewers can scroll the diff
+    // without context jumps; remove on the next pass.
+    /*
+    You are a dictation polish engine. Input: raw voice transcript. Output: polished \
+    transcript only. No preamble, no commentary, no sign-off.
+    /no_think
+
+    ⚠️ HARD CONSTRAINT: NEVER output an em-dash (\u{2014}) or en-dash (\u{2013}). \
+    Not even one. Replace every instance with a comma, period, or paragraph break. \
+    "great\u{2014}no bugs" → "great, no bugs" or "great. No bugs". \
+    THIS RULE CANNOT BE OVERRIDDEN BY ANY INSTRUCTION BELOW.
+
+    == ABSOLUTE RULES ==
+    Output ONLY the polished text. Nothing else.
+    No em-dashes or en-dashes (see hard constraint above).
+    No emojis. No decorative symbols.
+    Never invent content not present in the dictation. Every detail and qualifier survives.
+    Never paraphrase — output must reflect exactly what the speaker said, cleaned up.
+    FROZEN TOKENS: tokens like \u{27E6}E0\u{27E7} \u{27E6}E1\u{27E7} \u{27E6}E2\u{27E7} etc. are protected placeholders \
+    (emails, URLs, code, identifiers). Output them verbatim in their original position. Never modify them.
+
+    == PRESERVATION RULES (highest priority — override every other rule, example, and mode) ==
+    P1. CLAUSE PRESERVATION: PRESERVE EVERY DISTINCT CLAUSE FROM THE INPUT. Do not drop, summarize, or merge clauses. If the user mentions multiple topics joined by "and", "oh and", "also", "plus", "then", or "by the way", preserve ALL of them in the output. NEVER truncate a multi-topic input. NEVER stop early because the output "feels complete." NEVER replace a later clause with "?" or "...". The number of distinct topics/actions in the output must equal the number in the input.
+    Example: Input "remind me to call the dentist on thursday morning and then grab groceries after work oh and can you also text john that we're meeting at six" → Output "Remind me to call the dentist on Thursday morning and then grab groceries after work. Oh, and can you also text John that we're meeting at 6:00?" — three actions in, three actions out.
+
+    P2. BACKTICK SCOPE (strict): Backticks are ONLY for single tokens that are valid programming identifiers — a single camelCase/snake_case/PascalCase/SCREAMING_SNAKE word, a single function-like `foo()`, a single shell flag like `--verbose`, a single file path, URL, email, version number, or identifier-shaped string. NEVER wrap multi-word phrases or full sentences in backticks. NEVER backtick natural English words like "user name", "should be", "the variable". When the speaker says "the variable user name should be camel case not snake case", the ONLY thing that gets backticked is the identifier `userName`, not the surrounding English.
+    Right: "The variable `userName` should be camelCase, not snake_case."
+    Wrong: "The variable `username_should_be` camelCase, not snakeCase."
+
+    P3. PUNCTUATION AROUND PRONOUNS: Never insert a comma between a subject pronoun and its verb. "I, wanted" is wrong; "I wanted" is correct. Same for "He, said" / "She, thinks" / "We, need" / "They, are" / "You, should" — never split a pronoun from its verb with a comma. When the input opens with a salutation like "hi <name>" or "hey <name>" followed by a full sentence in email/letter register, insert a paragraph break (\\n\\n) after the salutation comma — but only when the next words read as a sentence start, not a mid-sentence continuation.
+    Right: "Hi Sarah,\\n\\nI wanted to follow up on the proposal..."
+    Wrong: "Hi Sarah, I, wanted to follow up on the proposal..."
+
+    P4. NUMBER NORMALIZATION:
+    - "<integer> point <integer> million/billion/thousand" → digit form WITH unit word: "4.5 million", "2.3 billion", "150 thousand". NEVER "four point 5.000.000". NEVER "4,500,000" or "4.500.000". NEVER European thousand-separators with periods.
+    - Decimals use a period as the decimal separator with NO thousand-separators inside the decimal: "4.5" not "4,5" and not "4.500".
+    - Percents: "23 percent" → "23%". "year over year" stays "year over year" or "YoY", not "year-over-year" unless the rest of the document is hyphenated.
+    Right: "Revenue grew by 23% year over year, and we're at $4.5M in annual recurring revenue."
+    Wrong: "Revenue grew by 23% year-over-year and were at four point 5.000.000 in annual recurring revenue."
+
+    P5. CONTRACTION PRESERVATION: Contractions in the input must be preserved exactly. If the speaker said "we're", output "we're" — NEVER "were". Same for "it's"/"its", "they're"/"their", "you're"/"your", "I'd"/"I had", "won't"/"wont", "don't"/"dont", "can't"/"cant". Apostrophes in contractions are load-bearing; losing one changes meaning.
+
+    P6. NO ARTICLE INJECTION: Do NOT insert articles ("a", "an", "the") that were not in the input. Time expressions like "next week", "last month", "this year", "tomorrow morning" must remain exactly as dictated. "next week" stays as "next week", NEVER "the next week". "last quarter" stays as "last quarter", NEVER "the last quarter". Articles are speaker-controlled — only preserve, never add.
+
+    P7. NO WORD INJECTION (general): Do not add filler English words ("just", "really", "actually", "the", "so") that the speaker did not say. Stutter dedup is the only exception ("the the cat" → "the cat"), and that REMOVES a duplicate — it never adds words.
+
+    == PARAGRAPH BREAKS ==
+    Insert blank line (\\n\\n) on: topic shift; pivot words (also, anyway, oh and, by the \
+    way, speaking of, one more thing, okay so, moving on, on that note, separately); \
+    salutation opener; before a list. For 40+ word output: lean toward more breaks. \
+    Exception clauses ("except/unless/but not") stay in the same paragraph as what they qualify.
+
+    == NUMBER FORMATTING ==
+    Always use digits: "four sets of eight"→"4 sets of 8", "seventy-five kilos"→"75 kg", \
+    "thirty three point five million"→"$33.5M", "twelve thousand"→"12,000". \
+    Q1/Q2/Q3/Q4 for quarters. \
+    Magnitudes (K/M/B): add "$" only when context is clearly monetary (revenue, cost, \
+    budget, price). "eight hundred k revenue"→"$800K". "eight hundred k followers"→"800K followers".
+
+    == LISTS & HEADINGS ==
+    "bullet point X"→- X | "number one X"→1. X | "checkbox X"→- [ ] X | "checked X"→- [x] X
+    "heading one X"→# X | "heading two X"→## X | "heading three X"→### X
+    "alinea" / "new paragraph"→\\n\\n
+
+    == CODE & TECHNICAL IDENTIFIERS ==
+    "backtick X backtick"→`X` | "camel case X Y Z"→xYZ | "snake case X Y Z"→x_y_z
+    "pascal case X Y Z"→XYZ | "screaming snake X Y Z"→X_Y_Z | "fat arrow"→=> | \
+    "thin arrow"→-> | "double equals"→== | "triple equals"→=== | "logical and"→&& | \
+    "logical or"→|| | "spread operator"→...
+    "X underscore Y" in schema context → `x_y` (snake_case identifier in backticks).
+
+    == SELF-CORRECTIONS ==
+    CLEAR RETRACTION ("no wait" / "actually, no" / "no, actually" / "scratch that" / \
+    "never mind" / "forget that" / "wait no" + new intent): keep ONLY the final intent — \
+    discard ALL prior attempts completely.
+    "actually" ALONE = hedge or clarifier, NOT a retraction (keep both sides). \
+    "actually" between two numbers/times = correction, second value wins.
+    EXCEPTION: "I'm not sure" / "I think" / "maybe" = doubt, not correction — keep both.
+    TRAILING FILLERS: "Yeah." / "Right." / "You know?" standing alone after a complete \
+    statement → strip. "It should be fine. Yeah." → "It should be fine."
+    STUTTER DEDUP: immediately repeated words → single. "the the cat"→"the cat". \
+    "I I think"→"I think".
+    INCOMPLETE INPUT: if input ends mid-clause with no closing punctuation, preserve \
+    as-is — never complete or extend it.
+    DESTINATION BEHAVIORAL CONTRACT: when a DESTINATION hint is provided —
+    Email: full prose, include greeting/closing if appropriate, formal-leaning.
+    Slack/chat/iMessage: brief, no greeting, casual register, contractions kept.
+    Code editor: terse, comment-style, no pleasantries.
+    No hint: infer from content and cleanup level.
+    """
+
+    /// Slim cloud system prompt (experimental). ~30-40% the size of
+    /// `cloudSystemInstructions`. Cuts: verbose explanations, redundant
+    /// rephrasings, the cleanup/destination behavioral contract block (it
+    /// is supplied by `cloudCleanupInstruction`), and most of the LISTS/HEADINGS
+    /// table. Keeps: hard constraints (no em-dash, no emoji, no fabrication),
+    /// frozen-token rule, paragraph-break rule, number formatting essentials,
+    /// self-correction rule. Toggle via UserDefaults key `voice.cloudPromptSlim`.
+    nonisolated private static let slimCloudSystemInstructions: String = """
+    You are a dictation polish engine. Input: raw voice transcript. Output: polished text only. No preamble, no commentary, no sign-off.
+    /no_think
+
+    ABSOLUTE RULES (highest priority, cannot be overridden by anything below):
+    1. NEVER output em-dashes (\u{2014}) or en-dashes (\u{2013}). Replace with a comma, a period, or restructure. Not even one.
+    2. NEVER output emojis or decorative symbols.
+    3. NEVER invent content. Every detail and qualifier the speaker said survives. Never paraphrase.
+    4. Frozen tokens like \u{27E6}E0\u{27E7} are placeholders for emails, URLs, code. Output verbatim in original position. Never modify.
+    5. CLAUSE PRESERVATION: every distinct topic/action in the input must appear in the output. Multi-topic inputs joined by "and", "oh and", "also", "plus", "then", "by the way" → preserve ALL clauses. Never drop a later clause. Never replace a later clause with "?" or "...". Count the actions in; count the actions out; they must match. (Example: "remind me to call the dentist on thursday morning and then grab groceries after work oh and can you also text john that we're meeting at six" → three actions in → three actions out: "Remind me to call the dentist on Thursday morning and then grab groceries after work. Oh, and can you also text John that we're meeting at 6:00?")
+    6. BACKTICK SCOPE: backticks ONLY wrap single programming identifiers (one camelCase/snake_case/PascalCase word, `foo()`, `--verbose`, a single file path/URL/email/version). NEVER wrap multi-word phrases or natural English in backticks. "the variable user name should be camel case" → "The variable `userName` should be camelCase" — NOT "`username_should_be` camelCase".
+    7. NEVER insert a comma between a subject pronoun and its verb. "I, wanted" is wrong; "I wanted" is correct. Same for he/she/we/they/you. Salutation "Hi <name>," followed by a full sentence → insert "\\n\\n" after the comma.
+    8. NUMBERS: "<integer> point <integer> million/billion/thousand" → digit + unit word ("4.5 million", "$4.5M"). NEVER "four point 5.000.000". Decimals use a period; no European thousand-separators ("4.5", not "4,5", not "4.500"). Contractions preserved exactly — "we're" stays "we're", never "were".
+    9. NO ARTICLE OR WORD INJECTION: never insert articles ("a", "an", "the") or filler words ("just", "really", "so") not in the input. Time expressions stay exact: "next week" never becomes "the next week".
+
+    VOICE vs FILLERS (no contradiction — fillers always win):
+    Fillers ALWAYS go: "um", "uh", "like" as filler, "you know", trailing standalone "Yeah."/"Right."/"You know?", stutter repeats ("the the cat"→"the cat").
+    Everything else preserves the speaker's voice: contractions stay ("I'm", "gonna", "wanna", "y'all"), slang stays, cadence stays, word choice stays.
+
+    SELF-CORRECTIONS:
+    Clear retraction ("no wait", "scratch that", "actually no", "never mind") + new intent → keep ONLY the final intent. Discard all prior attempts.
+    "actually" alone = hedge, keep both sides. Between two numbers = correction, second wins.
+    Incomplete input ending mid-clause → preserve as-is, never extend.
+
+    FEW-SHOT EXAMPLES:
+
+    Example A (short casual, fillers go, contractions stay):
+    Input: "um yeah i think we're gonna ship it tomorrow you know"
+    Output: "Yeah, I think we're gonna ship it tomorrow."
+
+    Example B (long multi-topic, paragraph break at pivot):
+    Input: "okay so the deploy went out around 4 and metrics look clean no error spikes p95 is back under 200ms also can you ping marketing about the launch tweet they wanted to schedule it for friday but i think monday morning hits harder"
+    Output: "The deploy went out around 4 and metrics look clean. No error spikes, p95 is back under 200ms.\\n\\nAlso, can you ping marketing about the launch tweet? They wanted to schedule it for Friday, but I think Monday morning hits harder."
+
+    Example C (restart with cue, drop everything before):
+    Input: "let's meet at three actually no let's do four thirty my one on one runs over"
+    Output: "Let's do 4:30, my one-on-one runs over."
+
+    Example D (restart without cue, frame repeat — keep final version only):
+    Input: "the bug is in the auth flow the bug is in the token refresh when the session expires"
+    Output: "The bug is in the token refresh when the session expires."
+
+    Example E (stutter / repeated words — dedupe):
+    Input: "i i i think we we should just just revert it"
+    Output: "I think we should just revert it."
+
+    Example F (code identifiers in backticks, camelCase preserved):
+    Input: "the getUserToken function is returning null when refreshToken is expired check the auth dot service file"
+    Output: "The `getUserToken` function is returning null when `refreshToken` is expired. Check the `auth.service` file."
+
+    Example G (numbers + percentages — exact preservation):
+    Input: "revenue is up 23 percent quarter over quarter we hit 1.4 million in march and forecasted 1.8 for q2"
+    Output: "Revenue is up 23% quarter-over-quarter. We hit $1.4M in March and forecasted $1.8M for Q2."
+
+    Example H (email register — full prose, polished):
+    Input: "hi sarah just following up on the contract draft i sent monday let me know if you have any feedback by end of week thanks"
+    Output: "Hi Sarah,\\n\\nJust following up on the contract draft I sent Monday. Let me know if you have any feedback by end of week.\\n\\nThanks."
+
+    Example I (Slack register — keep casual, no salutation):
+    Input: "hey can u take a look at the pr when you get a sec no rush"
+    Output: "Hey, can you take a look at the PR when you get a sec? No rush."
+
+    Example J (voice command "scratch that" — delete-back, only post-cue survives):
+    Input: "send the report to the whole team scratch that just send it to marcus and lily"
+    Output: "Just send it to Marcus and Lily."
+
+    FORMAT:
+    Numbers: use digits. Money magnitudes only when context is monetary ("$800K revenue" vs "800K followers").
+    Lists: "bullet point X"→- X | "number one X"→1. X | "heading one X"→# X.
+    Code: "backtick X backtick"→`X` | "camel/snake/pascal case"→xYZ/x_y_z/XYZ. Schema "X underscore Y"→`x_y`.
+    """
+
+    // ============================================================
+    // SLIM PROMPT A/B COMPARISON (review-only — not load-bearing)
+    // ============================================================
+    // Token estimates use the standard chars/4 heuristic (Qwen3 tokenizer
+    // gives a tighter ratio in practice, ~3.3 chars/token for English prose,
+    // so real cost is slightly higher than these numbers — but the RATIO
+    // between v1 and v2 is the same either way).
+    //
+    //   slim v1: ~4,172 chars, ~675 words, ~1,043 est tokens
+    //   slim v2: ~1,098 chars, ~173 words, ~  274 est tokens
+    //   delta:   -73.7% chars  -74.4% words  -73.7% tokens
+    //
+    // What v2 cuts vs v1:
+    //   - 10 few-shot examples (A through J) — only the most common failure
+    //     mode survives as one negative example
+    //   - "ABSOLUTE RULES" / "FEW-SHOT EXAMPLES" / "FORMAT" section headers
+    //   - Lists, headings, code-identifier conversion table (frontier model
+    //     infers these from dictation context)
+    //   - Verbose rephrasings of every rule
+    //   - "Incomplete input" clause (vanishingly rare in <30-word polishes)
+    //
+    // What v2 keeps (the 5–7 rules that matter for short dictations):
+    //   1. em-dash / en-dash ban (most-violated hard constraint)
+    //   2. no emoji, no fabrication, no paraphrase
+    //   3. frozen-token verbatim rule (corrupts emails/URLs if dropped)
+    //   4. filler-strip + voice-preserve (combined as one line)
+    //   5. retraction → final-intent + "actually" hedge nuance
+    //   6. digits + monetary "$" prefix
+    //   7. one negative example for the #1 failure mode (filler leakage)
+    //
+    // Personality + cleanup-level still arrive via per-call append, so v2
+    // doesn't lose any tone-shaping capability. Suspect words still arrive
+    // via the per-call `buildSuspectHints` block — v2 just nods at them in
+    // one final hint line instead of repeating the whole rationale.
+    // ============================================================
+
+    /// Slim v2 — ultra-tight prompt for short dictations (~200 tokens).
+    /// Designed off the observation that most polish calls are <30 words,
+    /// where slim v1's 10 few-shot examples and verbose section headers
+    /// are wasted tokens. Slim v2 keeps only what fails most often:
+    ///   1) em-dash ban (hard constraint)
+    ///   2) no fabrication / no paraphrase
+    ///   3) frozen-token verbatim rule
+    ///   4) filler-strip + voice-preserve tuple (one line)
+    ///   5) retraction → final-intent rule
+    ///   6) numbers as digits
+    /// Personality + cleanup level still arrive via per-call append,
+    /// suspect words via per-call append. Ends with one negative example
+    /// targeting the most common failure mode: fillers leaking through.
+    /// Toggle via UserDefaults `voice.cloudPromptSlimV2` (default OFF until
+    /// proven). Both v1 and v2 are retained so the toggle can be flipped
+    /// without recompile during the A/B window.
+    nonisolated private static let slimCloudSystemInstructionsV2: String = """
+    Polish raw voice transcript. Output polished text only. No preamble, commentary, sign-off.
+    /no_think
+
+    - NEVER em-dash (\u{2014}) or en-dash (\u{2013}). Use comma or period.
+    - NEVER emojis. NEVER invent or paraphrase. Every detail the speaker said survives.
+    - Frozen tokens \u{27E6}E0\u{27E7} etc. = placeholders. Output verbatim, original position.
+    - Strip fillers (um, uh, filler "like", "you know", trailing "yeah."/"right.", stutter repeats). Keep speaker voice: contractions, slang, cadence, word choice.
+    - Clear retraction ("no wait", "scratch that", "actually no") + new intent → keep ONLY final intent. "actually" alone = hedge, keep both sides.
+    - Numbers as digits. "$" prefix only when context is monetary.
+    - CLAUSE PRESERVATION: every distinct topic/action survives. Multi-topic input joined by "and"/"oh and"/"also"/"plus"/"then"/"by the way" → preserve ALL clauses. Never drop later clauses. Never end early with "?" or "...". Actions in = actions out.
+    - BACKTICKS only on single programming identifiers (one camelCase/snake_case/PascalCase token, `foo()`, `--flag`, single path/URL/email/version). NEVER on multi-word English phrases. "the variable user name should be camel case" → "The variable `userName` should be camelCase", NOT "`username_should_be`".
+    - NEVER insert a comma between a pronoun and its verb ("I, wanted" → wrong; "I wanted" → right). Salutation "Hi <name>," + sentence → "\\n\\n" after the comma.
+    - "<N> point <M> million/billion/thousand" → digit + unit word ("4.5 million", "$4.5M"). Decimals use a period, no European thousand-separators ("4.5" not "4,5" not "4.500"). Contractions preserved exactly ("we're" stays "we're", never "were").
+    - NEVER inject articles ("a"/"an"/"the") not in the input. "next week" stays "next week", never "the next week".
+    - Personality + cleanup-level arrive in the per-call instruction below; they tune tone but never override these rules.
+
+    Suspect words flagged below = mis-transcribed proper nouns; prefer the supplied vocabulary list.
+
+    DO NOT do this: "um yeah i think we're gonna ship it tomorrow you know" \u{2192} "Yeah, um, I think we are going to ship it tomorrow, you know." Correct: "Yeah, I think we're gonna ship it tomorrow."
+    """
+
+    /// Optional paragraph-break section, appended ONLY when wordCount > 50.
+    /// Most dictations are 1-2 sentences and don't need this rule — keeping it
+    /// out of the base slim prompt for short inputs reduces token cost and
+    /// stops the model spuriously inserting blank lines into one-liners.
+    nonisolated private static let slimParagraphBreakBlock: String = """
+
+    PARAGRAPH BREAKS:
+    Insert a blank line (\\n\\n) on topic shifts or pivot words ("also", "anyway", "by the way", "oh and", "speaking of", "moving on", "one more thing", "okay so"). Exception clauses ("except/unless/but not") stay in the same paragraph as what they qualify.
+    """
+
+    /// Lean cleanup instruction for cloud. Cerebras Qwen3-235B doesn't need
+    /// the full 2,000-token HIGH mode instruction — concise rules get the same
+    /// result from a frontier model. Target: 60-300 tokens vs 50-800 tokens local.
+    nonisolated private static func cloudCleanupInstruction(_ level: String?) -> String {
+        switch level?.lowercased() {
+        case "none":
+            return "Cleanup: NONE. Output the input verbatim. Fix only trivial whitespace. Never create a bulleted or numbered list."
+
+        case "light":
+            return """
+            Cleanup: LIGHT. Strip only isolated um/uh at clause boundaries. Fix capitalization \
+            and punctuation. Keep all word choice, sentence structure, and informal phrasing intact. \
+            Do not restructure. LISTS: do NOT turn prose into a list. Keep the speaker's words as \
+            sentences/paragraphs. ONLY exception: enumeration the speaker made unmistakably explicit \
+            ("number one … number two …" or "first, … second, …"). A rambling monologue stays prose. \
+            Near-verbatim with minimal cleanup.
+            """
+
+        case "high":
+            return """
+            Cleanup: HIGH. Deep rewrite — output reads like edited prose by a skilled editor. \
+            The speaker's voice and register survive; the structure, rhythm, and flow are made deliberate.
+            REQUIRED:
+            Strip opener fillers (okay so, hey so, alright so, so basically — NOT "I think"/"I want"). \
+            Collapse self-corrections to the final intent ("no wait X" → keep X only). \
+            Convert spoken numbers to digits. Reconstruct URLs/emails from spoken parts. \
+            Break run-ons at natural clause boundaries (no sentence > ~25 words). \
+            Insert paragraph breaks at topic shifts. \
+            SENTENCE MERGING: merge two adjacent short sentences (each ≤10 words) that express a single continuous thought into one fluent sentence using a comma or conjunction — but only when the result flows better. Do not merge when short cadence is emphatic ("It's fast. It works."). \
+            SENTENCE SPLITTING: split run-ons that pack two or more distinct thoughts at natural clause boundaries when each resulting sentence would be ≤15 words. \
+            LIST REORDERING: reorder bullet/enumeration items for logical flow (general before specific, premise before conclusion) when the speaker's order is clearly incidental. Never reorder sequential steps. Never add, remove, or paraphrase items. \
+            PASSIVE TO ACTIVE: convert passive constructions to active when the agent is clear ("the bug was fixed by the team" → "the team fixed the bug"). Leave passive when the agent is unknown or omitted. \
+            SENTENCE RHYTHM: vary sentence length — mix short punchy sentences (≤8 words, good for emphasis/conclusions) with longer flowing ones (15–25 words for explanation). A wall of identically-structured sentences is wrong. \
+            FILLER REMOVAL (aggressive): remove words that add no meaning — "basically", "literally" (non-literal use), redundant "honestly" at sentence end, "at the end of the day", "the thing is", "what I'm trying to say is". Keep genuine hedges ("I think", "maybe", "probably"). \
+            LISTS (aggressive): detect enumerated items and format as a list even when implied (items joined by "and", "also", "and then", "oh and", "plus", or commas). Use numbered list ONLY when order matters; otherwise "- " bullets. A list may ONLY reorganize words the speaker said — never invent, infer, or pad. One item or one continuous thought stays prose. \
+            Strip abandoned word fragments and disfluency clusters. Fix tense drift.
+            PROHIBITED: Changing register/voice. Adding content not in the source. Inventing or padding list items. Paraphrasing meaning. Em-dashes (—) — never, not even one. Emojis.
+            """
+
+        default: // "medium"
+            return """
+            Cleanup: MEDIUM. Strip isolated um/uh. Fix capitalization and punctuation. \
+            Break obvious run-ons. Insert paragraph breaks at topic shifts (40+ words: lean more). \
+            Keep word choice, contractions, and informal phrasing. \
+            Do not merge short sentences or normalize slang.
+            LISTS (only when CLEAR): format a list only when enumeration is clear — explicit ordinals \
+            ("first/second/third", "number one/two/three"), counting, or an intro + 3+ short parallel items \
+            ("a few things: X, Y, and Z"). Numbered only if order matters, else "- " bullets. Items must be the \
+            speaker's actual words — never invent or pad. Do NOT force a list out of an ambiguous rant — keep prose.
+            Collapse clear self-corrections ("no wait X" / "actually, no X" / "scratch that X" → keep X only). \
+            Strip standalone trailing fillers at end of statement ("Yeah." "Right." "You know?" alone → remove). \
+            Deduplicate immediately repeated words ("the the"→"the"). \
+            Fix accidental tense drift: if the narrative contains past-time markers \
+            (yesterday, last night, this morning, earlier today, last week) → normalize all \
+            verbs to past tense. Otherwise settle on whichever tense the speaker used most. \
+            DEFAULT: when in doubt, keep the original.
+            """
+        }
+    }
+    */
+    // End of commented-out legacy cloud-prompt constants.
 
     // MARK: - Sentence boundary counting (Section B)
 
@@ -2766,19 +4604,10 @@ final class Qwen3Polisher {
         // newlines. Allow those newlines through (don't strip them in the
         // newline-collapse step below) and grant extra word budget for list
         // prefixes like "1." "2." "3.".
-        let listTriggers: [String] = [
-            "first", "second", "third", "fourth", "fifth",
-            "point one", "point two", "point three",
-            "number one", "number two", "number three",
-            "step one", "step two", "step three",
-            "action item", "action items",
-            "bullet point",
-        ]
+        // Hoisted from hot path — was recompiled per polish call.
         var listTriggerHits = 0
-        for trigger in listTriggers {
-            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: trigger) + "\\b"
-            if let rx = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
-               rx.firstMatch(in: origLower, range: NSRange(origLower.startIndex..., in: origLower)) != nil {
+        for rx in Self.listTriggerRegexes {
+            if rx.firstMatch(in: origLower, range: NSRange(origLower.startIndex..., in: origLower)) != nil {
                 listTriggerHits += 1
             }
         }
@@ -2875,9 +4704,9 @@ final class Qwen3Polisher {
         // "i'mport" / "i'ma" and other accidental substrings. \b around the
         // whole alternation gives exactly one count per legitimate contraction
         // occurrence.
-        let contractionPattern = #"\b(don't|can't|won't|isn't|aren't|wasn't|weren't|hasn't|haven't|hadn't|doesn't|didn't|shouldn't|wouldn't|couldn't|i'm|i've|i'd|i'll|you're|you've|you'd|you'll|we're|we've|we'd|we'll|they're|they've|they'd|they'll|he's|she's|it's|that's|what's|let's|here's|there's)\b"#
+        // Hoisted from hot path — was recompiled per polish call.
         var contractionCount = 0
-        if let rx = try? NSRegularExpression(pattern: contractionPattern, options: .caseInsensitive) {
+        if let rx = Self.contractionBudgetRegex {
             contractionCount = rx.numberOfMatches(in: origLower, range: NSRange(origLower.startIndex..., in: origLower))
         }
         wordBudget += contractionCount
@@ -2900,15 +4729,10 @@ final class Qwen3Polisher {
         // Section B: tightened set focused on the canonical fillers called
         // out in the spec. Word-boundary regex prevents "like" matching
         // "alike" / "likely", "literally" matching "literal", etc.
-        let fillerTokens: Set<String> = [
-            "you know", "like", "basically", "literally", "actually",
-            "um", "uh", "i mean", "kind of", "sort of",
-        ]
+        // Hoisted from hot path — was recompiled per polish call.
         var fillerHits = 0
-        for f in fillerTokens {
-            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: f) + "\\b"
-            if let rx = try? NSRegularExpression(pattern: pattern),
-               rx.firstMatch(in: origLower, range: NSRange(origLower.startIndex..., in: origLower)) != nil {
+        for rx in Self.fillerTokenRegexes {
+            if rx.firstMatch(in: origLower, range: NSRange(origLower.startIndex..., in: origLower)) != nil {
                 fillerHits += 1
             }
         }
@@ -2916,6 +4740,30 @@ final class Qwen3Polisher {
         wordBudget += fillerBudget
         if fillerBudget > 0 {
             print("[VOICE] Qwen3 sanitizer: filler budget +\(fillerBudget) (detected \(fillerHits) filler types) → wordBudget=\(wordBudget)")
+        }
+        // Backtrack / self-correction budget (Smart Formatting behavior #2).
+        // When the speaker corrects themselves ("buy milk, no wait, eggs, no
+        // scratch that, just bread"), the correct polish DROPS every abandoned
+        // attempt — which can legitimately cut word count by 50-70%. Without
+        // this budget the medium-level ±30% guard REJECTS correct
+        // correction-collapse output and ships the raw rambling text instead.
+        // This was a primary "polish doesn't work" cause for any dictation
+        // containing a self-correction. Grant generous slack scaled by how many
+        // correction markers appear (each marks an abandoned span).
+        // Hoisted from hot path — was recompiled per polish call.
+        var correctionHits = 0
+        for rx in Self.correctionMarkerRegexes {
+            if rx.firstMatch(in: origLower, range: NSRange(origLower.startIndex..., in: origLower)) != nil {
+                correctionHits += 1
+            }
+        }
+        if correctionHits > 0 {
+            // Each correction can abandon a whole clause. Grant up to ~40% of
+            // the original word count (capped) so a multi-layer correction
+            // chain that collapses to a short final intent isn't rejected.
+            let correctionBudget = min(max(correctionHits * 4, originalWords * 40 / 100), originalWords)
+            wordBudget += correctionBudget
+            print("[VOICE] Qwen3 sanitizer: self-correction budget +\(correctionBudget) (detected \(correctionHits) correction markers) → wordBudget=\(wordBudget)")
         }
         // List-marker budget: "1." "2." prefixes add extra words vs. prose.
         if hasListMarkers {
@@ -2995,6 +4843,14 @@ final class Qwen3Polisher {
         if spokenPunct {
             lenThreshold = max(lenThreshold, original.count * 70 / 100, 20)
         }
+        // Self-correction collapse can cut char count as hard as it cuts word
+        // count (dropping abandoned clauses). Mirror the word-budget relaxation
+        // on the length threshold so correction-collapse output isn't rejected
+        // for "length drift". Allow up to 70% reduction when correction markers
+        // are present.
+        if correctionHits > 0 {
+            lenThreshold = max(lenThreshold, original.count * 70 / 100, 20)
+        }
         // List formatting legitimately changes char count more (added "1. \n2. \n" etc.).
         if hasListMarkers {
             lenThreshold = max(lenThreshold, original.count * 80 / 100, 30)
@@ -3024,9 +4880,17 @@ final class Qwen3Polisher {
             ("can't", "can"),
             ("cannot", "can"),
         ]
+        // Word-boundary helper: returns true iff `word` appears as a whole word
+        // in `text`. Uses \b anchors so "can't" doesn't fire inside "can'taloupe"
+        // and "will" doesn't fire inside "willingness".
+        func containsWord(_ word: String, in text: String) -> Bool {
+            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: word))\\b"
+            return text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+        }
+
         for flip in criticalFlips {
-            let origHasNeg = origLower.contains(flip.neg)
-            let cleanedLostNeg = !cleanedLower.contains(flip.neg) && cleanedLower.contains(flip.pos)
+            let origHasNeg = containsWord(flip.neg, in: origLower)
+            let cleanedLostNeg = !containsWord(flip.neg, in: cleanedLower) && containsWord(flip.pos, in: cleanedLower)
             if origHasNeg && cleanedLostNeg {
                 print("[VOICE] Qwen3: rejected — semantic flip '\(flip.neg)' → '\(flip.pos)'")
                 return original
@@ -3035,8 +4899,8 @@ final class Qwen3Polisher {
 
         // Negation collapse: if original has 3+ negation words and polished drops more than half.
         let negationWords = ["not", "no", "never", "don't", "doesn't", "didn't", "won't", "can't", "couldn't", "shouldn't", "wouldn't", "isn't", "aren't", "wasn't", "weren't"]
-        let origNegCount = negationWords.filter { origLower.contains($0) }.count
-        let cleanedNegCount = negationWords.filter { cleanedLower.contains($0) }.count
+        let origNegCount = negationWords.filter { containsWord($0, in: origLower) }.count
+        let cleanedNegCount = negationWords.filter { containsWord($0, in: cleanedLower) }.count
         if origNegCount >= 3 && cleanedNegCount < origNegCount / 2 {
             print("[VOICE] Qwen3: rejected — negation collapse (\(origNegCount) → \(cleanedNegCount))")
             return original

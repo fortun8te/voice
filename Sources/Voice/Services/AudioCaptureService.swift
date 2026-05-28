@@ -193,7 +193,7 @@ class AudioCaptureService {
     // not a permissive floor. Voice-processing (AEC/AGC/NS) is OFF across the
     // board (see DSPTuning), so nothing in our chain is crushing whisper signals.
     private let silenceFloorRMS: Float = 0.0008  // ~-62 dBFS — below this is true silence
-    private let silenceTimeoutSeconds: Double = 5.0  // Auto-stop after N seconds silence
+    private let silenceTimeoutSeconds: Double = 300.0  // Auto-stop after 5 min silence (hands-free max)
 
     // State
     var isCapturing = false
@@ -284,6 +284,11 @@ class AudioCaptureService {
     /// are part-2, part-3, etc. after re-open. Exposed so the caller can
     /// stitch them back together in post-processing.
     private(set) var audioFilePartURLs: [URL] = []
+    /// Hard cap on how many re-opened part files we'll create in one recording
+    /// before we give up and surface an error. Without this, a persistently
+    /// failing writer (full disk, permission flap) can run away appending
+    /// `.partN` URLs unbounded for the lifetime of the recording.
+    private let maxAudioFileParts = 10
     /// Wall-clock time the engine was started; used to surface a warning
     /// once we cross the 2-hour mark on a single engine instance.
     private var engineStartedAt: Date?
@@ -293,11 +298,14 @@ class AudioCaptureService {
     /// roughly every 10 seconds based on frames written, no Timer needed.
     private var framesSinceLastProgressLog: Int = 0
 
-    /// Wall-clock of the last tap buffer we received. Watchdog uses this to
-    /// detect a silently-stalled mic (permission revoked mid-record, device
-    /// unplugged, kernel input HAL wedged). Initialised lazily in
-    /// startMicrophoneCapture.
-    private var lastAudioReceivedAt: Date = Date()
+    /// Wall-clock of the last tap buffer we received, stored as a CFAbsoluteTime
+    /// (Double) so the audio I/O thread can update it without a main-queue hop
+    /// or a Date allocation on every buffer. The 8-byte aligned write is
+    /// naturally atomic on arm64; the watchdog only needs an approximate
+    /// timestamp (3-second tolerance), so a torn read is harmless in practice
+    /// — and on Apple Silicon the read isn't torn anyway.
+    /// Initialised lazily in startMicrophoneCapture.
+    private var lastAudioReceivedAtCF: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
     /// Periodic timer that fires `.voiceError` if no audio has arrived in
     /// >3s while we should be capturing. Created in startMicrophoneCapture,
     /// invalidated in stopCapture.
@@ -343,7 +351,7 @@ class AudioCaptureService {
         // logs let us see EXACTLY what AVAudioEngine and the OS think the
         // input device is at the moment recording starts.
         let preFormat = inputNode.inputFormat(forBus: 0)
-        print("[VOICE-AC] Input format @ start: sr=\(preFormat.sampleRate)Hz channels=\(preFormat.channelCount) interleaved=\(preFormat.isInterleaved)")
+        vlog("[VOICE-AC] Input format @ start: sr=\(preFormat.sampleRate)Hz channels=\(preFormat.channelCount) interleaved=\(preFormat.isInterleaved)")
 
         var osDeviceID = AudioDeviceID(0)
         var osSize = UInt32(MemoryLayout<AudioDeviceID>.size)
@@ -361,12 +369,12 @@ class AudioCaptureService {
                 mElement: kAudioObjectPropertyElementMain)
             if AudioObjectGetPropertyData(osDeviceID, &nameAddr, 0, nil, &nameSize, &nameRef) == noErr,
                let cf = nameRef?.takeRetainedValue() {
-                print("[VOICE-AC] OS default input: \(cf) (id=\(osDeviceID))")
+                vlog("[VOICE-AC] OS default input: \(cf) (id=\(osDeviceID))")
             }
         }
 
         if preFormat.sampleRate <= 0 || preFormat.channelCount == 0 {
-            print("[VOICE-AC] ERROR: invalid input format — sample rate or channel count is zero")
+            vlog("[VOICE-AC] ERROR: invalid input format — sample rate or channel count is zero")
             NotificationCenter.default.post(
                 name: .voiceError,
                 object: nil,
@@ -382,7 +390,7 @@ class AudioCaptureService {
         // and Bluetooth mics benefit from it (except AirPods — see DSPTuning).
         self.inputClass = detectInputDeviceClass()
         let tuning = DSPTuning.forDevice(self.inputClass)
-        print("[VOICE-AC] input device: \"\(currentInputDeviceName())\" class=\(self.inputClass.rawValue) — voiceProcessing=\(tuning.voiceProcessingEnabled) maxGain=\(tuning.maxAdaptiveGain)x")
+        vlog("[VOICE-AC] input device: \"\(currentInputDeviceName())\" class=\(self.inputClass.rawValue) — voiceProcessing=\(tuning.voiceProcessingEnabled) maxGain=\(tuning.maxAdaptiveGain)x")
 
         // Reset DSP state for a fresh recording.
         self.adaptiveGain = 1.0
@@ -405,7 +413,7 @@ class AudioCaptureService {
         do {
             try inputNode.setVoiceProcessingEnabled(tuning.voiceProcessingEnabled)
             if tuning.voiceProcessingEnabled {
-                print("[VOICE-AC] voice processing enabled (AEC + AGC + NS)")
+                vlog("[VOICE-AC] voice processing enabled (AEC + AGC + NS)")
                 // On macOS 14+ we can tune the AGC behavior; on older releases
                 // these properties no-op. The default AGC is conservative —
                 // we leave it on but ensure our own adaptive-gain stage
@@ -432,11 +440,45 @@ class AudioCaptureService {
                 }
                 #endif
             } else {
-                print("[VOICE-AC] voice processing DISABLED (studio mic — trusting input)")
+                vlog("[VOICE-AC] voice processing DISABLED (studio mic — trusting input)")
             }
         } catch {
-            print("[VOICE-AC] voice processing unavailable: \(error.localizedDescription)")
+            vlog("[VOICE-AC] voice processing unavailable: \(error.localizedDescription)")
         }
+
+        // Bluetooth High-Quality Recording (AirPods LAV-quality mic).
+        //
+        // iOS 26 introduces AVAudioSessionCategoryOptionBluetoothHighQualityRecording
+        // which keeps AirPods in their high-bitrate AAC microphone profile instead of
+        // falling back to the narrow-band SCO/HFP codec. On macOS, AVAudioSession is
+        // not available and the Bluetooth stack is managed differently — AirPods
+        // already prefer the higher-quality AAC profile when no active phone call is
+        // in progress. The option is explicitly marked API_UNAVAILABLE(macos) in the
+        // macOS SDK (AVAudioSessionTypes.h: API_AVAILABLE(ios(26.0)) API_UNAVAILABLE(macos)).
+        //
+        // TODO: If Apple adds an equivalent macOS API in a future SDK, enable here:
+        //
+        // if #available(macOS 26.0, *) {
+        //     // Enable when SDK confirms macOS availability:
+        //     // try AVAudioSession.sharedInstance().setCategory(
+        //     //     .playAndRecord,
+        //     //     mode: .measurement,
+        //     //     options: [.bluetoothHighQualityRecording]
+        //     // )
+        // }
+        //
+        // For now: when a Bluetooth mic is detected, log the device name. The
+        // presence of "Hands-Free" in the name indicates SCO/HFP 8kHz fallback
+        // mode (another app has an active call session). Pure AAC mode shows
+        // the clean device name ("AirPods Pro", "AirPods Max") at 24kHz.
+        if self.inputClass == .bluetooth {
+            let btName = currentInputDeviceName()
+            let qualityHint = btName.lowercased().contains("hands-free") || btName.lowercased().contains("handsfree")
+                ? "WARNING: HFP/SCO 8kHz fallback mode detected — close any active call in another app for full-quality AAC mic"
+                : "AAC mic profile likely active (good)"
+            vlog("[VOICE-AC] Bluetooth mic: \"\(btName)\" — \(qualityHint)")
+        }
+
         // Install tap + build converter for the current default input device.
         // Extracted into a helper so the route-change observer can re-run it
         // (the device's sample rate / channel count may have changed when the
@@ -469,9 +511,9 @@ class AudioCaptureService {
 
         do {
             try engine.start()
-            print("[VOICE-AC] AVAudioEngine started at \(Date()) (running=\(engine.isRunning))")
+            vlog("[VOICE-AC] AVAudioEngine started at \(Date()) (running=\(engine.isRunning))")
         } catch {
-            print("[VOICE-AC] AVAudioEngine.start THREW: \(error.localizedDescription)")
+            vlog("[VOICE-AC] AVAudioEngine.start THREW: \(error.localizedDescription)")
             throw error
         }
         isCapturing = true
@@ -482,12 +524,12 @@ class AudioCaptureService {
         // assume the mic died (permission revoked, device disconnected, HAL
         // wedged) and surface a user-visible error so the recording isn't
         // silently empty. Timer fires on the main run loop.
-        self.lastAudioReceivedAt = Date()
+        self.lastAudioReceivedAtCF = CFAbsoluteTimeGetCurrent()
         self.silenceWatchdog?.invalidate()
         self.silenceWatchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self, self.isCapturing else { return }
-            if Date().timeIntervalSince(self.lastAudioReceivedAt) > 3.0 {
-                print("[VOICE] No audio received in 3s — likely permission revoked or device disconnected")
+            if CFAbsoluteTimeGetCurrent() - self.lastAudioReceivedAtCF > 3.0 {
+                vlog("[VOICE] No audio received in 3s — likely permission revoked or device disconnected")
                 NotificationCenter.default.post(
                     name: .voiceError,
                     object: nil,
@@ -620,19 +662,19 @@ class AudioCaptureService {
         let closing: AVAudioFile?
         writerLock.lock()
         closing = audioFileWriter
-        // Trailing zero padding (~160ms @ 16kHz) before close. Symmetric to
+        // Trailing zero padding (~60ms @ 16kHz) before close. Symmetric to
         // the lead-in pad in startWritingToFile — gives Parakeet's right-
         // context window enough samples to finalize the last token's
         // duration prediction. Without this the final word can be clipped
         // ("that" → "tha") on tight push-to-talk stops.
         if let writer = closing, let format = targetFormat,
-           let padBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 2560) {
-            padBuffer.frameLength = 2560  // 160ms at 16kHz
+           let padBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 960) {
+            padBuffer.frameLength = 960  // 60ms at 16kHz
             if let ch = padBuffer.floatChannelData?[0] {
                 memset(ch, 0, Int(padBuffer.frameLength) * MemoryLayout<Float>.size)
             }
             try? writer.write(from: padBuffer)
-            audioFileBytesWritten &+= Int64(2560) * 4
+            audioFileBytesWritten &+= Int64(960) * 4
         }
         audioFileWriter = nil
         audioFileURL = nil
@@ -692,14 +734,14 @@ class AudioCaptureService {
         // and just generates zeros). Native-format-in, converter-to-16kHz-out
         // is the only configuration that works across all device classes.
         let inputFormat = inputNode.inputFormat(forBus: 0)
-        print("[VOICE-AC] mic input format: sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) interleaved=\(inputFormat.isInterleaved) voiceProcessing=\(inputNode.isVoiceProcessingEnabled)")
+        vlog("[VOICE-AC] mic input format: sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) interleaved=\(inputFormat.isInterleaved) voiceProcessing=\(inputNode.isVoiceProcessingEnabled)")
 
         // Guard against the "zero-channel mic" failure mode that happens when
         // mic permission was just revoked or the input device disappeared
         // mid-session. AVAudioEngine will install the tap but the closure
         // never fires — recording silently produces 0 bytes. Surface it.
         if inputFormat.channelCount == 0 || inputFormat.sampleRate <= 0 {
-            print("[VOICE-AC] FATAL: invalid mic input format — permission revoked or device missing")
+            vlog("[VOICE-AC] FATAL: invalid mic input format — permission revoked or device missing")
             throw NSError(domain: "AudioCaptureService", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "Microphone unavailable — check permissions and device selection"])
         }
@@ -723,8 +765,8 @@ class AudioCaptureService {
         // Resampling quality: default is .medium (linear-ish). For ASR we want
         // .max which uses a long sinc kernel — eliminates aliasing on
         // 44.1/48k → 16k downsample and preserves consonant clarity.
-        converter.sampleRateConverterQuality = .max
-        converter.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Mastering
+        // Medium quality is plenty for 16kHz ASR — Mastering kernel was burning CPU on every buffer.
+        converter.sampleRateConverterQuality = Int(AVAudioQuality.medium.rawValue)
         self.audioConverter = converter
         self.targetFormat = targetFormat
 
@@ -733,11 +775,11 @@ class AudioCaptureService {
             bufferSize: bufferSize,
             format: inputFormat  // Use native format — required by AVAudioEngine
         ) { [weak self] buffer, _ in
-            // Bounce the timestamp update to main — Date is 16 bytes and a
-            // direct cross-thread assignment between this audio I/O thread
-            // and the watchdog Timer on main is a data race (torn read can
-            // produce a garbage timestamp → spurious "mic not responding").
-            DispatchQueue.main.async { self?.lastAudioReceivedAt = Date() }
+            // Update the watchdog timestamp in-place — CFAbsoluteTime is a
+            // single 8-byte aligned Double, naturally atomic on arm64. No
+            // main-queue hop, no Date allocation, no closure capture cost per
+            // buffer (this fires every ~85ms during recording).
+            self?.lastAudioReceivedAtCF = CFAbsoluteTimeGetCurrent()
             self?.processAudioBuffer(buffer)
         }
     }
@@ -751,7 +793,7 @@ class AudioCaptureService {
     /// against a stale format — typically producing silence on the new device.
     private func handleConfigurationChange() {
         guard let engine = self.audioEngine else { return }
-        print("[VOICE-AC] route change — reconfiguring for new device: \"\(currentInputDeviceName())\"")
+        vlog("[VOICE-AC] route change — reconfiguring for new device: \"\(currentInputDeviceName())\"")
 
         // Stop the engine before mutating the graph. Restarting without
         // stopping causes intermittent CoreAudio asserts on macOS.
@@ -764,7 +806,7 @@ class AudioCaptureService {
         let oldClass = self.inputClass
         self.inputClass = newClass
         let newTuning = DSPTuning.forDevice(newClass)
-        print("[VOICE-AC] device class transition: \(oldClass.rawValue) → \(newClass.rawValue) — voiceProcessing=\(newTuning.voiceProcessingEnabled)")
+        vlog("[VOICE-AC] device class transition: \(oldClass.rawValue) → \(newClass.rawValue) — voiceProcessing=\(newTuning.voiceProcessingEnabled)")
 
         let inputNode = engine.inputNode
         do {
@@ -780,7 +822,7 @@ class AudioCaptureService {
             }
             #endif
         } catch {
-            print("[VOICE-AC] route-change voice-processing toggle failed: \(error.localizedDescription)")
+            vlog("[VOICE-AC] route-change voice-processing toggle failed: \(error.localizedDescription)")
         }
 
         // Reset DSP state — the old envelopes / smoothed RMS / adaptive gain
@@ -799,7 +841,7 @@ class AudioCaptureService {
         do {
             try installInputTap(on: inputNode)
         } catch {
-            print("[VOICE-AC] route-change tap install failed: \(error.localizedDescription)")
+            vlog("[VOICE-AC] route-change tap install failed: \(error.localizedDescription)")
             NotificationCenter.default.post(
                 name: .voiceError,
                 object: nil,
@@ -812,12 +854,12 @@ class AudioCaptureService {
             try engine.start()
             // Reset the watchdog clock so we don't immediately fire the
             // "no audio in 3s" alarm during the brief device-switch gap.
-            self.lastAudioReceivedAt = Date()
+            self.lastAudioReceivedAtCF = CFAbsoluteTimeGetCurrent()
             let newFormat = inputNode.inputFormat(forBus: 0)
-            print("[VOICE-AC] Post-reconfigure format: sr=\(newFormat.sampleRate)Hz channels=\(newFormat.channelCount)")
-            print("[VOICE-AC] route change complete — engine restarted (running=\(engine.isRunning))")
+            vlog("[VOICE-AC] Post-reconfigure format: sr=\(newFormat.sampleRate)Hz channels=\(newFormat.channelCount)")
+            vlog("[VOICE-AC] route change complete — engine restarted (running=\(engine.isRunning))")
         } catch {
-            print("[VOICE-AC] route-change engine restart failed: \(error.localizedDescription)")
+            vlog("[VOICE-AC] route-change engine restart failed: \(error.localizedDescription)")
         }
     }
 
@@ -868,9 +910,9 @@ class AudioCaptureService {
         // (mic muted, wrong device, kernel HAL wedged) within 1s.
         self.peakSampleThisSecond = max(self.peakSampleThisSecond, peak)
         if Date().timeIntervalSince(self.lastPeakLogAt) > 1.0 {
-            print("[VOICE-AC] Audio peak last 1s: \(self.peakSampleThisSecond)")
+            vlog("[VOICE-AC] Audio peak last 1s: \(self.peakSampleThisSecond)")
             if self.peakSampleThisSecond < 0.001 {
-                print("[VOICE-AC] WARNING: capturing near-silence — mic may be muted or routed wrong")
+                vlog("[VOICE-AC] WARNING: capturing near-silence — mic may be muted or routed wrong")
             }
             self.peakSampleThisSecond = 0
             self.lastPeakLogAt = Date()
@@ -900,7 +942,7 @@ class AudioCaptureService {
             else if rms < 0.05  { regime = "quiet"   }
             else if rms < 0.2   { regime = "normal"  }
             else                { regime = "LOUD"    }
-            print(String(format: "[VOICE-AC] DSP rms=%.2fdB peak=%.2fdB gain=%.2fx regime=%@ device=%@",
+            vlog(String(format: "[VOICE-AC] DSP rms=%.2fdB peak=%.2fdB gain=%.2fx regime=%@ device=%@",
                          rmsDb, peakDb, self.adaptiveGain, regime, self.inputClass.rawValue))
         }
 
@@ -914,20 +956,22 @@ class AudioCaptureService {
         // post-DSP samples for the visualizer.
         if !loggedPostDSPVisualizer && rms >= silenceFloorRMS {
             loggedPostDSPVisualizer = true
-            print("[VOICE-AC] visualizer using post-DSP samples")
+            vlog("[VOICE-AC] visualizer using post-DSP samples")
         }
         let newLevels = computeVisualizerLevels(samples: samples,
                                                 isRecording: isCapturing)
 
         // Perceptual level for the UI meter. RMS of typical speech sits in
         // ~0.02-0.15; a sqrt + scale lifts that to ~0.2-0.85 so the bars
-        // actually move. We pin to 0 below the absolute silence floor so the
-        // bars rest cleanly when nothing is happening.
+        // actually move. We apply a minimum visible floor while recording is
+        // active (0.02) so the waveform shows a faint pulse even on genuine
+        // room-silence — prevents the pill from looking "dead / not recording".
+        // When not recording (idle state) we return 0 so the waveform rests cleanly.
         let perceptual: Float
         if rms < silenceFloorRMS {
-            perceptual = 0
+            perceptual = isCapturing ? 0.02 : 0.0
         } else {
-            perceptual = min(1.0, sqrtf(rms) * 2.4)
+            perceptual = max(isCapturing ? 0.02 : 0.0, min(1.0, sqrtf(rms) * 2.4))
         }
 
         // Update @Observable properties on main thread to avoid data races.
@@ -963,16 +1007,30 @@ class AudioCaptureService {
                 // Progress heartbeat ~every 10s of audio (16k * 10 = 160k frames).
                 if framesSinceLastProgressLog >= 160_000 {
                     let durationSeconds = Double(audioFileBytesWritten / 4) / sampleRate
-                    print("[VOICE] audio file progress: bytes=\(audioFileBytesWritten) (~\(Int(durationSeconds))s)")
+                    vlog("[VOICE] audio file progress: bytes=\(audioFileBytesWritten) (~\(Int(durationSeconds))s)")
                     framesSinceLastProgressLog = 0
                 }
             } catch {
-                print("[VOICE] audio file write failed: \(error.localizedDescription) — attempting reopen")
+                vlog("[VOICE] audio file write failed: \(error.localizedDescription) — attempting reopen")
                 // Failure recovery: drop the broken handle, open a new
                 // `-partN` file next to the original, and try once more.
                 // Stitching across parts is handled in post-processing.
                 if let originalURL = audioFileURL, let settings = audioFileSettings {
                     audioFileWriter = nil
+                    // Bail out if we've already hit the part cap — runaway
+                    // reopens mean the disk/permissions aren't going to
+                    // recover, so stop capturing and tell the user.
+                    if audioFilePartURLs.count >= maxAudioFileParts {
+                        vlog("[VOICE] audio file reopen aborted: hit maxAudioFileParts=\(maxAudioFileParts)")
+                        writerLock.unlock()
+                        stopCapture()
+                        NotificationCenter.default.post(
+                            name: .voiceError,
+                            object: nil,
+                            userInfo: ["message": "Audio write keeps failing — recording stopped"]
+                        )
+                        return
+                    }
                     audioFilePartIndex += 1
                     let partURL = originalURL
                         .deletingPathExtension()
@@ -989,9 +1047,9 @@ class AudioCaptureService {
                         audioFileWriter = newFile
                         audioFilePartURLs.append(partURL)
                         audioFileBytesWritten &+= Int64(frameCount) * 4
-                        print("[VOICE] audio file reopened at \(partURL.lastPathComponent)")
+                        vlog("[VOICE] audio file reopened at \(partURL.lastPathComponent)")
                     } catch {
-                        print("[VOICE] audio file reopen failed: \(error.localizedDescription)")
+                        vlog("[VOICE] audio file reopen failed: \(error.localizedDescription)")
                     }
                 }
             }
@@ -1006,7 +1064,7 @@ class AudioCaptureService {
            !engineLongRunningWarningEmitted,
            Date().timeIntervalSince(startedAt) > 2 * 60 * 60 {
             engineLongRunningWarningEmitted = true
-            print("[VOICE] WARNING: AVAudioEngine has been running >2h — long-recording territory")
+            vlog("[VOICE] WARNING: AVAudioEngine has been running >2h — long-recording territory")
         }
 
         // 4. Silence detection — must run on main thread (Timer requires run loop).
@@ -1020,7 +1078,7 @@ class AudioCaptureService {
             if isSilent {
                 if self.silenceTimer == nil {
                     self.silenceTimer = Timer.scheduledTimer(withTimeInterval: self.silenceTimeoutSeconds, repeats: false) { [weak self] _ in
-                        print("[VOICE] Silence detected for \(self?.silenceTimeoutSeconds ?? 0)s — auto-committing lock mode")
+                        vlog("[VOICE] Silence detected for \(self?.silenceTimeoutSeconds ?? 0)s — auto-committing lock mode")
                         self?.onSilenceTimeout?()
                     }
                 }
@@ -1045,25 +1103,68 @@ class AudioCaptureService {
     private func applyDSPChain(channelData: UnsafeMutablePointer<Float>,
                                frameCount: Int,
                                tuning: DSPTuning) {
+        // Ensure reusable vDSP scratch buffers exist (grown lazily, no per-buffer
+        // alloc in steady state once the first frameCount has been seen).
+        ensurePreEmphScratch(frameCount)
+
         // ---- Stage 1: One-pole high-pass (DC removal + sub-80Hz rumble) ----
         // Standard one-pole HPF: y[n] = α·(y[n-1] + x[n] - x[n-1])
+        //                            = α·x[n] − α·x[n-1] + α·y[n-1]
         // α = exp(-2π·fc/fs). At fc=80Hz, fs=16kHz → α ≈ 0.9691. Gives a
         // ~ -3dB point at 80Hz, 12dB/oct rolloff below. Cheaper than a biquad
         // and good enough for DC removal — the goal isn't surgical filtering,
         // it's preventing DC offset from eating dynamic range.
-        if tuning.highPassCutoffHz > 0 {
+        //
+        // VECTORIZED (vDSP_deq22): Direct Form II 2-pole/2-zero solver.
+        // Replaces the per-sample scalar feedback loop with a single
+        // Accelerate call. vDSP_deq22's contract is:
+        //   C[n] = A[n]*B[0] + A[n-1]*B[1] + A[n-2]*B[2]
+        //                    - C[n-1]*B[3] - C[n-2]*B[4]
+        // For our 1st-order HPF we collapse to:
+        //   B = [α, -α, 0, -α, 0]
+        // which yields y[n] = α·x[n] − α·x[n-1] + α·y[n-1]. The 2nd-order
+        // slots (B[2], B[4]) are zero so it degrades cleanly to 1st-order.
+        // Inputs/outputs must include 2 samples of prior history; we keep
+        // only the last input/output as before (the 2-back slot is unused
+        // since B[2]=B[4]=0, so any value works — we pass zeros).
+        if tuning.highPassCutoffHz > 0 && frameCount > 0 {
             let alpha: Float = expf(-2.0 * .pi * tuning.highPassCutoffHz / Float(sampleRate))
-            var prevIn = self.hpfPrevIn
-            var prevOut = self.hpfPrevOut
-            for i in 0..<frameCount {
-                let x = channelData[i]
-                let y = alpha * (prevOut + x - prevIn)
-                channelData[i] = y
-                prevIn = x
-                prevOut = y
+            // vDSP_deq22 requires (N + 2) input and output samples — slots
+            // [0] and [1] are previous input/output history, [2..N+1] are
+            // current. Since our 2-back coefficients are zero we only need
+            // [1] to be set correctly; [0] can be anything (we use 0).
+            ensureHPFScratch(frameCount)
+            hpfInScratch.withUnsafeMutableBufferPointer { inBuf in
+                hpfOutScratch.withUnsafeMutableBufferPointer { outBuf in
+                    guard let inBase = inBuf.baseAddress,
+                          let outBase = outBuf.baseAddress else { return }
+                    inBase[0]  = 0
+                    inBase[1]  = self.hpfPrevIn
+                    outBase[0] = 0
+                    outBase[1] = self.hpfPrevOut
+                    // Copy current samples into the scratch input buffer
+                    // starting at offset 2.
+                    memcpy(inBase + 2, channelData, frameCount * MemoryLayout<Float>.size)
+                    // Coefficients: y[n] = α·x[n] − α·x[n-1] + α·y[n-1]
+                    //   B[0] =  α   (current input)
+                    //   B[1] = −α   (1-back input)
+                    //   B[2] =  0   (2-back input)
+                    //   B[3] = −α   (1-back output; sign flips: −C·B = +α·y[n-1])
+                    //   B[4] =  0   (2-back output)
+                    var coeffs: [Float] = [alpha, -alpha, 0, -alpha, 0]
+                    coeffs.withUnsafeBufferPointer { bPtr in
+                        vDSP_deq22(inBase, 1, bPtr.baseAddress!, outBase, 1, vDSP_Length(frameCount))
+                    }
+                    // Copy filtered output (lives at outBase[2..N+1]) back
+                    // into channelData in-place. Persist last raw input
+                    // BEFORE this copy clobbers channelData (last raw input
+                    // is the source's last sample, which we read from the
+                    // scratch input buffer where it's still untouched).
+                    self.hpfPrevIn  = inBase[frameCount + 1]
+                    self.hpfPrevOut = outBase[frameCount + 1]
+                    memcpy(channelData, outBase + 2, frameCount * MemoryLayout<Float>.size)
+                }
             }
-            self.hpfPrevIn = prevIn
-            self.hpfPrevOut = prevOut
         }
 
         // ---- Stage 2: Pre-emphasis (FIR: y[n] = x[n] - α·x[n-1]) ----
@@ -1072,15 +1173,32 @@ class AudioCaptureService {
         // We apply it here (rather than as a separate model-side step) because
         // we ALSO want the on-disk file to carry it — the post-hoc batch
         // re-transcription pass should see the same signal as the live one.
-        if tuning.preEmphasisAlpha > 0 {
+        //
+        // VECTORIZED (vDSP): y[n] = x[n] - α·x[n-1] is a length-2 FIR. We
+        // capture the last input sample first (will be next buffer's prev),
+        // shift the signal one sample (using preEmphPrev as the first prev),
+        // then compute y = x - α·prev via vDSP_vsmsa-style fused ops. This
+        // replaces a ~4096-iteration scalar Swift loop with a single
+        // vectorized pass per buffer.
+        if tuning.preEmphasisAlpha > 0 && frameCount > 0 {
             let a = tuning.preEmphasisAlpha
-            var prev = self.preEmphPrev
-            for i in 0..<frameCount {
-                let x = channelData[i]
-                channelData[i] = x - a * prev
-                prev = x
+            let lastIn = channelData[frameCount - 1]
+            // Build "prev" vector in scratch: [preEmphPrev, x[0], x[1], ..., x[N-2]]
+            // then compute channelData[i] = channelData[i] - a * prev[i].
+            // We use vDSP_vsmsa (multiply by scalar then add) with negated alpha
+            // to fuse the multiply-subtract: y = (-a)*prev + x.
+            preEmphScratch.withUnsafeMutableBufferPointer { scratch in
+                guard let base = scratch.baseAddress else { return }
+                base[0] = self.preEmphPrev
+                if frameCount > 1 {
+                    // copy x[0..N-2] → scratch[1..N-1]
+                    memcpy(base + 1, channelData, (frameCount - 1) * MemoryLayout<Float>.size)
+                }
+                var negA = -a
+                // y = (-a)*prev + x, written back into channelData
+                vDSP_vsma(base, 1, &negA, channelData, 1, channelData, 1, vDSP_Length(frameCount))
             }
-            self.preEmphPrev = prev
+            self.preEmphPrev = lastIn
         }
 
         // ---- Stage 2b: Quiet-regime consonant lift (mumble robustness) ----
@@ -1094,16 +1212,21 @@ class AudioCaptureService {
         // on normal+loud speech (no benefit, and we'd over-spike sibilants).
         // Uses smoothedRMS so the decision is stable across buffer seams,
         // not flickering on per-buffer transients.
-        if tuning.preEmphasisAlpha > 0 && self.smoothedRMS > silenceFloorRMS && self.smoothedRMS < 0.05 {
+        if tuning.preEmphasisAlpha > 0 && self.smoothedRMS > silenceFloorRMS && self.smoothedRMS < 0.05 && frameCount > 0 {
             let a2: Float = 0.55  // lighter than the 0.97 main pass — adds a
                                   // second high-shelf without over-rolling lows
-            var prev = self.preEmphPrev2
-            for i in 0..<frameCount {
-                let x = channelData[i]
-                channelData[i] = x - a2 * prev
-                prev = x
+            // Vectorized FIR pass — see Stage 2 above for the rationale.
+            let lastIn = channelData[frameCount - 1]
+            preEmphScratch2.withUnsafeMutableBufferPointer { scratch in
+                guard let base = scratch.baseAddress else { return }
+                base[0] = self.preEmphPrev2
+                if frameCount > 1 {
+                    memcpy(base + 1, channelData, (frameCount - 1) * MemoryLayout<Float>.size)
+                }
+                var negA2 = -a2
+                vDSP_vsma(base, 1, &negA2, channelData, 1, channelData, 1, vDSP_Length(frameCount))
             }
-            self.preEmphPrev2 = prev
+            self.preEmphPrev2 = lastIn
         } else {
             // Decay the second-stage memory toward zero so re-entering the
             // quiet regime starts from a clean state instead of a stale prev.
@@ -1210,12 +1333,59 @@ class AudioCaptureService {
         return outputBuffer
     }
 
+    /// Reusable scratch buffer for the vDSP pre-emphasis pass. Sized lazily
+    /// to the largest frameCount we've seen so subsequent buffers reuse the
+    /// allocation. Owned by the audio I/O thread (the only one that touches
+    /// applyDSPChain).
+    private var preEmphScratch: [Float] = []
+    /// Same idea for the second-pass quiet-regime pre-emphasis (stage 2b).
+    private var preEmphScratch2: [Float] = []
+
+    /// HPF biquad scratch buffers — vDSP_deq22 requires (N+2) sized I/O so it
+    /// can read 2 samples of history. Slots [0]/[1] hold prior input/output,
+    /// [2..N+1] hold current data. Reused across calls.
+    private var hpfInScratch: [Float] = []
+    private var hpfOutScratch: [Float] = []
+
+    /// Ensure both pre-emphasis scratch buffers can hold `frameCount` floats.
+    /// Called once per buffer before the vectorized stages run.
+    @inline(__always)
+    private func ensurePreEmphScratch(_ frameCount: Int) {
+        if preEmphScratch.count < frameCount {
+            preEmphScratch = [Float](repeating: 0, count: frameCount)
+        }
+        if preEmphScratch2.count < frameCount {
+            preEmphScratch2 = [Float](repeating: 0, count: frameCount)
+        }
+    }
+
+    /// Ensure HPF biquad scratch I/O buffers can hold `frameCount + 2` floats.
+    /// `+2` for the 2-sample history slots vDSP_deq22 reads from.
+    @inline(__always)
+    private func ensureHPFScratch(_ frameCount: Int) {
+        let needed = frameCount + 2
+        if hpfInScratch.count < needed {
+            hpfInScratch = [Float](repeating: 0, count: needed)
+        }
+        if hpfOutScratch.count < needed {
+            hpfOutScratch = [Float](repeating: 0, count: needed)
+        }
+    }
+
     /// I/O-thread-private prior bin values used as the smoothing basis. Owning this
     /// array on the I/O thread (rather than reading the @Observable audioLevels
     /// across threads) eliminates a torn-read data race that produced waveform
     /// glitches and the occasional crash on stop. Only mutated inside
     /// computeVisualizerLevels and reset by resetVisualizerSmoothing on stop.
     private var visualizerPriorBins: [Float] = []
+    /// Pre-computed deterministic per-bin variation multipliers (0.65…1.35).
+    /// Built once on first use; reused across all `computeVisualizerLevels`
+    /// calls. Eliminates a per-buffer `sinf(phase)` loop and a per-buffer
+    /// `[Float](repeating:count:)` allocation for `rawLevels`.
+    private var visualizerVariation: [Float] = []
+    /// Scratch buffer for the EMA-smoothed result returned to the UI. Same
+    /// length as fftBinCount; reused across calls.
+    private var visualizerResultScratch: [Float] = []
 
     /// Reset the I/O-thread smoothing buffer. Call from the same thread that
     /// owns the audio tap (I/O) or before installing the tap.
@@ -1275,30 +1445,35 @@ class AudioCaptureService {
             scaled = min(1.0, scaled + (pulse + pulseAmplitude))
         }
 
-        // Per-bin variation: seeded multipliers so each bar has a slightly
-        // different height. Multipliers are derived from a fixed integer seed
-        // so they're deterministic across calls (no random flicker at silence).
-        // Range: 0.65 … 1.35 (±35% around the base level).
-        // The 7-bar WaveformView averages groups of bins; ±35% bin variation
-        // produces ±15-20% bar-height spread — enough to look organic without
-        // looking chaotic.
-        var rawLevels = [Float](repeating: 0, count: fftBinCount)
-        for i in 0..<fftBinCount {
-            // Cheap deterministic pseudo-variation: mix of sin/cos at different
-            // frequencies per bin index. Stays in [0.65, 1.35].
-            let phase = Float(i) * 1.618034  // golden ratio spacing
-            let variation = 1.0 + 0.35 * sinf(phase)
-            rawLevels[i] = min(1.0, scaled * variation)
+        // Per-bin variation: cached on first use. Multipliers are deterministic
+        // (sinf of golden-ratio-spaced phases) so we compute them exactly once
+        // per process and reuse the array for every buffer. Previously this
+        // ran fftBinCount sinf() calls + a 32-float allocation EVERY audio
+        // buffer (~4-12 Hz). Now: zero per-buffer work for the variation.
+        if visualizerVariation.count != fftBinCount {
+            var v = [Float](repeating: 0, count: fftBinCount)
+            for i in 0..<fftBinCount {
+                let phase = Float(i) * 1.618034
+                v[i] = 1.0 + 0.35 * sinf(phase)
+            }
+            visualizerVariation = v
+        }
+        if visualizerResultScratch.count != fftBinCount {
+            visualizerResultScratch = [Float](repeating: 0, count: fftBinCount)
         }
 
         // EMA smoothing: 0.3 = ~3-frame attack at 30Hz → fast but not jumpy.
+        // Fused into the variation pass so we only walk the bins once and
+        // never allocate per call:
+        //   result[i] = prior[i]*smoothing + (scaled * variation[i])*(1-smoothing)
         let smoothing: Float = 0.3
-        var result = visualizerPriorBins
+        let oneMinusSmoothing: Float = 1.0 - smoothing
         for i in 0..<fftBinCount {
-            result[i] = visualizerPriorBins[i] * smoothing + rawLevels[i] * (1.0 - smoothing)
+            let raw = min(1.0, scaled * visualizerVariation[i])
+            visualizerResultScratch[i] = visualizerPriorBins[i] * smoothing + raw * oneMinusSmoothing
+            visualizerPriorBins[i] = visualizerResultScratch[i]
         }
-        visualizerPriorBins = result
-        return result
+        return visualizerResultScratch
     }
 }
 

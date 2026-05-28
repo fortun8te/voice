@@ -192,34 +192,129 @@ final class LLMPolisher {
         return stripped
     }
 
+    /// Aggressiveness of `stripFillers`. The cloud path should pass `.minimal`
+    /// — the cloud model is plenty smart enough to handle natural disfluencies,
+    /// and aggressively pre-stripping fillers like "i mean" / "actually" /
+    /// "like" / "you know" destroys real signal:
+    ///   - "i mean"  is a restart cue, not just a filler
+    ///   - "actually" can mark a restart or a contrast
+    ///   - "like"    is often a real preposition
+    ///   - "you know" is often a transition / discourse function
+    ///
+    /// Local-only callers (Apple FM, Qwen3 1.7B / 4B) should keep `.aggressive`
+    /// — small models can't reliably distinguish filler from cue, so trimming
+    /// helps their output quality and shortens the prompt.
+    public enum FillerStripMode {
+        /// Strip everything in the legacy set: stutters, all standalone verbal
+        /// fillers (um/uh/uhm/er/ah/hmm/mhm), and sentence-boundary discourse
+        /// fillers ("you know", "i mean", "sort of", "kind of"). Use for the
+        /// LOCAL polish path.
+        case aggressive
+        /// Strip ONLY pure verbal fillers (um, uh, uhm) that the cloud model
+        /// gains nothing from seeing. Leave stutters, "like", "i mean",
+        /// "actually", "you know" alone — they may carry real signal the
+        /// model can use. Use for the CLOUD polish path.
+        case minimal
+        /// Pass the text through untouched. Used by the raw cloud path —
+        /// the cloud model sees fillers, restarts, and disfluencies and
+        /// decides what to do with them. Even pre-stripping "um" can change
+        /// how the model reads the surrounding cadence.
+        case skip
+    }
+
+    /// Default mode honours the `voice.heavyPreprocessing` @AppStorage flag.
+    /// When the user has explicitly enabled heavy preprocessing, every caller
+    /// that doesn't pass an explicit mode gets `.aggressive`. When unset (the
+    /// safe new default) we still return `.aggressive` here because callers
+    /// who haven't been updated to pass a mode are presumed to be on the
+    /// local path. Cloud-path callers MUST pass `.minimal` explicitly.
+    nonisolated private static var defaultFillerStripMode: FillerStripMode { .aggressive }
+
     /// Rule-based filler removal. Runs before the model to shorten input
     /// (cheaper LLM call) and to handle filler stripping even when we skip the model.
-    nonisolated static func stripFillers(_ text: String) -> String {
+    ///
+    /// `mode` controls aggressiveness. Cloud callers should pass `.minimal`
+    /// — the cloud model handles natural disfluencies natively and benefits
+    /// from seeing restart cues like "i mean" / "actually".
+    nonisolated static func stripFillers(_ text: String, mode: FillerStripMode = .aggressive) -> String {
+        // .skip: hand the raw text to the caller, untouched. The cloud path
+        // uses this so the model sees the original disfluencies and can
+        // reason about them, instead of receiving a pre-processed signal-free
+        // version. Whitespace trim is still safe (model output is identical
+        // either way).
+        if mode == .skip {
+            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         var result = text
 
         // 1. Repeated word stutters: "I I want" → "I want", "the the cat" → "the cat"
-        result = result.replacingOccurrences(
-            of: #"\b(\w+)\s+\1\b"#,
-            with: "$1",
-            options: [.regularExpression, .caseInsensitive]
-        )
+        //    Only in aggressive mode — the cloud model handles stutters fine and
+        //    seeing them gives it stronger signal that a restart happened.
+        if mode == .aggressive {
+            result = result.replacingOccurrences(
+                of: #"\b(\w+)\s+\1\b"#,
+                with: "$1",
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
 
-        // 2. Standalone fillers anywhere: um, uh, uhm, er, ah, hmm, mhm
-        let standaloneFillers = #"\b(um+|uh+|uhm+|er+|ah+|hmm+|mhm+)\b[,.\s]*"#
-        result = result.replacingOccurrences(
-            of: standaloneFillers,
-            with: "",
-            options: [.regularExpression, .caseInsensitive]
-        )
+        // 2. Standalone fillers anywhere: um, uh, uhm, er, ah, hmm, mhm.
+        //    Slang allowlist: "yeah", "yo", "nah" are kept by the casual
+        //    personality and must NOT be stripped. Since none of those tokens
+        //    are in the filler alternation, the allowlist is enforced
+        //    structurally — we only need to make sure the regex never matches
+        //    a hyphenated compound like "uh-huh" or "ah-ha". A negative
+        //    lookahead on `-` (and word-chars, to avoid eating into a longer
+        //    token) keeps those compounds intact.
+        //
+        //    In `.minimal` mode we restrict to the pure verbal-filler core
+        //    (um / uh / uhm) — those carry zero meaning. We drop er/ah/hmm/mhm
+        //    too, since they're never load-bearing; the trimming is to the
+        //    sentence-boundary class below.
+        let slangAllowlist: Set<String> = ["yeah", "yo", "nah"]
+        let fillerAlternation = mode == .aggressive
+            ? #"um+|uh+|uhm+|er+|ah+|hmm+|mhm+"#
+            : #"um+|uh+|uhm+"#
+        let standaloneFillers = #"\b("# + fillerAlternation + #")(?![-\w])[,.\s]*"#
+        if let rx = try? NSRegularExpression(pattern: standaloneFillers, options: [.caseInsensitive]) {
+            let ns = result as NSString
+            let matches = rx.matches(in: result, options: [], range: NSRange(location: 0, length: ns.length))
+            if !matches.isEmpty {
+                var out = ""
+                var cursor = 0
+                for m in matches {
+                    let r = m.range
+                    let matched = ns.substring(with: m.range(at: 1)).lowercased()
+                    if r.location > cursor {
+                        out += ns.substring(with: NSRange(location: cursor, length: r.location - cursor))
+                    }
+                    if slangAllowlist.contains(matched) {
+                        out += ns.substring(with: r)
+                    }
+                    cursor = r.location + r.length
+                }
+                if cursor < ns.length {
+                    out += ns.substring(with: NSRange(location: cursor, length: ns.length - cursor))
+                }
+                result = out
+            }
+        }
 
         // 3. Sentence-boundary fillers: "you know", "i mean", "sort of", "kind of"
         //    Only strip when at start of sentence or after comma — preserves "I mean it"
-        let boundaryFillers = #"(^|[.!?,]\s*)(you know|i mean|sort of|kind of)[,]?\s*"#
-        result = result.replacingOccurrences(
-            of: boundaryFillers,
-            with: "$1",
-            options: [.regularExpression, .caseInsensitive]
-        )
+        //
+        //    Skipped entirely in `.minimal` mode — "i mean" is a real restart
+        //    cue, "sort of" and "kind of" carry hedging meaning, and "you know"
+        //    can mark a discourse transition. The cloud model decides what to
+        //    do with them.
+        if mode == .aggressive {
+            let boundaryFillers = #"(^|[.!?,]\s*)(you know|i mean|sort of|kind of)[,]?\s*"#
+            result = result.replacingOccurrences(
+                of: boundaryFillers,
+                with: "$1",
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
 
         // 4. Collapse runs of 2+ horizontal spaces (NOT newlines) from removals.
         //    Preserving \n and \n\n is critical — TextFormatter inserts them for

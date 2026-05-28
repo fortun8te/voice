@@ -14,7 +14,7 @@ let package = Package(
     platforms: [
         // TWEAK: Minimum macOS version. v14 needed for Core Audio Process Tap.
         // Drop to v13 if you only need mic capture (no system audio).
-        .macOS(.v14)
+        .macOS(.v26)
     ],
     products: [
         .executable(name: "Voice", targets: ["Voice"])

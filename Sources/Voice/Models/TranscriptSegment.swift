@@ -8,6 +8,10 @@
 //   v2 — TranscriptSegment adds: speakerId, isFinal
 //   v3 — Meeting adds: kind, markdownExportPath, tagsJson, pinnedNote
 //        (audioFilePath was already present from v1)
+//   v4 — Meeting adds: sourceApp
+//   v5 — Meeting adds: participantNames (scraped from Meet/Zoom/Teams DOM
+//        via the Chrome extension) and speakerEventsJson (raw active-speaker
+//        timeline from MeetBridgeServer, JSON-encoded)
 //
 // All new fields have safe defaults so older rows decode without error.
 // ============================================================
@@ -103,6 +107,9 @@ struct Meeting: Identifiable, Codable, Sendable {
     var markdownExportPath: String?    // v3: filesystem path of last markdown export, if any
     var tags: [String]                 // v3: free-form tags; persisted as JSON
     var pinnedNote: String?            // v3: a single user-pinned note shown above transcript
+    var sourceApp: String?             // v4: Bundle ID that triggered capture (e.g. "com.hnc.Discord", "com.apple.FaceTime")
+    var participantNames: [String]     // v5: scraped from Meet/Zoom/Teams DOM via Chrome ext
+    var speakerEventsJson: String?     // v5: JSON-encoded array of {name, t, active} from MeetBridgeServer
 
     init(
         id: UUID = UUID(),
@@ -115,7 +122,10 @@ struct Meeting: Identifiable, Codable, Sendable {
         kind: MeetingKind = .meeting,
         markdownExportPath: String? = nil,
         tags: [String] = [],
-        pinnedNote: String? = nil
+        pinnedNote: String? = nil,
+        sourceApp: String? = nil,
+        participantNames: [String] = [],
+        speakerEventsJson: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -128,6 +138,9 @@ struct Meeting: Identifiable, Codable, Sendable {
         self.markdownExportPath = markdownExportPath
         self.tags = tags
         self.pinnedNote = pinnedNote
+        self.sourceApp = sourceApp
+        self.participantNames = participantNames
+        self.speakerEventsJson = speakerEventsJson
     }
 
     var speakerCount: Int {
@@ -153,7 +166,8 @@ struct Meeting: Identifiable, Codable, Sendable {
     // Custom decoder so older rows without v3 fields decode successfully.
     enum CodingKeys: String, CodingKey {
         case id, title, date, duration, segments, summary, audioFilePath
-        case kind, markdownExportPath, tags, pinnedNote
+        case kind, markdownExportPath, tags, pinnedNote, sourceApp
+        case participantNames, speakerEventsJson
     }
 
     init(from decoder: Decoder) throws {
@@ -169,6 +183,9 @@ struct Meeting: Identifiable, Codable, Sendable {
         self.markdownExportPath = try c.decodeIfPresent(String.self, forKey: .markdownExportPath)
         self.tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
         self.pinnedNote = try c.decodeIfPresent(String.self, forKey: .pinnedNote)
+        self.sourceApp = try c.decodeIfPresent(String.self, forKey: .sourceApp)
+        self.participantNames = try c.decodeIfPresent([String].self, forKey: .participantNames) ?? []
+        self.speakerEventsJson = try c.decodeIfPresent(String.self, forKey: .speakerEventsJson)
     }
 }
 

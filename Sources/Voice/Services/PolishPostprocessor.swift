@@ -27,6 +27,54 @@ import Foundation
 
 public enum PolishPostprocessor {
 
+    /// How aggressively the deterministic list passes are allowed to fire.
+    /// Maps directly onto the dictation cleanup level so prose is only
+    /// reorganized into lists when the user's chosen level actually wants it.
+    ///
+    ///   - `.none`        : never produce a list. Verbatim-ish output.
+    ///   - `.explicitOnly`: only restructure enumeration the speaker made
+    ///                      UNMISTAKABLY explicit ("number one … number two …",
+    ///                      "first, … second, …", inline "1. 2. 3."). A rambling
+    ///                      monologue stays as prose.
+    ///   - `.clear`       : the above PLUS reasonably-clear colon enumerations
+    ///                      ("a few things: X, Y, Z, and W" with 4+ short items).
+    ///                      Still does NOT force a list out of an ambiguous rant.
+    ///   - `.aggressive`  : the above PLUS implicit/non-explicit enumeration in a
+    ///                      rambling monologue (cue-phrase comma runs). This is
+    ///                      the only mode that turns a rant into a clean list.
+    public enum ListFormattingMode: Sendable {
+        case none
+        case explicitOnly
+        case clear
+        case aggressive
+
+        /// Map a dictation cleanup level string onto a list mode.
+        ///   none   → .none          (never list)
+        ///   light  → .explicitOnly  (only unmistakable enumeration)
+        ///   medium → .clear         (clear enumeration, incl. colon lists)
+        ///   high   → .aggressive    (detect implied enumeration in rants)
+        public init(cleanupLevel: String?) {
+            switch cleanupLevel?.lowercased() {
+            case "none":   self = .none
+            case "light":  self = .explicitOnly
+            case "high":   self = .aggressive
+            default:       self = .clear   // "medium" / nil / unrecognized
+            }
+        }
+
+        /// Explicit numbered enumeration ("number one…", "first/second/third",
+        /// inline "1. 2. 3."). Allowed everywhere except `.none`.
+        var allowsExplicitNumbered: Bool { self != .none }
+
+        /// Colon enumeration ("intro: a, b, c, d" with 4+ short items). Clear
+        /// but not labeled by the speaker — allowed at `.clear` and above.
+        var allowsColonList: Bool { self == .clear || self == .aggressive }
+
+        /// Implicit cue-phrase enumeration (a comma run after "I need", "things
+        /// to get", etc.). Can be ambiguous, so only `.aggressive` runs it.
+        var allowsImplicitList: Bool { self == .aggressive }
+    }
+
     public struct Options: Sendable {
         public var sentenceStartCaps: Bool
         public var midClauseCapsReducer: Bool
@@ -43,9 +91,28 @@ public enum PolishPostprocessor {
         public var timeFormat: Bool
         public var quarterAbbreviation: Bool
         public var spokenUrlReconstruction: Bool
+        /// Convert spoken punctuation/line commands ("period", "comma",
+        /// "question mark", "new line", "new paragraph", "slash", …) into the
+        /// real symbol/break. This is the DETERMINISTIC safety net that makes
+        /// dictated commands work even when the LLM is unavailable, rejected,
+        /// or skipped (e.g. the triple-ASR merge path). Mirrors TextFormatter's
+        /// voice-command table so the behavior is identical whether or not the
+        /// model ran.
+        public var spokenPunctuation: Bool
+        /// Normalize spacing AROUND punctuation: no space before `.,;:!?`, one
+        /// space after sentence punctuation, collapse double spaces, fix
+        /// missing space after a comma/period. Runs last so it cleans up any
+        /// spacing introduced by earlier passes or by unfreezing entities.
+        public var punctuationSpacing: Bool
         /// Extra proper nouns from user vocabulary that should never be
         /// lower-cased by the mid-clause caps pass.
         public var userProperNouns: Set<String>
+        /// How aggressively the list passes (numbered / colon / implicit) may
+        /// fire. Gated by the dictation cleanup level so lighter levels never
+        /// impose list structure on prose. Defaults to `.aggressive` to keep
+        /// the historical behavior for any caller that doesn't set it; the
+        /// polisher passes the correct mode per cleanup level.
+        public var listMode: ListFormattingMode
 
         public init(
             sentenceStartCaps: Bool = true,
@@ -63,7 +130,10 @@ public enum PolishPostprocessor {
             timeFormat: Bool = true,
             quarterAbbreviation: Bool = true,
             spokenUrlReconstruction: Bool = true,
-            userProperNouns: Set<String> = []
+            spokenPunctuation: Bool = true,
+            punctuationSpacing: Bool = true,
+            userProperNouns: Set<String> = [],
+            listMode: ListFormattingMode = .aggressive
         ) {
             self.sentenceStartCaps = sentenceStartCaps
             self.midClauseCapsReducer = midClauseCapsReducer
@@ -80,7 +150,10 @@ public enum PolishPostprocessor {
             self.timeFormat = timeFormat
             self.quarterAbbreviation = quarterAbbreviation
             self.spokenUrlReconstruction = spokenUrlReconstruction
+            self.spokenPunctuation = spokenPunctuation
+            self.punctuationSpacing = punctuationSpacing
             self.userProperNouns = userProperNouns
+            self.listMode = listMode
         }
 
         public static let `default` = Options()
@@ -99,7 +172,10 @@ public enum PolishPostprocessor {
             unitAbbreviation: false,
             timeFormat: false,
             quarterAbbreviation: false,
-            spokenUrlReconstruction: false
+            spokenUrlReconstruction: false,
+            spokenPunctuation: false,
+            punctuationSpacing: false,
+            listMode: .none
         )
     }
 
@@ -114,9 +190,69 @@ public enum PolishPostprocessor {
         public var after: String
     }
 
+    /// Validate a polish via the new relaxed-cloud `Sanitizer`, then run the
+    /// deterministic post-pass. Returns the polished output on accept, or the
+    /// `originalForFallback` (typically the frozen raw input) when the
+    /// sanitizer rejects.
+    ///
+    /// This is the hook the cloud (Cerebras / Groq) branch in Qwen3Polisher
+    /// should call instead of skipping straight to `process(_:options:)`.
+    /// `Sanitizer.run` honors `UserDefaults.standard.bool(forKey:
+    /// "voice.disableSanitizer")` for the emergency override.
+    ///
+    /// - Parameters:
+    ///   - polish: The model output to validate + format.
+    ///   - originalForFallback: The pre-polish frozen text. Returned (after
+    ///     a post-pass) when sanitizer rejects, so the caller's downstream
+    ///     unfreeze + paste path is unchanged.
+    ///   - mode: `.relaxed` for cloud, `.strict` for the local 1.7B path.
+    ///   - cleanupLevel: forwarded to sanitizer + post-pass list gating.
+    ///   - userVocabulary: forwarded for proper-noun safelist + sanitizer.
+    public static func validateAndProcess(
+        polish: String,
+        originalForFallback: String,
+        mode: Sanitizer.Mode,
+        cleanupLevel: String? = "medium",
+        userVocabulary: [String]? = nil
+    ) -> Result {
+        let userNouns: Set<String> = Set((userVocabulary ?? []).map { $0.lowercased() })
+        let options = Options(
+            userProperNouns: userNouns,
+            listMode: ListFormattingMode(cleanupLevel: cleanupLevel)
+        )
+        let accepted = Sanitizer.run(
+            polish: polish,
+            original: originalForFallback,
+            mode: mode,
+            cleanupLevel: cleanupLevel,
+            userVocabulary: userVocabulary
+        )
+        let textToProcess = accepted ?? originalForFallback
+        if accepted == nil {
+            print("[VOICE-SANITIZE] FALLBACK → using raw frozen input (mode=\(mode))")
+        } else {
+            print("[VOICE-SANITIZE] accepted polish (mode=\(mode), \(originalForFallback.count)→\(textToProcess.count) chars)")
+        }
+        return process(textToProcess, options: options)
+    }
+
     public static func process(_ text: String, options: Options = .default) -> Result {
         var current = text
         var changes: [Change] = []
+
+        // Pass 0: Spoken punctuation / line commands. Runs FIRST so the real
+        // symbols and \n / \n\n breaks it produces are visible to every
+        // downstream pass (sentence-start caps, lists, spacing). This is the
+        // deterministic safety net: dictated commands like "period", "comma",
+        // "question mark", "new line", "new paragraph", and "slash" convert
+        // here REGARDLESS of whether the LLM ran. The LLM (when it runs) has
+        // usually already done this via TextFormatter pre-pass + the system
+        // prompt; this pass is idempotent on already-converted text.
+        if options.spokenPunctuation {
+            let r = spokenPunctuationPass(current)
+            recordIfChanged(current, r, rule: "spoken-punctuation", into: &changes)
+            current = r
+        }
 
         if options.compoundWords {
             let r = compoundWordPass(current)
@@ -203,18 +339,28 @@ public enum PolishPostprocessor {
         //   "number one X number two Y number three Z"
         //   "first X second Y third Z"
         //   "1. X 2. Y 3. Z" (model already emitted ordinals but inline)
-        let nl = Self.numberedListPass(current)
-        recordIfChanged(current, nl, rule: "numbered-list", into: &changes)
-        current = nl
+        // This is the UNMISTAKABLY-EXPLICIT case (the speaker literally
+        // enumerated), so it runs at every level except `.none`. Lighter
+        // levels still honor an explicit "first… second… third…" but never
+        // invent structure the speaker didn't signal.
+        if options.listMode.allowsExplicitNumbered {
+            let nl = Self.numberedListPass(current)
+            recordIfChanged(current, nl, rule: "numbered-list", into: &changes)
+            current = nl
+        }
 
-        // Em-dash strip — Qwen 3 235B keeps emitting em-dashes despite the
-        // prompt rule. Hard-strip post-LLM: every `—` / `–` / `―` becomes
-        // a comma (or period if the following clause starts strong).
-        // This pass replaces TextFormatter's pre-LLM strip for the cloud
-        // path (where the LLM may insert dashes after that pre-pass ran).
+        // Em-dash strip — Qwen 3 keeps emitting em-dashes despite the prompt
+        // rule. Hard-strip post-LLM: every `\u{2014}` / `\u{2013}` / `\u{2015}`
+        // becomes `. ` + capitalized next word. Belt-and-suspenders so the user
+        // never sees a dash even when the prompt fails.
         let de = Self.stripDashesPass(current)
         recordIfChanged(current, de, rule: "strip-dashes", into: &changes)
         current = de
+
+        // (Emoji strip moved to the ABSOLUTE FINAL PASS at the end of
+        // process() so every other normalization has happened first and we
+        // catch any emoji that any other pass might have accidentally
+        // preserved or introduced. See `stripEmojis` below.)
 
         // European-style decimals → US format inside currency amounts:
         // €2.300 → €2,300 (only when 3 digits follow, i.e. thousands separator
@@ -223,19 +369,57 @@ public enum PolishPostprocessor {
         recordIfChanged(current, euro, rule: "european-decimal", into: &changes)
         current = euro
 
+        // European-style decimal-magnitude mis-renderings: "4.5.000.000" →
+        // "4.5 million". The model sometimes treats "four point five million"
+        // as a single number with European thousand separators. Catastrophic
+        // readability failure. Catch and fix.
+        let enm = Self.normalizeEuropeanNumberMistakes(current)
+        recordIfChanged(current, enm, rule: "european-number-mistakes", into: &changes)
+        current = enm
+
+        // "at <number>" is NEVER the @ symbol. Some models mis-render clock
+        // times "at 3:00" or "at 6" as "@3:00" / "@6". Undo it.
+        let atTime = Self.normalizeAtTime(current)
+        recordIfChanged(current, atTime, rule: "at-time", into: &changes)
+        current = atTime
+
         // Colon-list detection — "X: a, b, c, d" with 4+ short items becomes
         // a bullet list. Catches the "pull up some numbers: 5am, €2,300, ..."
-        // pattern that the implicit-list pass misses (no cue verb).
-        let cl = Self.colonListPass(current)
-        recordIfChanged(current, cl, rule: "colon-list", into: &changes)
-        current = cl
+        // pattern that the implicit-list pass misses (no cue verb). Reasonably
+        // clear enumeration, so it runs at `.clear` (medium) and `.aggressive`
+        // (high) — NOT at light/none.
+        if options.listMode.allowsColonList {
+            let cl = Self.colonListPass(current)
+            recordIfChanged(current, cl, rule: "colon-list", into: &changes)
+            current = cl
+        }
 
         // Implicit list detection — "I have to get X, Y, Z, and W" with
         // 3+ short items becomes a bullet list. Runs near the end so
-        // earlier passes have already normalized punctuation.
-        let lr = Self.implicitListPass(current)
-        recordIfChanged(current, lr, rule: "implicit-list", into: &changes)
-        current = lr
+        // earlier passes have already normalized punctuation. This is the
+        // ambiguous / non-explicit detector that turns a rambling enumeration
+        // into a list, so it ONLY runs at `.aggressive` (high). Below high we
+        // never force a list out of prose.
+        if options.listMode.allowsImplicitList {
+            let lr = Self.implicitListPass(current)
+            recordIfChanged(current, lr, rule: "implicit-list", into: &changes)
+            current = lr
+        }
+
+        // Oxford comma — runs after the list-restructuring passes so any
+        // inline tails of bulleted lists ("X, Y, Z and W" → "X, Y, Z, and W")
+        // and pure inline lists in prose get the serial comma. Always on:
+        // the regex requires a leading ", " so it can't trip on bare "A and B".
+        let ox = Self.ensureOxfordComma(current)
+        recordIfChanged(current, ox, rule: "oxford-comma", into: &changes)
+        current = ox
+
+        // Capitalize first letter of each bullet/numbered item. Runs
+        // unconditionally — only mutates lines that already look like list
+        // items, so prose is never touched.
+        let cli = Self.capitalizeListItems(current)
+        recordIfChanged(current, cli, rule: "list-item-caps", into: &changes)
+        current = cli
 
         // Common homophones and grammar fixes that ASR mishears constantly.
         let hp = Self.homophonePass(current)
@@ -258,6 +442,16 @@ public enum PolishPostprocessor {
         let dd = Self.deduplicateCurrencySymbols(current)
         recordIfChanged(current, dd, rule: "dedup-currency", into: &changes)
         current = dd
+
+        // Email salutation normalizer — if the output starts with "Hi <Name>,"
+        // or any salutation form but the comma is followed by a space instead
+        // of a paragraph break, inject `\n\n`. Belt-and-suspenders for the
+        // cloud prompt: model is told to put the salutation on its own line,
+        // but it occasionally produces an inline form. Runs before
+        // force-paragraph-breaks so the newline counter sees it.
+        let es = Self.normalizeEmailSalutation(current)
+        recordIfChanged(current, es, rule: "email-salutation", into: &changes)
+        current = es
 
         // Force paragraph breaks on long outputs. If the result is >80 words
         // and contains fewer than 2 newlines, insert breaks at the strongest
@@ -327,6 +521,45 @@ public enum PolishPostprocessor {
             recordIfChanged(current, r, rule: "whitespace", into: &changes)
             current = r
         }
+
+        // Code-fencing pass: wrap dictated identifiers ("the variable foo bar")
+        // in backticks and snake_case them ("the variable `foo_bar`"). Runs
+        // after whitespace normalization but before punctuation spacing so the
+        // final spacing pass cleans up any artifacts.
+        let cf = Self.applyCodeFencing(current)
+        recordIfChanged(current, cf, rule: "code-fencing", into: &changes)
+        current = cf
+
+        // Backtick-discipline safety net: if the cloud model ever wraps a
+        // multi-word phrase in single-backticks (e.g. `username should be`),
+        // strip the backticks rather than ship a broken polish. Real code
+        // identifiers don't contain spaces. Triple-backtick code blocks are
+        // preserved (legitimate for multi-line code dictation).
+        let bd = Self.enforceBacktickDiscipline(current)
+        recordIfChanged(current, bd, rule: "backtick-discipline", into: &changes)
+        current = bd
+
+        // Punctuation spacing pass. Repairs any spacing artifacts left by
+        // entity-unfreezing or earlier passes: space-before-punctuation,
+        // missing-space-after-punctuation, and stray double spaces.
+        if options.punctuationSpacing {
+            let r = punctuationSpacingPass(current)
+            recordIfChanged(current, r, rule: "punctuation-spacing", into: &changes)
+            current = r
+        }
+
+        // ABSOLUTE FINAL PASS: hard-line emoji strip. Polish output is forbidden
+        // to contain emojis (prompt + sanitizer enforce this), but the cloud
+        // model still leaks them through on conversational dictations — the
+        // "Excited" personality and emoji-evoking phrases ("thumbs up",
+        // "smiley") are the most common culprits. This pass is the LAST line
+        // of defense: after every normalization, including punctuation spacing,
+        // strip any surviving emoji codepoint. Runs unconditionally so a
+        // caller's Options toggles can never accidentally leave the door open.
+        // Tidies up any spacing the strip introduces (e.g. " ." → ".").
+        let finalStrip = Self.stripEmojis(current)
+        recordIfChanged(current, finalStrip, rule: "final-strip-emojis", into: &changes)
+        current = finalStrip
 
         return Result(cleaned: current, changes: changes)
     }
@@ -595,6 +828,403 @@ public enum PolishPostprocessor {
             let r = NSRange(location: 0, length: (s as NSString).length)
             s = rx.stringByReplacingMatches(in: s, options: [], range: r, withTemplate: "\n\n")
         }
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Code fencing for dictated identifiers
+    //
+    // Wraps an identifier dictated after a code keyword ("variable", "function",
+    // "method", "field", "column", "prop", "property", "key", "parameter",
+    // "argument", "class") in backticks and snake_cases it. Preserves the
+    // keyword and any "the "/"a " prefix.
+    //   "the variable foo bar" → "the variable `foo_bar`"
+    //   "function get user id" → "function `get_user_id`"
+
+    static func applyCodeFencing(_ text: String) -> String {
+        let pattern = #"\b(the |a )?(variable|function|method|field|column|prop|property|key|parameter|argument|class) ([a-z]+( [a-z]+){0,2})\b"#
+        guard let rx = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return text
+        }
+        let ns = text as NSString
+        let matches = rx.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return text }
+
+        var out = ""
+        out.reserveCapacity(text.count)
+        var cursor = 0
+        for m in matches {
+            let r = m.range
+            if r.location > cursor {
+                out += ns.substring(with: NSRange(location: cursor, length: r.location - cursor))
+            }
+            let prefix: String = {
+                let pr = m.range(at: 1)
+                return pr.location == NSNotFound ? "" : ns.substring(with: pr)
+            }()
+            let keyword = ns.substring(with: m.range(at: 2))
+            let identifierRaw = ns.substring(with: m.range(at: 3))
+            // Snake-case: lowercase + spaces → underscores. Identifier capture
+            // is already lowercase-only, but lowercase defensively.
+            let snake = identifierRaw.lowercased().replacingOccurrences(of: " ", with: "_")
+            out += "\(prefix)\(keyword) `\(snake)`"
+            cursor = r.location + r.length
+        }
+        if cursor < ns.length {
+            out += ns.substring(with: NSRange(location: cursor, length: ns.length - cursor))
+        }
+        return out
+    }
+
+    // MARK: - Backtick discipline (safety net)
+    //
+    // Detects suspicious multi-word backtick spans and breaks them.
+    // A legitimate code-identifier token contains no spaces and uses
+    // alphanumerics, underscore, dot, slash, hyphen, or colon.
+    // Multi-word phrases inside backticks (e.g., `username should be`)
+    // almost certainly indicate the model over-applied code formatting
+    // (the canonical failure: "the variable userName should be camelCase
+    // not snakeCase" → "`username_should_be` camelCase, not snakeCase").
+    //
+    // Triple-backtick code blocks are preserved — those are legit for
+    // multi-line code dictation.
+
+    /// Detects suspicious multi-word backtick spans and breaks them.
+    /// A legitimate code-identifier token contains no spaces and uses
+    /// alphanumerics, underscore, dot, slash, hyphen, or colon.
+    /// Multi-word phrases inside backticks (e.g., `username should be`)
+    /// almost certainly indicate the model over-applied code formatting.
+    public static func enforceBacktickDiscipline(_ text: String) -> String {
+        // Catch single-backtick spans containing spaces. Strip ONLY when the
+        // content looks like English prose (lowercase words + stopwords).
+        // KEEP backticks when the content shows code/shell/SQL signatures:
+        //   - any of `:` `=` `/` `&` `--` (shell/SQL/path)
+        //   - any ALL_CAPS token of len ≥2 (SQL keywords, env vars)
+        //   - first token is a known shell/CLI command name
+        //   - tokens contain `_` (snake_case identifiers in a phrase)
+        // This protects `bundle exec rake db:migrate`, `TRUNCATE users CASCADE`,
+        // `cd ~/Downloads && pwd` while still stripping
+        // `username should be camelCase`.
+        let pattern = #"`([^`\n]*\s[^`\n]*)`"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        guard !matches.isEmpty else { return text }
+
+        // Common English stopwords that strongly signal prose, not code.
+        let prose: Set<String> = [
+            "should", "the", "a", "an", "is", "are", "be", "to", "of", "in", "on", "at",
+            "and", "or", "but", "not", "this", "that", "with", "for", "from", "by",
+            "it", "its", "as", "if", "when", "where", "how", "why", "we", "you", "they"
+        ]
+        // Recognized shell / SQL command leading tokens.
+        let cmds: Set<String> = [
+            "bundle", "git", "npm", "yarn", "pnpm", "cd", "ls", "cat", "grep", "find",
+            "sed", "awk", "curl", "wget", "ssh", "scp", "make", "cargo", "swift", "node",
+            "python", "python3", "ruby", "rails", "rake", "go", "docker", "kubectl",
+            "psql", "mysql", "redis-cli", "sudo", "brew", "pip", "pip3", "apt", "apt-get",
+            "tail", "head", "tar", "zip", "unzip", "rsync", "mv", "cp", "rm", "mkdir",
+            "touch", "echo", "export", "set", "unset",
+            "select", "insert", "update", "delete", "truncate", "alter", "create", "drop",
+            "grant", "revoke", "begin", "commit", "rollback"
+        ]
+
+        var result = text
+        // Walk matches in reverse so range replacements don't shift indices.
+        for m in matches.reversed() {
+            let fullRange = m.range
+            let contentRange = m.range(at: 1)
+            let content = nsText.substring(with: contentRange)
+            let tokens = content.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard !tokens.isEmpty else { continue }
+
+            let firstLower = tokens[0].lowercased()
+            let hasCodeChar = content.contains(":") || content.contains("=")
+                || content.contains("/") || content.contains("&")
+                || content.contains("--") || content.contains("_")
+            let hasAllCapsToken = tokens.contains { tok in
+                tok.count >= 2 && tok.allSatisfy { $0.isUppercase || !$0.isLetter }
+                    && tok.contains(where: { $0.isLetter })
+            }
+            let startsWithCmd = cmds.contains(firstLower)
+            let looksLikeCode = hasCodeChar || hasAllCapsToken || startsWithCmd
+            if looksLikeCode { continue }  // keep backticks
+
+            // Otherwise: check if it's prose (contains stopwords).
+            let lowerTokens = Set(tokens.map { $0.lowercased() })
+            let looksLikeProse = !lowerTokens.isDisjoint(with: prose)
+            if !looksLikeProse { continue }  // ambiguous — keep backticks to be safe
+
+            // Strip backticks: replace `<content>` with <content>.
+            if let swiftRange = Range(fullRange, in: result) {
+                result.replaceSubrange(swiftRange, with: content)
+            }
+        }
+        return result
+    }
+
+    // MARK: - Pass 0: Spoken punctuation & line commands (deterministic)
+    //
+    // Converts dictated punctuation/structure commands into the real symbol or
+    // line break. This is the DETERMINISTIC mirror of TextFormatter's voice-
+    // command table, living in the shared postprocessor so it fires on every
+    // polish path — including the triple-ASR merge path and any LLM-rejected /
+    // model-unavailable fallback. The user's #1 reported bug ("can't recognize
+    // slash commands") is fixed here: bare "slash" / "X slash Y" now converts
+    // even when no URL context is present.
+    //
+    // Design:
+    //   - UNAMBIGUOUS commands ("question mark", "new paragraph", "open paren",
+    //     "exclamation point", symbol names) convert anywhere they appear as a
+    //     whole word/phrase — they essentially never occur as literal prose.
+    //   - AMBIGUOUS single words ("period", "comma", "colon", "semicolon",
+    //     "dash") only convert in a command-shaped context: end-of-utterance,
+    //     OR followed by another word (capital OR lowercase — dictation is
+    //     lowercase, so we MUST accept lowercase, unlike the old TextFormatter
+    //     rule that required a capital). A short denylist of real prose
+    //     collocations ("period drama", "comma splice", "colon cancer") is
+    //     excluded so they survive.
+    //   - SLASH: "X slash Y" → "X/Y" (no surrounding spaces) for the common
+    //     path/handle case. Already-formed "a/b" is untouched. URLs/emails are
+    //     further reconstructed by the dedicated spoken-URL pass that runs
+    //     after this.
+    //
+    // No emojis, no em-dashes: spoken "dash" becomes a hyphen with surrounding
+    // spaces (" - "); the strip-dashes pass downstream still removes any real
+    // em/en dashes per the app rule.
+
+    /// Prose collocations where an ambiguous command word is NOT a command.
+    /// Matched as "<word> <command>" or "<command> <word>"; if the command
+    /// participates in one of these, we leave it as prose.
+    private static let ambiguousCommandProseGuards: [String: Set<String>] = [
+        "period": ["drama", "dramas", "piece", "costume", "grace", "time", "of"],
+        "comma": ["splice", "splices"],
+        "colon": ["cancer", "cleanse", "rectal", "polyp", "polyps"],
+        "dash": ["board", "boards", "cam", "line", "lines", "of"],
+    ]
+
+    static func spokenPunctuationPass(_ text: String) -> String {
+        var s = text
+
+        // --- Structural commands (always convert; multi-word first) ---
+        // Order matters: "new paragraph" before "new line"/"line", etc.
+        // Consume surrounding horizontal whitespace so we get "a\n\nb", not
+        // "a \n\n b" (the latter leaves stray leading spaces on each line).
+        let structural: [(String, String)] = [
+            (#"[^\S\n]*\bnew\s+paragraph\b[^\S\n]*"#, "\n\n"),
+            (#"[^\S\n]*\bnext\s+paragraph\b[^\S\n]*"#, "\n\n"),
+            (#"[^\S\n]*\bnew\s+line\b[^\S\n]*"#, "\n"),
+            (#"[^\S\n]*\bnext\s+line\b[^\S\n]*"#, "\n"),
+            (#"[^\S\n]*\bline\s+break\b[^\S\n]*"#, "\n"),
+        ]
+        for (pat, rep) in structural {
+            s = replaceRegex(s, pattern: pat, options: [.caseInsensitive]) { _ in rep }
+        }
+
+        // --- Glue symbols: consume surrounding spaces so they bind to
+        // neighboring tokens ("user underscore id" → "user_id", "a forward
+        // slash b" → "a/b"). These NEVER take surrounding spaces in real text.
+        let glueSymbols: [(String, String)] = [
+            (#"[^\S\n]*\bunderscore\b[^\S\n]*"#, "_"),
+            (#"[^\S\n]*\bforward\s+slash\b[^\S\n]*"#, "/"),
+            (#"[^\S\n]*\bback\s*slash\b[^\S\n]*"#, "\\"),
+        ]
+        for (pat, rep) in glueSymbols {
+            s = replaceRegex(s, pattern: pat, options: [.caseInsensitive]) { _ in rep }
+        }
+
+        // --- Unambiguous punctuation phrases (multi-word first) ---
+        let unambiguous: [(String, String)] = [
+            (#"\bexclamation\s+point\b"#, "!"),
+            (#"\bexclamation\s+mark\b"#, "!"),
+            (#"\bexplanation\s+point\b"#, "!"),  // common ASR mishear of "exclamation"
+            (#"\bexplanation\s+mark\b"#, "!"),
+            (#"\bquestion\s+mark\b"#, "?"),
+            (#"\bfull\s+stop\b"#, "."),
+            (#"\bopen\s+paren(?:thesis)?\b"#, "("),
+            (#"\bclose\s+paren(?:thesis)?\b"#, ")"),
+            (#"\bopen\s+bracket\b"#, "["),
+            (#"\bclose\s+bracket\b"#, "]"),
+            (#"\bopen\s+brace\b"#, "{"),
+            (#"\bclose\s+brace\b"#, "}"),
+            (#"\bat\s+sign\b"#, "@"),
+            (#"\bat\s+symbol\b"#, "@"),
+            (#"\bpound\s+sign\b"#, "#"),
+            (#"\bhash\s+sign\b"#, "#"),
+            (#"\bdollar\s+sign\b"#, "$"),
+            (#"\bpercent\s+sign\b"#, "%"),
+            (#"\bplus\s+sign\b"#, "+"),
+            (#"\bequals\s+sign\b"#, "="),
+            (#"\bequal\s+sign\b"#, "="),
+            (#"\bdot\s+dot\s+dot\b"#, "\u{2026}"),
+            (#"\bellipsis\b"#, "\u{2026}"),
+            (#"\bampersand\b"#, "&"),
+            (#"\basterisk\b"#, "*"),
+            (#"\btilde\b"#, "~"),
+            (#"\bcaret\b"#, "^"),
+        ]
+        for (pat, rep) in unambiguous {
+            s = replaceRegex(s, pattern: pat, options: [.caseInsensitive]) { _ in rep }
+        }
+
+        // --- Slash: "X slash Y" → "X/Y" (path/handle), bare "slash" → "/" ---
+        // Both sides word-chars → glue without spaces. This is the dominant
+        // dictation intent ("github slash repo slash readme" → github/repo/readme).
+        // Apply repeatedly so chained slashes ("a slash b slash c") all collapse.
+        var prevSlash: String
+        repeat {
+            prevSlash = s
+            s = replaceRegex(
+                s,
+                pattern: #"([A-Za-z0-9_.\-]+)\s+slash\s+([A-Za-z0-9_.\-]+)"#,
+                options: [.caseInsensitive]
+            ) { g in "\(g[1])/\(g[2])" }
+        } while s != prevSlash
+        // Any remaining standalone "slash" (start/end of clause) → "/".
+        s = replaceRegex(s, pattern: #"\bslash\b"#, options: [.caseInsensitive]) { _ in "/" }
+
+        // --- Ambiguous single-word commands (period/comma/colon/semicolon) ---
+        // Convert when: end-of-string, OR followed by whitespace + a word
+        // (lowercase OR capital) + we are NOT in a known prose collocation.
+        // Replacement carries the natural following space for word-then-word
+        // cases so "store comma then" → "store, then".
+        s = applyAmbiguousCommand(s, word: "period", symbol: ".")
+        s = applyAmbiguousCommand(s, word: "comma", symbol: ",")
+        s = applyAmbiguousCommand(s, word: "colon", symbol: ":")
+        s = applyAmbiguousCommand(s, word: "semicolon", symbol: ";")
+
+        // --- Spoken "dash" / "hyphen" → " - " (ambiguous-guarded) ---
+        // CLI flags first: "dash dash" / "double dash" → "--". Keep it as a
+        // space-separated token ("npm install --save"), so we do NOT consume
+        // surrounding whitespace here (unlike the glue symbols).
+        s = replaceRegex(s, pattern: #"\b(?:dash\s+dash|double\s+dash|double\s+hyphen)\b"#, options: [.caseInsensitive]) { _ in "--" }
+        s = applyAmbiguousCommand(s, word: "hyphen", symbol: "-", spaced: true)
+        s = applyAmbiguousCommand(s, word: "dash", symbol: "-", spaced: true)
+
+        return s
+    }
+
+    /// Convert an ambiguous single-word spoken command to its symbol, but only
+    /// in a command-shaped context and not inside a known prose collocation.
+    ///
+    /// - Parameters:
+    ///   - spaced: when true (dash/hyphen) the symbol is wrapped with spaces
+    ///     (" - ") and we DON'T glue it to the next word; when false (period/
+    ///     comma/etc.) the symbol attaches to the preceding word and a single
+    ///     space precedes the following word ("store, then").
+    private static func applyAmbiguousCommand(
+        _ text: String,
+        word: String,
+        symbol: String,
+        spaced: Bool = false
+    ) -> String {
+        let proseGuard = ambiguousCommandProseGuards[word] ?? []
+        let escaped = NSRegularExpression.escapedPattern(for: word)
+        // Capture the optional following word so we can (a) check the prose
+        // guard and (b) preserve it. Group 1 = following word (may be empty at
+        // end-of-utterance). We require the command word to be preceded by a
+        // boundary and followed by: HORIZONTAL-whitespace + word, OR
+        // end-of-string, OR a newline. The following-word separator is
+        // [^\S\n]+ (NOT \s+) so a newline does NOT get swallowed into the
+        // word branch — "period\nbye" must yield "." + a preserved newline,
+        // not "period. bye" with the line break eaten. Also guard the
+        // PRECEDING word against prose collocations.
+        let pattern = #"(?:^|(?<=\s))"# + "\(escaped)" + #"\b(?:[^\S\n]+([A-Za-z][A-Za-z'\-]*)|(?=\s*$)|(?=\s*\n))"#
+        guard let rx = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return text }
+        let ns = text as NSString
+        let matches = rx.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return text }
+        var out = ""
+        out.reserveCapacity(text.count)
+        var cursor = 0
+        for m in matches {
+            let mRange = m.range
+            // Preceding word (for prose-guard): the token immediately before the match.
+            let precedingWord: String = {
+                let pre = ns.substring(to: mRange.location)
+                guard let last = pre.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).last else { return "" }
+                return String(last).lowercased().trimmingCharacters(in: .punctuationCharacters)
+            }()
+            let followingWord: String = {
+                let r = m.range(at: 1)
+                return r.location == NSNotFound ? "" : ns.substring(with: r)
+            }()
+            // Prose-guard: skip conversion if either neighbor marks this as prose.
+            let isProse = proseGuard.contains(precedingWord)
+                || (!followingWord.isEmpty && proseGuard.contains(followingWord.lowercased()))
+            // Copy text before the match verbatim.
+            if mRange.location > cursor {
+                out += ns.substring(with: NSRange(location: cursor, length: mRange.location - cursor))
+            }
+            if isProse {
+                out += ns.substring(with: mRange)  // leave prose untouched
+            } else if followingWord.isEmpty {
+                // End-of-utterance command: just the symbol (no trailing space).
+                out += spaced ? " \(symbol)" : symbol
+            } else if spaced {
+                out += " \(symbol) \(followingWord)"
+            } else {
+                out += "\(symbol) \(followingWord)"
+            }
+            cursor = mRange.location + mRange.length
+        }
+        if cursor < ns.length {
+            out += ns.substring(with: NSRange(location: cursor, length: ns.length - cursor))
+        }
+        return out
+    }
+
+    // MARK: - Final pass: punctuation spacing (deterministic)
+    //
+    // Repairs spacing AROUND punctuation, the user's "spacing is sometimes off"
+    // complaint. Runs last so it cleans up whatever earlier passes / entity
+    // unfreezing produced. Conservative: only touches spaces, never content.
+    // Preserves \n and \n\n (paragraph structure), decimals (3.5), ellipses
+    // (…), and numeric/clock colons (3:30).
+
+    static func punctuationSpacingPass(_ text: String) -> String {
+        var s = text
+
+        // 1. Remove space(s) BEFORE , ; : ! ? . — but not inside a newline run.
+        //    "word ," → "word,". Negative: don't pull a period off a decimal
+        //    (there's never a space before a decimal point anyway).
+        s = replaceRegex(s, pattern: #"[^\S\n]+([,;:!?])"#, options: []) { g in g[1] }
+        // Period: same, but guard ellipsis (handled as its own char) — a lone
+        // "." preceded by space collapses.
+        s = replaceRegex(s, pattern: #"[^\S\n]+(\.)(?!\.)"#, options: []) { g in g[1] }
+
+        // 2. Ensure ONE space after sentence punctuation . ! ? when a sentence
+        //    clearly ended and the next one starts. To avoid mangling dotted
+        //    identifiers (Foo.Bar, U.S.A, README.MD, v1.2) the period rule
+        //    requires: a full lowercase WORD before the dot whose FIRST letter
+        //    is also lowercase (so "home.She" splits but "Foo.Bar" — leading
+        //    cap — does not), the dot, then an uppercase+lowercase start. This
+        //    leaves CamelCase/acronym/file/version dotted tokens intact while
+        //    still fixing run-together sentences. `!`/`?` are unambiguous
+        //    sentence terminals, so they only need a lowercase letter before.
+        s = replaceRegex(s, pattern: #"(?<![A-Za-z])([a-z][a-z]+)\.([A-Z][a-z])"#, options: []) { g in "\(g[1]). \(g[2])" }
+        s = replaceRegex(s, pattern: #"([a-z])([!?])([A-Z])"#, options: []) { g in "\(g[1])\(g[2]) \(g[3])" }
+        // 3. Ensure ONE space after a comma/semicolon/colon when followed by a
+        //    letter (missing-space-after-comma: "a,b" → "a, b"). Skip when
+        //    followed by a digit (could be "3,500" thousands or "3:30" time).
+        s = replaceRegex(s, pattern: #"([,;])([A-Za-z])"#, options: []) { g in "\(g[1]) \(g[2])" }
+
+        // 4. Collapse any horizontal double-spaces introduced above (NOT \n).
+        s = replaceRegex(s, pattern: #"[^\S\n]{2,}"#, options: []) { _ in " " }
+
+        // 5. No space before a closing paren/bracket; no space after an opening one.
+        s = replaceRegex(s, pattern: #"\(\s+"#, options: []) { _ in "(" }
+        s = replaceRegex(s, pattern: #"[^\S\n]+\)"#, options: []) { _ in ")" }
+
+        // 6. Trim trailing horizontal whitespace on each line + overall ends.
+        s = s.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> String in
+                var l = String(line)
+                while l.hasSuffix(" ") || l.hasSuffix("\t") { l.removeLast() }
+                while l.hasPrefix(" ") || l.hasPrefix("\t") { l.removeFirst() }
+                return l
+            }
+            .joined(separator: "\n")
+
         return s.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -2099,37 +2729,252 @@ public enum PolishPostprocessor {
     // the model used the dash to join two clear sentences.
 
     static func stripDashesPass(_ text: String) -> String {
-        var s = text
+        // Belt-and-suspenders enforcement: the prompt bans em-dashes and
+        // en-dashes, but Qwen3 still emits them on long inputs. This pass is
+        // deterministic and unconditional: every `\u{2014}` / `\u{2013}` /
+        // `\u{2015}` / `\u{2012}` becomes ". " + capitalized next word.
+        //
+        // Why period-and-capital (was: comma, sometimes period): the user's
+        // explicit preference. Restarting the sentence reads cleanly across
+        // both appositive and clause-joining usages — a comma after "tired"
+        // in "I'm tired, I've been working" is a comma splice; the period
+        // form ("I'm tired. I've been working.") is correct prose either way.
+        //
+        // We also LOG every replacement so we know the prompt failed for this
+        // input — surfaces prompt regressions in the rolling Console output.
+        let dashChars: [Character] = ["\u{2014}", "\u{2013}", "\u{2015}", "\u{2012}"]
 
-        // Step 1: Convert `, X — Y, ...` and ` — X — Y...` (appositive form):
-        // when an em-dash is surrounded by short prose, comma is right.
-        // We do this as a global replacement; the heuristic for period is
-        // applied in step 2 over the same set of dashes.
-        let dashChars: [String] = ["\u{2014}", "\u{2013}", "\u{2015}", "\u{2012}"]
+        // Fast path: no dashes? skip entirely (single linear scan).
+        guard text.contains(where: { dashChars.contains($0) }) else { return text }
 
-        for dash in dashChars {
-            // Period: dash followed by space + capital letter + at least 4
-            // words before next strong punctuation suggests two sentences.
-            // Use lookahead to detect the pattern, replace ` — ` with `. `.
-            s = s.replacingOccurrences(
-                of: "\\s*\(dash)\\s+(?=[A-Z][a-z]+(?:\\s+\\w+){3,})",
-                with: ". ",
-                options: .regularExpression
-            )
-            // Everything else: comma replacement.
-            s = s.replacingOccurrences(
-                of: "\\s*\(dash)\\s*",
-                with: ", ",
-                options: .regularExpression
-            )
+        var replacementCount = 0
+        var result = ""
+        result.reserveCapacity(text.count)
+
+        // Two-state machine: when we see a dash (possibly surrounded by
+        // whitespace), emit ". " and flip `capitalizeNext` to true so the
+        // first letter character we then encounter gets uppercased.
+        let chars = Array(text)
+        var i = 0
+        var capitalizeNext = false
+        while i < chars.count {
+            let ch = chars[i]
+            if dashChars.contains(ch) {
+                // Trim trailing whitespace already emitted (so "tired — I" → "tired. I"
+                // not "tired . I"). Walk back over spaces we just wrote.
+                while result.last == " " || result.last == "\t" {
+                    result.removeLast()
+                }
+                // Drop the trailing comma if any (e.g. ", —" patterns).
+                if result.last == "," {
+                    result.removeLast()
+                }
+                result.append(". ")
+                replacementCount += 1
+                capitalizeNext = true
+                // Skip the dash and any following whitespace.
+                i += 1
+                while i < chars.count, chars[i].isWhitespace, chars[i] != "\n" {
+                    i += 1
+                }
+                continue
+            }
+            if capitalizeNext, ch.isLetter {
+                result.append(Character(ch.uppercased()))
+                capitalizeNext = false
+            } else {
+                result.append(ch)
+                // If we hit non-letter non-space mid-flight (digit, punctuation),
+                // stop trying to capitalize — the "next word" was non-alpha.
+                if !ch.isWhitespace { capitalizeNext = false }
+            }
+            i += 1
         }
 
-        // Clean up double commas that might result from `,X, Y,` patterns
+        if replacementCount > 0 {
+            print("[VOICE-POLISH] stripDashesPass: replaced \(replacementCount) dash(es) with period+capital — prompt failed for this input")
+        }
+
+        // Clean up artifacts: double periods (".. "), double commas.
+        var s = result
+        s = s.replacingOccurrences(of: ".. ", with: ". ")
+        s = s.replacingOccurrences(of: ". .", with: ".")
         s = s.replacingOccurrences(of: ", ,", with: ",")
         s = s.replacingOccurrences(of: ",,", with: ",")
-        // Collapse repeated whitespace
         s = s.replacingOccurrences(of: "  +", with: " ", options: .regularExpression)
         return s
+    }
+
+    // MARK: - Strip emojis (belt-and-suspenders)
+    //
+    // The prompt bans emojis, but Qwen3 still emits them on some inputs
+    // (especially short conversational dictations). This pass deterministically
+    // strips every Unicode scalar in the Extended_Pictographic class, plus
+    // common symbol blocks the property test misses (variation selectors,
+    // zero-width joiners chained between pictographs, regional indicator pairs).
+
+    /// Strips any emoji or symbol pictograph that survived earlier passes.
+    /// Hard rule: polish output must never contain emojis. Cloud model
+    /// occasionally leaks them through ("Excited" personality or when the
+    /// dictation contains emoji-evoking phrases). This is the last defense
+    /// and is wired as the absolute final pass in `process(_:options:)`.
+    ///
+    /// Implementation note: this is the public API surface for the strip.
+    /// It delegates to `stripEmojiPass` which is the well-tested
+    /// implementation (handles ZWJ chains, skin-tone modifiers, regional
+    /// indicator pairs, variation selectors, and tidies the surrounding
+    /// whitespace artifacts). Logs `[VOICE-POLISH-STRIP] removed N emoji
+    /// codepoints` when it strips anything so prompt regressions surface
+    /// in the Console.
+    public static func stripEmojis(_ text: String) -> String {
+        let before = text
+        let after = stripEmojiPass(text)
+        if before != after {
+            // Count actually-removed pictographic scalars (not just length
+            // delta, since the pass also tidies trailing spaces).
+            let beforePictographs = before.unicodeScalars.reduce(0) { acc, s in
+                acc + (isPictographicScalar(s) ? 1 : 0)
+            }
+            let afterPictographs = after.unicodeScalars.reduce(0) { acc, s in
+                acc + (isPictographicScalar(s) ? 1 : 0)
+            }
+            let removed = max(0, beforePictographs - afterPictographs)
+            if removed > 0 {
+                print("[VOICE-POLISH-STRIP] removed \(removed) emoji codepoints")
+            }
+        }
+        return after
+    }
+    //
+    // Logs every replacement so prompt regressions surface in the Console.
+
+    static func stripEmojiPass(_ text: String) -> String {
+        // Fast path: no non-ASCII bytes outside common punctuation? skip.
+        var hasCandidate = false
+        for scalar in text.unicodeScalars {
+            if scalar.properties.isEmojiPresentation
+                || scalar.properties.isEmoji
+                || isPictographicScalar(scalar)
+                || scalar.value == 0x200D  // ZWJ
+                || (scalar.value >= 0xFE00 && scalar.value <= 0xFE0F) // variation selectors
+            {
+                // Filter false positives: digits, asterisk, hash, copyright,
+                // trademark, etc. ARE marked Emoji=Yes by Unicode. We only want
+                // to strip pictographs.
+                if isPictographicScalar(scalar) {
+                    hasCandidate = true
+                    break
+                }
+            }
+        }
+        guard hasCandidate else { return text }
+
+        var stripped = 0
+        var result = String.UnicodeScalarView()
+        result.reserveCapacity(text.unicodeScalars.count)
+
+        let scalars = Array(text.unicodeScalars)
+        var i = 0
+        while i < scalars.count {
+            let s = scalars[i]
+            if isPictographicScalar(s) {
+                stripped += 1
+                // Consume the entire emoji sequence: skip following ZWJ-joined
+                // pictographs, skin-tone modifiers, variation selectors,
+                // keycap sequences, regional indicators (flag pairs).
+                i += 1
+                while i < scalars.count {
+                    let nxt = scalars[i]
+                    if nxt.value == 0x200D {
+                        // ZWJ: consume and continue (next scalar joined to seq).
+                        i += 1
+                        continue
+                    }
+                    if nxt.value >= 0xFE00 && nxt.value <= 0xFE0F {
+                        // Variation selector.
+                        i += 1
+                        continue
+                    }
+                    if nxt.value >= 0x1F3FB && nxt.value <= 0x1F3FF {
+                        // Skin tone modifier.
+                        i += 1
+                        continue
+                    }
+                    if nxt.value >= 0x1F1E6 && nxt.value <= 0x1F1FF {
+                        // Regional indicator (flag pair). Consume one extra if next is also RI.
+                        i += 1
+                        continue
+                    }
+                    if isPictographicScalar(nxt) {
+                        // Another pictograph in the same sequence (rare without ZWJ but possible).
+                        i += 1
+                        continue
+                    }
+                    break
+                }
+                continue
+            }
+            // Stray ZWJ / variation selector outside a pictograph sequence: drop.
+            if s.value == 0x200D || (s.value >= 0xFE00 && s.value <= 0xFE0F) {
+                i += 1
+                continue
+            }
+            result.append(s)
+            i += 1
+        }
+
+        // Logging happens in the public `stripEmojis` wrapper as
+        // "[VOICE-POLISH-STRIP] removed N emoji codepoints" — single source
+        // of truth so consoles aren't double-logged.
+        _ = stripped
+
+        var out = String(result)
+        // Tidy up double-spaces and a leading/trailing space introduced by the
+        // stripped scalars.
+        out = out.replacingOccurrences(of: "  +", with: " ", options: .regularExpression)
+        // Strip orphan space-before-punctuation: " ." → ".", " ," → ",".
+        out = out.replacingOccurrences(of: " \\.", with: ".", options: .regularExpression)
+        out = out.replacingOccurrences(of: " ,", with: ",", options: .regularExpression)
+        out = out.replacingOccurrences(of: " !", with: "!", options: .regularExpression)
+        out = out.replacingOccurrences(of: " \\?", with: "?", options: .regularExpression)
+        return out.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// True if the scalar is in the Extended_Pictographic class OR in a
+    /// well-known emoji block. We can't rely on `properties.isEmoji` alone
+    /// because that flags digits, asterisk, hash, and other ASCII symbols.
+    private static func isPictographicScalar(_ s: Unicode.Scalar) -> Bool {
+        // Swift's UnicodeScalar.Properties exposes `isEmojiPresentation` and
+        // (since macOS 11) the Extended_Pictographic property is reachable as
+        // `isEmoji` combined with non-ASCII range. We use explicit block ranges
+        // because they're stable across OS versions and don't false-positive.
+        let v = s.value
+        // Emoticons
+        if v >= 0x1F600 && v <= 0x1F64F { return true }
+        // Misc Symbols & Pictographs
+        if v >= 0x1F300 && v <= 0x1F5FF { return true }
+        // Transport & Map
+        if v >= 0x1F680 && v <= 0x1F6FF { return true }
+        // Supplemental Symbols & Pictographs
+        if v >= 0x1F900 && v <= 0x1F9FF { return true }
+        // Symbols & Pictographs Extended-A
+        if v >= 0x1FA70 && v <= 0x1FAFF { return true }
+        // Misc Symbols (block-level, contains ☀ ☂ ★ etc.)
+        if v >= 0x2600 && v <= 0x26FF { return true }
+        // Dingbats (contains ✅ ✈ ✊ etc.)
+        if v >= 0x2700 && v <= 0x27BF { return true }
+        // Regional Indicator (flags)
+        if v >= 0x1F1E6 && v <= 0x1F1FF { return true }
+        // Enclosed Alphanumeric Supplement (contains 🅰 🆎 etc.)
+        if v >= 0x1F100 && v <= 0x1F1FF { return true }
+        // Mahjong/playing card/domino emoji blocks
+        if v >= 0x1F000 && v <= 0x1F02F { return true } // mahjong
+        if v >= 0x1F0A0 && v <= 0x1F0FF { return true } // playing cards
+        // Misc Technical (contains ⌚ ⌛ ⏰ etc.)
+        if v >= 0x231A && v <= 0x231B { return true }
+        if v == 0x23E9 || v == 0x23EA || v == 0x23EB || v == 0x23EC { return true }
+        if v == 0x23F0 || v == 0x23F3 { return true }
+        return false
     }
 
     // MARK: - European decimal normalization
@@ -2147,6 +2992,50 @@ public enum PolishPostprocessor {
             options: []
         ) { groups in "\(groups[1])\(groups[2]),\(groups[3])" }
         return s
+    }
+
+    // MARK: - European-style number mis-renderings ("4.5.000.000" -> "4.5 million")
+    //
+    // Cloud / local models occasionally render a spoken decimal-magnitude
+    // number ("four point five million") with European thousand separators:
+    // "4.5.000.000". Catastrophic readability failure. This pass catches the
+    // exact pattern and converts it to digit-plus-magnitude form.
+
+    /// Catches European-style mis-renderings like "4.5.000.000" and "4.500.000"
+    /// and corrects them. These appear when a small model treats spoken decimals
+    /// + magnitude as a single number with European thousand separators.
+    public static func normalizeEuropeanNumberMistakes(_ text: String) -> String {
+        var result = text
+        // Pattern: digit "point" "5.000.000" (where ".000.000" or ".000" was meant to be a magnitude)
+        // Specifically catch: "<digit>.<digit>.000.000" -> "<digit>.<digit> million"
+        let millionPattern = #"\b(\d+)\.(\d)\.0{3}\.0{3}\b"#
+        if let regex = try? NSRegularExpression(pattern: millionPattern) {
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "$1.$2 million")
+        }
+        // "<digit>.<digit>.000" -> "<digit>.<digit> thousand" (less common)
+        let thousandPattern = #"\b(\d+)\.(\d)\.0{3}\b"#
+        if let regex = try? NSRegularExpression(pattern: thousandPattern) {
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "$1.$2 thousand")
+        }
+        return result
+    }
+
+    // MARK: - "at <number>" never becomes "@<number>"
+    //
+    // The word "at" preceding a clock time is NEVER the @ symbol. Some models
+    // mis-render "at 3:00" or "at 6" as "@3:00" / "@6" — an email-handle-style
+    // misread. This pass undoes that.
+
+    /// Catches "at-three" or "@three" or "@<number>" — the model mis-reading
+    /// "at <number>" as an email handle / mention. Output should never have
+    /// @ followed by a digit when the source was a spoken clock time.
+    public static func normalizeAtTime(_ text: String) -> String {
+        let pattern = #"@(\d+(?::\d+)?)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let range = NSRange(text.startIndex..., in: text)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "at $1")
     }
 
     // MARK: - Colon list detection
@@ -2329,6 +3218,61 @@ public enum PolishPostprocessor {
         return s
     }
 
+    // MARK: - List structure helpers (Oxford comma + item capitalization)
+    //
+    // These two passes clean up the surface form of lists AFTER the LLM has
+    // produced them and the bullet/numbered passes above have done their
+    // restructuring. They are deliberately small and surgical:
+    //
+    //   - `ensureOxfordComma` walks inline "X, Y and Z" sequences and inserts
+    //     the missing serial comma so they read "X, Y, and Z". Some upstream
+    //     models still elide the Oxford comma despite the prompt.
+    //   - `capitalizeListItems` walks bullet/numbered list lines and uppercases
+    //     the first letter of the item, regardless of what the model emitted.
+    //
+    // Both are idempotent and conservative (no-op when the text already
+    // conforms), and both run unconditionally — they have no `listMode`
+    // gating because they only mutate text that is already shaped like a
+    // list.
+
+    /// Ensures Oxford comma in inline lists of 3+ items.
+    /// Detects patterns like "X, Y and Z" and converts to "X, Y, and Z".
+    public static func ensureOxfordComma(_ text: String) -> String {
+        // Match: ", <word> and <word>" or ", <word> or <word>" → ", <word>, and/or <word>"
+        // The leading comma anchors us to genuine lists (≥3 items) — we never
+        // touch bare "<word> and <word>" pairs.
+        let pattern = #",\s+([A-Za-z][\w'-]*)\s+(and|or)\s+([A-Za-z][\w'-]*)\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let range = NSRange(text.startIndex..., in: text)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: ", $1, $2 $3")
+    }
+
+    /// Capitalizes the first letter of each line in a bulleted/numbered list.
+    /// Matches lines starting with "- ", "* ", "• ", or "N. ".
+    public static func capitalizeListItems(_ text: String) -> String {
+        let lines = text.components(separatedBy: "\n")
+        // Match the bullet/number prefix and the first lowercase letter that
+        // follows it. We rebuild the line in code (rather than via regex
+        // replacement) so the capitalization is unambiguous and we never
+        // accidentally rewrite content past the first character.
+        let bulletPrefixPattern = #"^(\s*(?:[-*\u{2022}]|\d+\.)\s+)([a-z])"#
+        guard let regex = try? NSRegularExpression(pattern: bulletPrefixPattern) else { return text }
+        let updated = lines.map { line -> String in
+            let ns = line as NSString
+            let range = NSRange(location: 0, length: ns.length)
+            guard let m = regex.firstMatch(in: line, range: range), m.numberOfRanges >= 3 else {
+                return line
+            }
+            let prefixRange = m.range(at: 1)
+            let letterRange = m.range(at: 2)
+            let prefix = ns.substring(with: prefixRange)
+            let letter = ns.substring(with: letterRange).uppercased()
+            let rest = ns.substring(from: letterRange.location + letterRange.length)
+            return prefix + letter + rest
+        }
+        return updated.joined(separator: "\n")
+    }
+
     // MARK: - Thousands separator
     //
     // "14000" → "14,000". Carefully skips:
@@ -2350,9 +3294,13 @@ public enum PolishPostprocessor {
             guard let num = Int(numStr) else { continue }
             // Skip years (1900-2100).
             if numStr.count == 4 && (1900...2100).contains(num) { continue }
-            // Format with commas.
+            // Format with commas. Pin en_US — the system locale carries a
+            // region override (e.g. en_US@rg=nlzzzz) that would emit a PERIOD
+            // thousands separator ("820.000"), recreating the exact European-
+            // separator corruption the number system exists to prevent.
             let formatter = NumberFormatter()
             formatter.numberStyle = .decimal
+            formatter.locale = Locale(identifier: "en_US")
             guard let formatted = formatter.string(from: NSNumber(value: num)) else { continue }
             s = (s as NSString).replacingCharacters(in: r, with: formatted)
         }
@@ -2459,5 +3407,31 @@ public enum PolishPostprocessor {
             }
         }
         return s
+    }
+
+    // MARK: - Email salutation normalizer
+
+    /// Verifies that an output that LOOKS like an email (starts with
+    /// Hi/Hello/Hey/Dear + name) has the salutation on its own line. If not,
+    /// returns the corrected version with a `\n\n` injected after the
+    /// salutation comma.
+    ///
+    /// Belt-and-suspenders for the cloud prompt: the model is told to put the
+    /// salutation on its own line, but it occasionally produces an inline
+    /// form like "Hi Sarah, I wanted to follow up...". This pass detects
+    /// that shape and rewrites the trailing whitespace after the comma to
+    /// `\n\n` so the output is always a properly structured email.
+    public static func normalizeEmailSalutation(_ text: String) -> String {
+        // If the text starts with "Hi <name>," or "Hello <name>," etc., and
+        // the next char is a space (not \n), inject "\n\n" after the comma.
+        let pattern = #"^(Hi|Hello|Hey|Dear|Good morning|Good afternoon|Good evening)\s+[A-Z][A-Za-z]+(?:\s+and\s+[A-Z][A-Za-z]+)?,\s+"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return text }
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range) else { return text }
+        // Replace the trailing whitespace after the comma with \n\n
+        let salutationEnd = match.range.upperBound
+        let cleaned = String(text[text.startIndex..<text.index(text.startIndex, offsetBy: salutationEnd)])
+            .trimmingCharacters(in: .whitespaces) + "\n\n" + String(text[text.index(text.startIndex, offsetBy: salutationEnd)...])
+        return cleaned
     }
 }

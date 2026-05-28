@@ -18,29 +18,163 @@
 // drift terms use sin/cos of t scaled by integer multipliers, so the
 // position at t=0 exactly equals the position at t=2π — no visible jump
 // when the loop wraps. The color breath shares the same 16s clock.
+//
+// OVER-COVER (no-clip): a MeshGradient's colored field only exists inside
+// the convex hull of its outer control ring. To guarantee the field always
+// fills (and over-fills) the capsule/circle the caller clips it to, the
+// entire 8-point outer ring is pinned WELL outside the unit square (corners
+// at ±0.25 beyond [0,1], edge midpoints at -0.2 / 1.2 on their outer axis).
+// Only the single CENTER control point animates. The interior color blobs
+// still breathe, but the field can never recede inside the frame on any
+// phase or palette — so there is no visible clipping/seam. See `meshBody`.
 
 import SwiftUI
 
+/// Color theme for the aurora mesh. Each case maps to a 6-color × 2-palette
+/// (a/b breathing) palette. All three palettes share the SAME mesh layout
+/// and animation curves — only the colors differ.
+enum AuroraPalette {
+    case iris        // original pink/indigo/sky (default)
+    case verdant     // jungle/forest greens + tropical teals
+    case midnight    // deep navy/cobalt + ice highlights
+    case ember       // smoldering charcoal + iron-orange embers
+    case opaline     // mother-of-pearl, cool lilac over oyster graphite
+    case saffron     // spice-market dusk, turmeric + rose + ink
+}
+
 struct AuroraBackground: View {
-    // Palette extracted from the reference image. Two slightly different
-    // palettes (a/b) are interpolated over time for subtle color breathing.
-    // Set "a" = vibrant baseline, "b" = slightly cooler/more saturated.
+    /// Pick the color theme. Caller passes one of `.iris` / `.verdant` /
+    /// `.midnight` based on user's selected skin. Default keeps the original
+    /// pink/indigo aurora so all existing call sites keep working unchanged.
+    var palette: AuroraPalette = .iris
 
-    // a-palette (baseline)
-    private let vibrantBlueA = Color(red: 0.231, green: 0.482, blue: 1.0)   // #3B7BFF
-    private let deepIndigoA  = Color(red: 0.302, green: 0.251, blue: 1.0)   // #4D40FF
-    private let magentaA     = Color(red: 0.769, green: 0.361, blue: 0.878) // #C45CE0
-    private let lightPinkA   = Color(red: 0.961, green: 0.702, blue: 0.851) // #F5B3D9
-    private let palePinkA    = Color(red: 1.0,   green: 0.831, blue: 0.898) // #FFD4E5
-    private let skyBlueA     = Color(red: 0.420, green: 0.690, blue: 1.0)   // #6BB0FF
+    // MARK: - Palette pairs (a = baseline, b = slight saturation/temp lift)
 
-    // b-palette (slight cool/saturation lift)
-    private let vibrantBlueB = Color(red: 0.180, green: 0.520, blue: 1.0)
-    private let deepIndigoB  = Color(red: 0.345, green: 0.220, blue: 0.965)
-    private let magentaB     = Color(red: 0.820, green: 0.380, blue: 0.910)
-    private let lightPinkB   = Color(red: 0.980, green: 0.730, blue: 0.875)
-    private let palePinkB    = Color(red: 1.0,   green: 0.855, blue: 0.910)
-    private let skyBlueB     = Color(red: 0.380, green: 0.730, blue: 1.0)
+    private var vibrantBlueA: Color { Self.color(for: palette, slot: .vibrant,    variant: .a) }
+    private var deepIndigoA:  Color { Self.color(for: palette, slot: .deep,       variant: .a) }
+    private var magentaA:     Color { Self.color(for: palette, slot: .magenta,    variant: .a) }
+    private var lightPinkA:   Color { Self.color(for: palette, slot: .lightPink,  variant: .a) }
+    private var palePinkA:    Color { Self.color(for: palette, slot: .palePink,   variant: .a) }
+    private var skyBlueA:     Color { Self.color(for: palette, slot: .skyBlue,    variant: .a) }
+
+    private var vibrantBlueB: Color { Self.color(for: palette, slot: .vibrant,    variant: .b) }
+    private var deepIndigoB:  Color { Self.color(for: palette, slot: .deep,       variant: .b) }
+    private var magentaB:     Color { Self.color(for: palette, slot: .magenta,    variant: .b) }
+    private var lightPinkB:   Color { Self.color(for: palette, slot: .lightPink,  variant: .b) }
+    private var palePinkB:    Color { Self.color(for: palette, slot: .palePink,   variant: .b) }
+    private var skyBlueB:     Color { Self.color(for: palette, slot: .skyBlue,    variant: .b) }
+
+    private enum Slot { case vibrant, deep, magenta, lightPink, palePink, skyBlue }
+    private enum Variant { case a, b }
+
+    /// Centralised palette table. Comments give the role each slot plays —
+    /// `vibrant` is the bright punch, `deep` is the anchor blob, `magenta` is
+    /// the accent, `lightPink` / `palePink` are the soft washes, `skyBlue` is
+    /// the cool transition tone.
+    private static func color(for p: AuroraPalette, slot: Slot, variant: Variant) -> Color {
+        switch p {
+        case .iris:
+            switch (slot, variant) {
+            case (.vibrant,   .a): return Color(red: 0.231, green: 0.482, blue: 1.0)   // #3B7BFF
+            case (.vibrant,   .b): return Color(red: 0.180, green: 0.520, blue: 1.0)
+            case (.deep,      .a): return Color(red: 0.302, green: 0.251, blue: 1.0)   // #4D40FF
+            case (.deep,      .b): return Color(red: 0.345, green: 0.220, blue: 0.965)
+            case (.magenta,   .a): return Color(red: 0.769, green: 0.361, blue: 0.878) // #C45CE0
+            case (.magenta,   .b): return Color(red: 0.820, green: 0.380, blue: 0.910)
+            case (.lightPink, .a): return Color(red: 0.961, green: 0.702, blue: 0.851) // #F5B3D9
+            case (.lightPink, .b): return Color(red: 0.980, green: 0.730, blue: 0.875)
+            case (.palePink,  .a): return Color(red: 1.0,   green: 0.831, blue: 0.898) // #FFD4E5
+            case (.palePink,  .b): return Color(red: 1.0,   green: 0.855, blue: 0.910)
+            case (.skyBlue,   .a): return Color(red: 0.420, green: 0.690, blue: 1.0)   // #6BB0FF
+            case (.skyBlue,   .b): return Color(red: 0.380, green: 0.730, blue: 1.0)
+            }
+        case .verdant:
+            // Jungle/forest theme. Bright leafy lime + deep moss anchor + a
+            // tropical teal accent in the "magenta" slot. The pink slots
+            // become soft fern/mist tints; sky slot becomes sage.
+            switch (slot, variant) {
+            case (.vibrant,   .a): return Color(red: 0.231, green: 0.847, blue: 0.451) // #3BD873 lush lime-green
+            case (.vibrant,   .b): return Color(red: 0.180, green: 0.812, blue: 0.502)
+            case (.deep,      .a): return Color(red: 0.063, green: 0.349, blue: 0.231) // #105938 deep forest moss (anchor)
+            case (.deep,      .b): return Color(red: 0.094, green: 0.392, blue: 0.243)
+            case (.magenta,   .a): return Color(red: 0.180, green: 0.769, blue: 0.690) // #2EC4B0 tropical teal accent
+            case (.magenta,   .b): return Color(red: 0.220, green: 0.800, blue: 0.706)
+            case (.lightPink, .a): return Color(red: 0.706, green: 0.949, blue: 0.784) // #B4F2C8 pale fern
+            case (.lightPink, .b): return Color(red: 0.745, green: 0.961, blue: 0.808)
+            case (.palePink,  .a): return Color(red: 0.882, green: 0.961, blue: 0.871) // #E1F5DE soft mist wash
+            case (.palePink,  .b): return Color(red: 0.902, green: 0.973, blue: 0.890)
+            case (.skyBlue,   .a): return Color(red: 0.420, green: 0.847, blue: 0.690) // #6BD8B0 sage-cyan
+            case (.skyBlue,   .b): return Color(red: 0.380, green: 0.812, blue: 0.722)
+            }
+        case .midnight:
+            // Deep navy theme. Cobalt punch + near-black abyss anchor + a
+            // slight purple in the magenta slot for depth. Soft ice/azure
+            // tints for the highlight slots.
+            switch (slot, variant) {
+            case (.vibrant,   .a): return Color(red: 0.180, green: 0.349, blue: 0.969) // #2E59F7 cobalt punch
+            case (.vibrant,   .b): return Color(red: 0.141, green: 0.396, blue: 1.0)
+            case (.deep,      .a): return Color(red: 0.027, green: 0.063, blue: 0.243) // #07103E abyss navy anchor
+            case (.deep,      .b): return Color(red: 0.039, green: 0.094, blue: 0.290)
+            case (.magenta,   .a): return Color(red: 0.318, green: 0.247, blue: 0.706) // #513FB4 royal-violet accent
+            case (.magenta,   .b): return Color(red: 0.349, green: 0.275, blue: 0.749)
+            case (.lightPink, .a): return Color(red: 0.620, green: 0.776, blue: 0.949) // #9EC6F2 pale azure
+            case (.lightPink, .b): return Color(red: 0.659, green: 0.804, blue: 0.961)
+            case (.palePink,  .a): return Color(red: 0.871, green: 0.918, blue: 0.969) // #DEEAF7 ice white
+            case (.palePink,  .b): return Color(red: 0.890, green: 0.937, blue: 0.980)
+            case (.skyBlue,   .a): return Color(red: 0.290, green: 0.561, blue: 0.847) // #4A8FD8 steel sky
+            case (.skyBlue,   .b): return Color(red: 0.243, green: 0.522, blue: 0.890)
+            }
+        case .ember:
+            // Smoldering charcoal + iron-orange embers. Glows from within without
+            // ever turning into a generic sunset; the anchor is near-black coal.
+            switch (slot, variant) {
+            case (.vibrant,   .a): return Color(red: 0.961, green: 0.435, blue: 0.149) // #F56F26 ember orange
+            case (.vibrant,   .b): return Color(red: 0.984, green: 0.482, blue: 0.122)
+            case (.deep,      .a): return Color(red: 0.106, green: 0.063, blue: 0.078) // #1B1014 coal anchor
+            case (.deep,      .b): return Color(red: 0.137, green: 0.078, blue: 0.090)
+            case (.magenta,   .a): return Color(red: 0.706, green: 0.196, blue: 0.231) // #B4323B oxidized cinnabar
+            case (.magenta,   .b): return Color(red: 0.745, green: 0.220, blue: 0.212)
+            case (.lightPink, .a): return Color(red: 0.961, green: 0.706, blue: 0.471) // #F5B478 warm ash glow
+            case (.lightPink, .b): return Color(red: 0.973, green: 0.733, blue: 0.494)
+            case (.palePink,  .a): return Color(red: 0.980, green: 0.847, blue: 0.706) // #FAD8B4 pale ember haze
+            case (.palePink,  .b): return Color(red: 0.988, green: 0.867, blue: 0.733)
+            case (.skyBlue,   .a): return Color(red: 0.553, green: 0.302, blue: 0.227) // #8D4D3A scorched bronze
+            case (.skyBlue,   .b): return Color(red: 0.596, green: 0.329, blue: 0.235)
+            }
+        case .opaline:
+            // Mother-of-pearl: cool lilac shimmer over a deep oyster-graphite anchor.
+            switch (slot, variant) {
+            case (.vibrant,   .a): return Color(red: 0.541, green: 0.776, blue: 0.890) // #8AC6E3 cool nacre
+            case (.vibrant,   .b): return Color(red: 0.580, green: 0.812, blue: 0.918)
+            case (.deep,      .a): return Color(red: 0.137, green: 0.149, blue: 0.196) // #232632 oyster graphite anchor
+            case (.deep,      .b): return Color(red: 0.157, green: 0.169, blue: 0.220)
+            case (.magenta,   .a): return Color(red: 0.737, green: 0.620, blue: 0.831) // #BC9ED4 lilac shimmer
+            case (.magenta,   .b): return Color(red: 0.776, green: 0.651, blue: 0.859)
+            case (.lightPink, .a): return Color(red: 0.918, green: 0.871, blue: 0.890) // #EADEE3 pearl wash
+            case (.lightPink, .b): return Color(red: 0.937, green: 0.886, blue: 0.902)
+            case (.palePink,  .a): return Color(red: 0.949, green: 0.937, blue: 0.918) // #F2EFEA bone cream
+            case (.palePink,  .b): return Color(red: 0.961, green: 0.953, blue: 0.937)
+            case (.skyBlue,   .a): return Color(red: 0.620, green: 0.706, blue: 0.776) // #9EB4C6 silver-mist
+            case (.skyBlue,   .b): return Color(red: 0.655, green: 0.737, blue: 0.808)
+            }
+        case .saffron:
+            // Spice-market dusk: turmeric punch, dried-rose accent, indigo-black anchor.
+            switch (slot, variant) {
+            case (.vibrant,   .a): return Color(red: 0.945, green: 0.690, blue: 0.196) // #F1B032 turmeric punch
+            case (.vibrant,   .b): return Color(red: 0.961, green: 0.722, blue: 0.176)
+            case (.deep,      .a): return Color(red: 0.071, green: 0.055, blue: 0.122) // #120E1F ink anchor
+            case (.deep,      .b): return Color(red: 0.090, green: 0.071, blue: 0.149)
+            case (.magenta,   .a): return Color(red: 0.706, green: 0.275, blue: 0.318) // #B44651 dried rose
+            case (.magenta,   .b): return Color(red: 0.745, green: 0.298, blue: 0.302)
+            case (.lightPink, .a): return Color(red: 0.949, green: 0.792, blue: 0.561) // #F2CA8F saffron cream
+            case (.lightPink, .b): return Color(red: 0.965, green: 0.812, blue: 0.580)
+            case (.palePink,  .a): return Color(red: 0.965, green: 0.890, blue: 0.769) // #F6E3C4 pale clove
+            case (.palePink,  .b): return Color(red: 0.973, green: 0.906, blue: 0.788)
+            case (.skyBlue,   .a): return Color(red: 0.392, green: 0.275, blue: 0.435) // #64466F bruised plum
+            case (.skyBlue,   .b): return Color(red: 0.420, green: 0.290, blue: 0.471)
+            }
+        }
+    }
 
     // Pick a variant ONCE per app process (not per view mount). A plain
     // `@State` with `Int.random(...)` re-rolls every time SwiftUI remounts
@@ -56,11 +190,11 @@ struct AuroraBackground: View {
     var body: some View {
         // TimelineView at the display refresh rate (60Hz+) was driving a
         // full MeshGradient + 6-color lerp every vsync. The aurora's motion
-        // is slow (mesh oscillates ~0.3–0.4 Hz, breath ~16s), so 30fps is
-        // visually identical and roughly halves main-thread cost during
-        // recording. paused:false explicitly so the view never freezes
-        // when offscreen-ish.
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+        // is slow (mesh oscillates ~0.3–0.4 Hz, breath ~16s) — the mesh
+        // control points only meaningfully shift at ~3 Hz, so 15fps is
+        // visually identical and quarter the main-thread cost vs. 60fps.
+        // paused:false explicitly so the view never freezes when offscreen-ish.
+        TimelineView(.animation(minimumInterval: 1.0 / 15.0, paused: false)) { context in
             // Absolute wall-clock time — `timeIntervalSinceReferenceDate` is
             // CONTINUOUS across view remounts. If we used a per-mount
             // `startDate` reference, the animation phase would jump every
@@ -76,7 +210,9 @@ struct AuroraBackground: View {
         // producing the visible gradient clipping glitch. By removing it here,
         // SwiftUI can apply the clip before compositing, which gives clean edges.
         .onAppear {
-            print("[VOICE-AURORA] mounted variant=\(variantIndex) sessionVariant=\(AuroraBackground.sessionVariant)")
+            #if DEBUG
+            if voiceVerbose { print("[VOICE-AURORA] mounted variant=\(variantIndex) sessionVariant=\(AuroraBackground.sessionVariant)") }
+            #endif
         }
     }
 
@@ -106,9 +242,14 @@ struct AuroraBackground: View {
     /// expresses a different "where do the colors live" composition while
     /// reusing the same animated drift math + breathing palette.
     private struct MeshVariant {
-        /// Base positions for the 3×3 grid in [0,1] coords (slightly inset
-        /// on the outer ring is fine; the mesh extends past the visible
-        /// rect to allow color to bleed off the edges).
+        /// Base positions for the 3×3 grid in [0,1]-ish coords. NOTE: only the
+        /// INNER components of the edge-midpoints (base[1].x / base[7].x for
+        /// the top/bottom mids, base[3].y / base[5].y for the left/right mids)
+        /// and the CENTER point (base[4]) are actually used at render time —
+        /// `meshBody` pins the whole outer ring far outside the unit square
+        /// for over-cover (see the OVER-COVER note at the top of this file).
+        /// The corner entries and the outer-axis edge components are retained
+        /// only as documentation of each variant's original composition.
         let basePoints: [SIMD2<Float>]
         /// Indices into the breathing palette for each of the 9 grid slots.
         /// `0 = vibrantBlue, 1 = deepIndigo, 2 = magenta, 3 = lightPink,
@@ -200,53 +341,57 @@ struct AuroraBackground: View {
         let theta = (t.truncatingRemainder(dividingBy: cycleDuration)
                      / cycleDuration) * 2.0 * .pi
 
-        // Per-point phase/frequency so motion looks organic but still loops.
-        // Amplitudes are kept conservative (≤0.14 mid, ≤0.06 edge) so that
-        // when combined with the base point positions, no control point
-        // strays far outside [0,1]. MeshGradient tolerates a little overshoot
-        // (the corners sit at -0.05/1.05 by design to bleed color off-edge),
-        // but if a mid-point swings past ~-0.2 or 1.2 the gradient develops
-        // visible discontinuities — the "bugging out" the user reported.
-        let aMid: Float  = 0.14
-        let aEdge: Float = 0.06
+        // ---- Over-cover geometry (the clipping fix) ----
+        // A MeshGradient's COLORED FIELD only exists inside the convex hull of
+        // its outer control ring. The previous layout pinned the corners at
+        // only -0.05/1.05 and let the mid/edge points oscillate INWARD, so on
+        // some phases/palettes the field receded inside the capsule frame and
+        // the corners revealed the underlying material — the "clipping" the
+        // user saw. Overscan via scaleEffect was a partial patch.
+        //
+        // Fix: shove the ENTIRE outer ring (all 8 perimeter points) well
+        // outside the unit square so the field always extends past the visible
+        // capsule on every frame and every palette. Only the CENTER point
+        // breathes — the interior blobs still move, but the field never
+        // recedes. Geometry, not color, so this is palette-agnostic.
+        let outerLo: Float = -0.25   // corner outer coordinate (top/left)
+        let outerHi: Float =  1.25   // corner outer coordinate (bottom/right)
+        let edgeLo:  Float = -0.20   // edge-midpoint outer coordinate
+        let edgeHi:  Float =  1.20
 
-        // Middle point — biggest amplitude, the "anchor blob" we can see breathe.
+        // Center point — the only animated control point now. Keep the
+        // original conservative amplitude so the "anchor blob" still breathes.
+        // Because the whole outer ring sits far outside [0,1], the center can
+        // swing freely within the interior without ever creating a seam.
+        let aMid: Float = 0.14
         let mx = Float(sin(theta * 1.0 + 0.0)) * aMid
         let my = Float(cos(theta * 1.0 + 0.0)) * aMid * 0.85
-        // Mid-left and mid-right — slightly smaller, offset phases.
-        let lx = Float(sin(theta * 1.0 + 1.3)) * aMid * 0.75
-        let ly = Float(cos(theta * 1.0 + 0.8)) * aMid * 0.60
-        let rx = Float(sin(theta * 1.0 + 2.4)) * aMid * 0.75
-        let ry = Float(cos(theta * 1.0 + 1.9)) * aMid * 0.60
-        // Top and bottom edge mid-points — slow, low-amplitude wobble.
-        let tx = Float(sin(theta * 1.0 + 0.4)) * aEdge
-        let bx = Float(cos(theta * 1.0 + 1.7)) * aEdge
 
         // Pull the chosen variant. Bounds-checked via modulo in case the
         // variant count and the random range ever drift apart.
         let variant = Self.variants[variantIndex % Self.variants.count]
         let base = variant.basePoints
 
-        // Apply drift to the same positions the old code did:
-        //   row-1 cols 0/1/2 get lx/ly, mx/my, rx/ry
-        //   row-0 col 1 gets tx, row-2 col 1 gets bx
-        // Corner points stay exactly anchored so the rect always fills.
-        // Defensive clamp: keep every control point inside a slightly-padded
-        // unit square. Corners use [-0.05, 1.05] (intentional bleed); mid
-        // points are clamped to [-0.15, 1.15] so the drift can't ever push
-        // them into territory where MeshGradient produces visible glitches.
-        func clampMid(_ v: Float) -> Float { min(max(v, -0.15), 1.15) }
-        func clampEdge(_ v: Float) -> Float { min(max(v, -0.10), 1.10) }
+        // Build the grid. The outer ring's OUTER axis is pinned far outside
+        // the frame; we preserve each variant's INNER axis on the edge mids
+        // (e.g. base[1].x, base[7].x, base[3].y, base[5].y) so the per-variant
+        // colour sweep / anchor placement still reads. Only base[4] (center)
+        // gets the drift, then it's clamped to the interior as a guard.
+        //   [0]=TL [1]=TM [2]=TR
+        //   [3]=ML [4]=C  [5]=MR
+        //   [6]=BL [7]=BM [8]=BR
+        func clampCenter(_ v: Float) -> Float { min(max(v, 0.12), 0.88) }
         let points: [SIMD2<Float>] = [
-            base[0],
-            SIMD2(clampEdge(base[1].x + tx), base[1].y),
-            base[2],
-            SIMD2(clampMid(base[3].x + lx), clampMid(base[3].y + ly)),
-            SIMD2(clampMid(base[4].x + mx), clampMid(base[4].y + my)),
-            SIMD2(clampMid(base[5].x + rx), clampMid(base[5].y + ry)),
-            base[6],
-            SIMD2(clampEdge(base[7].x + bx), base[7].y),
-            base[8],
+            SIMD2(outerLo, outerLo),                       // TL
+            SIMD2(base[1].x, edgeLo),                      // TM (keep variant x, push y up)
+            SIMD2(outerHi, outerLo),                       // TR
+            SIMD2(edgeLo, base[3].y),                       // ML (push x left, keep variant y)
+            SIMD2(clampCenter(base[4].x + mx),
+                  clampCenter(base[4].y + my)),             // C  (the only breather)
+            SIMD2(edgeHi, base[5].y),                       // MR (push x right, keep variant y)
+            SIMD2(outerLo, outerHi),                        // BL
+            SIMD2(base[7].x, edgeHi),                       // BM (keep variant x, push y down)
+            SIMD2(outerHi, outerHi),                        // BR
         ]
 
         // Slow color breath — one full cycle per loop, so the colors also

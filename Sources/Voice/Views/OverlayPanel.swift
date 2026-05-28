@@ -18,9 +18,15 @@ class OverlayPanel: NSPanel {
     private let recordingState: RecordingState
 
     var onTap: (() -> Void)?
+    /// Polish closure carries the cleanup level: "light" / "medium" / "heavy".
+    var onPolish: ((String) -> Void)?
     var onCancel: (() -> Void)?
     var onConfirm: (() -> Void)?
     var onUndoCancel: (() -> Void)?
+    var onUndoPaste: (() -> Void)?
+    /// Called when the companion meeting dot is tapped during dictation,
+    /// or when any meeting-stop affordance in the pill fires.
+    var onStopMeeting: (() -> Void)?
 
     // NOTE: We no longer install `.mouseMoved` or `.keyDown/.flagsChanged` global
     // monitors. They fired at 60–200Hz on the main thread, dwarfing every other
@@ -41,6 +47,27 @@ class OverlayPanel: NSPanel {
     private var debugEnabled: Bool {
         UserDefaults.standard.bool(forKey: "voicePillDebug")
     }
+
+    /// User-selected horizontal anchor: "bottomLeft" | "bottomCenter" | "bottomRight".
+    /// Read live from UserDefaults so changes via the settings picker take effect
+    /// immediately (we observe didChangeNotification and reposition).
+    private var pillAnchor: String {
+        UserDefaults.standard.string(forKey: "voice.pillPosition") ?? "bottomCenter"
+    }
+
+    /// While the user is dragging the idle dot we snap-as-you-go: the cursor's
+    /// X position is bucketed into one of three zones (left/center/right third
+    /// of the active screen), and the panel commits to that anchor with a quick
+    /// spring as soon as the cursor crosses into a new zone. This anchor wins
+    /// over `pillAnchor` in computeTargetFrame() until the drag ends.
+    /// Reset to nil when the drag ends.
+    private var liveDragAnchor: String? = nil
+
+    /// Hysteresis: once the pill has snapped to an anchor mid-drag, require the
+    /// cursor to push this many points PAST the next boundary before snapping
+    /// to a neighbouring zone. Prevents flicker when the user hovers near a
+    /// zone boundary.
+    private let dragSnapHysteresis: CGFloat = 30
 
     // MARK: - Active-screen tracking
 
@@ -64,15 +91,41 @@ class OverlayPanel: NSPanel {
     // Display-link frame counter — skip odd frames to cap main-thread dispatches at ~30Hz.
     private var displayLinkFrameCounter: Int = 0
 
+    // Idle throttle: when the pill is idle and nothing is animating, skip all but
+    // 1 in 30 frames (≈1Hz at 60Hz vsync, ≈1Hz at 120Hz ProMotion) to minimise
+    // main-thread dispatch overhead. This is a 97% reduction vs the raw vsync
+    // rate and a 4× reduction vs the prior 4Hz setting. The pill's idle position
+    // only needs to track the Dock edge / screen layout, both of which change
+    // rarely; 1Hz is more than sufficient latency for that. Reset to 0 whenever
+    // the phase leaves idle or a forced reposition is requested.
+    private var idleFrameSkipCounter: Int = 0
+    private let idleFrameSkipRate: Int = 30  // fire 1 in every 30 eligible frames ≈ 1Hz
+
+    /// Set true by phase-change notifications so the display link does a full
+    /// target-frame check on the next tick even while idle. Cleared after the check.
+    private var needsReposition: Bool = false
+
     // Cached dock top edge — re-read at most every 3s (AX call is expensive at vsync rate).
     private var cachedDockTopEdge: CGFloat? = nil
     private var dockEdgeCachedAt: TimeInterval = 0
     private let dockEdgeCacheTTL: TimeInterval = 3.0
 
+    // Cached screen list — refreshed only on NSApplication.didChangeScreenParametersNotification.
+    // NSScreen.screens is a property that allocates a new array every call; calling it multiple
+    // times per display-link tick at 30 Hz produces measurable churn. One cached copy covers
+    // resolveActiveScreen(), computeTargetFrame(), and the intersects-any-screen guard.
+    private var cachedScreens: [NSScreen] = NSScreen.screens
+
     /// Periodic re-assert of front-most order while recording. Other apps
     /// occasionally push panels back even at high window levels — a cheap
     /// 5s tick keeps the pill on top without burning cycles when idle.
     private var topmostReassertTimer: Timer?
+
+    /// Periodic poll (every 3 s) that detects meeting apps even when the user
+    /// navigates to Meet/Zoom/Teams inside an already-frontmost browser window.
+    /// App-activation notifications only fire on an app switch, so we need this
+    /// to catch in-browser navigation (Chrome → new tab → meet.google.com).
+    private var meetingPollTimer: Timer?
 
     init(recordingState: RecordingState) {
         self.recordingState = recordingState
@@ -143,6 +196,102 @@ class OverlayPanel: NSPanel {
         topmostReassertTimer = nil
     }
 
+    // MARK: - Meeting detection poll
+
+    /// Start the 5 s poll. Fires immediately so the first detection doesn't
+    /// wait a full interval. Called once from `observeScreenChanges()`.
+    ///
+    /// 5 s vs the previous 3 s: the AX window-title check (used to detect
+    /// Google Meet / Zoom inside a browser tab) dispatches to a background
+    /// queue so it never blocks the main thread, but the GCD scheduling and
+    /// background work still consume CPU + power ~20 times per minute. At 5 s
+    /// that drops to 12 times per minute. Detection latency goes from ≤3 s to
+    /// ≤5 s — imperceptible for a "you just joined a meeting" trigger.
+    private func startMeetingPollTimer() {
+        guard meetingPollTimer == nil else { return }
+        meetingPollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            self.pollMeetingDetection()
+        }
+        // First check right now, don't wait 5 s.
+        pollMeetingDetection()
+    }
+
+    /// Check the current frontmost app for meeting activity.
+    /// Posts `voiceAutoStartMeeting` on a false → true transition only.
+    /// We do NOT auto-stop when the user switches windows — if they tab away
+    /// from Chrome while still in the meeting we'd kill the capture. The user
+    /// taps the pill (or the meeting ends deliberately) to stop.
+    ///
+    /// LATENCY FIX: The accessibility query inside `checkForMeetingApp` (used to
+    /// detect Meet/Zoom/Teams running inside a browser tab) is a synchronous
+    /// cross-process call that can take 50–300+ ms when the target app is busy.
+    /// Running that on the main thread every 3 s stalls hotkey events and pill
+    /// updates. We hop to a background queue for the AX read, then come back to
+    /// the main actor only to apply the state delta. The fast path (frontmost
+    /// app's bundleID is in the known meeting-app set) needs no AX call.
+    private func pollMeetingDetection() {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return }
+        // When Voice's own pill is frontmost, frontmostApplication returns Voice.
+        // Don't let that clear a previously-detected meeting app.
+        if app.bundleIdentifier == Bundle.main.bundleIdentifier { return }
+
+        // Capture pid + bundleID off the NSRunningApplication so the background
+        // queue doesn't have to touch it (NSRunningApplication is thread-safe
+        // for these properties but we avoid races by snapshotting).
+        let pid = app.processIdentifier
+        let bundleID = app.bundleIdentifier
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let (isMeeting, source) = self.detectMeetingForBundle(bundleID, pid: pid)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.recordingState.isMeetingAppActive = isMeeting
+                self.recordingState.meetingSourceBundleID = isMeeting ? source : nil
+                // Poll only updates tint state — auto-start is NOT triggered here.
+                // No auto-stop: user controls the end of the capture explicitly.
+            }
+        }
+    }
+
+    /// Background-safe meeting detection. Does the bundle-ID match (fast) and,
+    /// if `pid` belongs to a known browser, the AX window-title check (slow).
+    /// Returns (isMeeting, sourceBundleID).
+    nonisolated private func detectMeetingForBundle(_ bundleID: String?, pid: pid_t) -> (Bool, String?) {
+        let meetBundleIDs: Set<String> = [
+            "com.google.meet",
+            "us.zoom.xos",
+            "com.microsoft.teams2",
+            "com.microsoft.teams",
+            "com.apple.FaceTime",
+            "com.cisco.webex.meetings",
+        ]
+        if let bundleID, meetBundleIDs.contains(bundleID) {
+            return (true, bundleID)
+        }
+        let browserBundles: Set<String> = [
+            "com.google.Chrome",
+            "com.apple.Safari",
+            "company.thebrowser.Browser",
+            "org.mozilla.firefox",
+            "com.microsoft.edgemac",
+            "com.brave.Browser",
+        ]
+        guard let bundleID, browserBundles.contains(bundleID), AXIsProcessTrusted() else {
+            return (false, nil)
+        }
+        let axApp = AXUIElementCreateApplication(pid)
+        var windowValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &windowValue) == .success,
+              let window = windowValue else { return (false, nil) }
+        var titleValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(window as! AXUIElement, kAXTitleAttribute as CFString, &titleValue) == .success,
+              let title = titleValue as? String else { return (false, nil) }
+        let meetKeywords = ["Google Meet", "meet.google.com", "Zoom Meeting", "Microsoft Teams"]
+        return (meetKeywords.contains(where: { title.contains($0) }) ? (true, bundleID) : (false, nil))
+    }
+
     private func applyScreenCapturePolicy() {
         sharingType = hidePillFromScreenCapture ? .none : .readWrite
     }
@@ -155,11 +304,22 @@ class OverlayPanel: NSPanel {
         // view uses .contentShape(Capsule()) so only the visible pill area
         // captures hits; the surrounding panel padding stays click-through.
         switch phase {
-        case .idle, .recording, .transcribing, .polishingSelection:
+        case .recording, .transcribing, .polishingSelection:
+            // Status-display phases — clicks fall through to the app underneath.
             ignoresMouseEvents = true
-        case .locked, .cancelled:
-            // .locked has X/✓ buttons; .cancelled has an Undo button.
-            // Both need to capture clicks. .contentShape(Capsule()) on the
+        case .idle:
+            // IdlePill has a hover bar with Dictate + Polish buttons. Those
+            // need to receive click events. The Color.clear wrappers around
+            // the dot and inside the bar buttons use contentShape() so only
+            // the visible pixels capture hits — surrounding padding still
+            // falls through.
+            ignoresMouseEvents = false
+        case .meetingCapture:
+            // meetingCapture pill has a tap target (tap to stop the meeting).
+            ignoresMouseEvents = false
+        case .locked, .cancelled, .undoPaste:
+            // .locked has X/✓ buttons; .cancelled and .undoPaste each have an Undo button.
+            // All need to capture clicks. .contentShape(Capsule()) on the
             // pill view keeps the surrounding panel padding click-through.
             ignoresMouseEvents = false
         }
@@ -167,7 +327,7 @@ class OverlayPanel: NSPanel {
         switch phase {
         case .recording, .locked:
             beginTopmostReassert()
-        case .idle, .transcribing, .polishingSelection, .cancelled:
+        case .idle, .transcribing, .polishingSelection, .meetingCapture, .cancelled, .undoPaste:
             endTopmostReassert()
         }
 
@@ -206,6 +366,105 @@ class OverlayPanel: NSPanel {
                                           forKeyPath: "hidePillFromScreenCapture",
                                           options: [.new],
                                           context: nil)
+
+        // Start polling for meeting apps (catches in-browser navigation without
+        // an app-switch notification, e.g. Chrome → meet.google.com tab).
+        startMeetingPollTimer()
+
+        // Reposition when the user changes "voice.pillPosition" in Settings.
+        // UserDefaults.didChangeNotification fires for ANY default change — we
+        // accept that cost (it's cheap) rather than KVO each individual key.
+        nc.addObserver(self,
+                       selector: #selector(handlePillAnchorChanged),
+                       name: UserDefaults.didChangeNotification,
+                       object: nil)
+
+        // Real-time drag updates from the IdlePill DragGesture.
+        nc.addObserver(self,
+                       selector: #selector(handlePillDrag(_:)),
+                       name: Notification.Name("voice.pillDrag"),
+                       object: nil)
+        nc.addObserver(self,
+                       selector: #selector(handlePillDragEnd(_:)),
+                       name: Notification.Name("voice.pillDragEnd"),
+                       object: nil)
+    }
+
+    @objc private func handlePillAnchorChanged() {
+        // Cheap early-out: only reposition if we're not in the middle of a drag.
+        guard liveDragAnchor == nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.repositionImmediate(animated: true)
+        }
+    }
+
+    /// Snap-while-dragging. The cursor X (in global screen coords) is bucketed
+    /// into one of three zones on the screen the cursor is currently on. If the
+    /// resulting anchor differs from where the pill is right now, commit the
+    /// snap immediately with a quick spring + haptic. We do NOT track the
+    /// cursor 1:1 — the pill glides between three discrete positions.
+    @objc private func handlePillDrag(_ note: Notification) {
+        guard let x = note.userInfo?["screenX"] as? CGFloat else { return }
+
+        // Use the screen the cursor is on (handles multi-monitor drags).
+        let mouse = NSEvent.mouseLocation
+        let cursorScreen = cachedScreens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+            ?? resolveActiveScreen()
+        let screenW = cursorScreen.frame.width
+        let third = screenW / 3
+        let relX = x - cursorScreen.frame.minX
+
+        // Determine which anchor the cursor X maps to. Apply hysteresis: when
+        // a live drag anchor exists, widen the current zone by
+        // `dragSnapHysteresis` so the user has to push past the boundary to
+        // flip zones. Prevents flicker at the zone edges.
+        let current = liveDragAnchor ?? pillAnchor
+        let h = dragSnapHysteresis
+        let target: String
+        switch current {
+        case "bottomLeft":
+            if relX < third + h { target = "bottomLeft" }
+            else if relX < third * 2 + h { target = "bottomCenter" }
+            else { target = "bottomRight" }
+        case "bottomRight":
+            if relX >= third * 2 - h { target = "bottomRight" }
+            else if relX >= third - h { target = "bottomCenter" }
+            else { target = "bottomLeft" }
+        default: // bottomCenter — symmetric pull from both sides
+            if relX < third - h { target = "bottomLeft" }
+            else if relX < third * 2 + h { target = "bottomCenter" }
+            else { target = "bottomRight" }
+        }
+
+        // Initialise live anchor on first event of this drag. Only animate /
+        // commit when the target zone differs from the pill's current zone.
+        let priorAnchor = liveDragAnchor ?? pillAnchor
+        liveDragAnchor = target
+
+        if target != priorAnchor {
+            // Persist immediately so the Settings picker stays in sync.
+            UserDefaults.standard.set(target, forKey: "voice.pillPosition")
+            // Subtle tactile feedback on each zone snap.
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+            // Quick spring snap to the new corner.
+            DispatchQueue.main.async { [weak self] in
+                self?.repositionImmediate(animated: true)
+            }
+        } else if liveDragAnchor != nil && currentTargetFrame == .zero {
+            // First-event seed: ensure the panel frame matches the anchor.
+            DispatchQueue.main.async { [weak self] in
+                self?.repositionImmediate(animated: false)
+            }
+        }
+    }
+
+    @objc private func handlePillDragEnd(_ note: Notification) {
+        // Snap already happened during the drag — just clear transient state.
+        // The final anchor was written to UserDefaults on the last zone change.
+        liveDragAnchor = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.repositionImmediate(animated: true)
+        }
     }
 
     override func observeValue(forKeyPath keyPath: String?,
@@ -219,7 +478,8 @@ class OverlayPanel: NSPanel {
 
     @objc private func handleScreenParametersChanged() {
         DispatchQueue.main.async { [weak self] in
-            self?.cachedDockTopEdge = nil  // force re-read after screen change
+            self?.cachedScreens = NSScreen.screens  // refresh screen list cache
+            self?.cachedDockTopEdge = nil           // force re-read after screen change
             self?.restartDisplayLink()
             self?.repositionImmediate(animated: true)
         }
@@ -249,10 +509,24 @@ class OverlayPanel: NSPanel {
     @objc private func handleAppActivation(_ note: Notification) {
         // Record which screen the activated app sits on.
         let now = CACurrentMediaTime()
-        if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
-           let screen = screenForFrontmostWindow(of: app) {
-            lastAppActivationScreen = screen
-            lastAppActivationAt = now
+        if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+            if let screen = screenForFrontmostWindow(of: app) {
+                lastAppActivationScreen = screen
+                lastAppActivationAt = now
+            }
+            // Hop off-main for the AX-touching meeting detection — see
+            // pollMeetingDetection() for rationale.
+            let pid = app.processIdentifier
+            let bundleID = app.bundleIdentifier
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                let (isMeeting, source) = self.detectMeetingForBundle(bundleID, pid: pid)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.recordingState.isMeetingAppActive = isMeeting
+                    self.recordingState.meetingSourceBundleID = isMeeting ? source : nil
+                }
+            }
         }
         DispatchQueue.main.async { [weak self] in
             self?.repositionImmediate(animated: true)
@@ -268,9 +542,10 @@ class OverlayPanel: NSPanel {
     // MARK: - Signal seeding
 
     /// Polls NSEvent.mouseLocation on demand — cheap, no global monitor needed.
+    /// Uses `cachedScreens` to avoid allocating a new array per call.
     private func currentMouseScreen() -> NSScreen? {
         let mouse = NSEvent.mouseLocation
-        return NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
+        return cachedScreens.first(where: { NSMouseInRect(mouse, $0.frame, false) })
     }
 
     private func seedActiveScreenSignals() {
@@ -300,10 +575,10 @@ class OverlayPanel: NSPanel {
             // CG coords are top-left origin in the global display space.
             // Convert to NS coords (bottom-left) by flipping against the
             // total screen-space height.
-            let primary = NSScreen.screens.first?.frame ?? .zero
+            let primary = cachedScreens.first?.frame ?? .zero
             let nsY = primary.maxY - (y + height)
             let center = CGPoint(x: x + width / 2, y: nsY + height / 2)
-            if let s = NSScreen.screens.first(where: { NSMouseInRect(center, $0.frame, false) }) {
+            if let s = cachedScreens.first(where: { NSMouseInRect(center, $0.frame, false) }) {
                 return s
             }
         }
@@ -326,8 +601,9 @@ class OverlayPanel: NSPanel {
             candidates.append((dyn, 0))
         }
 
-        // Drop nils / disconnected screens.
-        let attached = NSScreen.screens
+        // Drop nils / disconnected screens. Use the cached list — NSScreen.screens
+        // allocates a new array on every call; at 30 Hz this adds up fast.
+        let attached = cachedScreens
         candidates = candidates.filter { c in attached.contains(where: { $0 === c.screen }) }
 
         // Pick freshest.
@@ -349,7 +625,7 @@ class OverlayPanel: NSPanel {
             return sticky
         }
 
-        let chosen = freshest ?? NSScreen.main ?? NSScreen.screens.first!
+        let chosen = freshest ?? NSScreen.main ?? cachedScreens.first ?? NSScreen.screens.first!
         stickyScreen = chosen
         stickySetAt = now
         return chosen
@@ -436,7 +712,21 @@ class OverlayPanel: NSPanel {
             y = screen.visibleFrame.minY
         }
 
-        let x = screen.frame.midX - panelWidth / 2
+        // Horizontal anchor — bottomCenter (default), bottomLeft, bottomRight.
+        // While the user is actively dragging the idle dot, `liveDragAnchor`
+        // wins (snap-while-dragging — the pill glides between the three
+        // discrete corners rather than tracking the cursor 1:1).
+        let margin: CGFloat = 40
+        let effectiveAnchor = liveDragAnchor ?? pillAnchor
+        let x: CGFloat
+        switch effectiveAnchor {
+        case "bottomLeft":
+            x = screen.frame.minX + margin
+        case "bottomRight":
+            x = screen.frame.maxX - panelWidth - margin
+        default:
+            x = screen.frame.midX - panelWidth / 2
+        }
 
         if debugEnabled, lastDockHiddenLogged != dockHidden {
             print("[VOICE/dbg] screen=\(screen.localizedName) dockHidden=\(dockHidden) y=\(Int(y))")
@@ -446,12 +736,32 @@ class OverlayPanel: NSPanel {
         return NSRect(x: x, y: y, width: panelWidth, height: panelHeight)
     }
 
+    /// True when the pill is in the idle phase — mirrors `rawPhase` from OverlayPillView
+    /// but computed directly from RecordingState so the panel can check it without
+    /// touching any SwiftUI state. Used to throttle the display link at idle AND
+    /// to shrink the hit-test band so the idle dot doesn't intercept clicks
+    /// across a wide invisible strip.
+    var isIdlePhase: Bool {
+        !recordingState.pendingRecordingStart &&
+        !recordingState.isTranscribing &&
+        !(recordingState.isLocked && recordingState.isRecording) &&
+        !recordingState.isRecording &&
+        !recordingState.isPolishingSelection &&
+        !recordingState.showingCancelledToast &&
+        !recordingState.showingUndoPasteToast
+    }
+
     /// Immediate reposition — used for notifications. Bypasses display-link
     /// throttle and animates if requested.
     private func repositionImmediate(animated: Bool) {
+        // Signal the display link to do a full frame check on the next tick
+        // even if we're currently throttled (idle rate). This covers cases
+        // like space-change or screen-parameter-change where the pill needs
+        // to snap to a new position even while idle.
+        needsReposition = true
         let target = computeTargetFrame()
 
-        let intersectsAnyScreen = NSScreen.screens.contains { $0.frame.intersects(target) }
+        let intersectsAnyScreen = cachedScreens.contains { $0.frame.intersects(target) }
         guard intersectsAnyScreen else {
             if debugEnabled { print("[VOICE/dbg] target offscreen, skip: \(target)") }
             return
@@ -484,6 +794,27 @@ class OverlayPanel: NSPanel {
     /// SwiftUI re-render — directly calling setFrame from there crashes with
     /// `_postWindowNeedsUpdateConstraints` on macOS 26.
     fileprivate func displayLinkTick() {
+        // IDLE EARLY-EXIT: the CVDisplayLink callback already throttles dispatch
+        // to ~4Hz when idle. But if we're here AND idle, do a cheap short-circuit:
+        // if the frame hasn't moved, skip all the downstream work immediately.
+        // This costs one frame-comparison per 4Hz tick instead of the full
+        // resolveActiveScreen + computeTargetFrame path.
+        if isIdlePhase {
+            needsReposition = false
+            let cur = self.frame
+            // Only run the full target computation if we don't already know the frame is current.
+            // currentTargetFrame is updated by repositionImmediate so it tracks the last known good position.
+            let cached = currentTargetFrame
+            if cached != .zero &&
+               abs(cached.minX - cur.minX) < 0.5 &&
+               abs(cached.minY - cur.minY) < 0.5 &&
+               abs(cached.height - cur.height) < 0.5 {
+                return
+            }
+        } else {
+            needsReposition = false
+        }
+
         let target = computeTargetFrame()
         let cur = self.frame
         let dx = abs(target.minX - cur.minX)
@@ -491,7 +822,7 @@ class OverlayPanel: NSPanel {
         let dh = abs(target.height - cur.height)
         if dx < 0.5 && dy < 0.5 && dh < 0.5 { return }
 
-        let intersectsAnyScreen = NSScreen.screens.contains { $0.frame.intersects(target) }
+        let intersectsAnyScreen = cachedScreens.contains { $0.frame.intersects(target) }
         guard intersectsAnyScreen else { return }
 
         currentTargetFrame = target
@@ -542,6 +873,17 @@ class OverlayPanel: NSPanel {
             // the AX dock-edge API — causing measurable click and audio latency.
             panel.displayLinkFrameCounter &+= 1
             guard panel.displayLinkFrameCounter % 2 == 0 else { return kCVReturnSuccess }
+            // Additional idle throttle at the callback level: when the pill is
+            // idle and no reposition is pending, skip 7 out of 8 eligible frames
+            // (≈4Hz). This avoids even the DispatchQueue.main.async overhead for
+            // the skipped frames — the cheapest possible no-op.
+            if panel.isIdlePhase && !panel.needsReposition {
+                panel.idleFrameSkipCounter &+= 1
+                guard panel.idleFrameSkipCounter >= panel.idleFrameSkipRate else { return kCVReturnSuccess }
+                panel.idleFrameSkipCounter = 0
+            } else {
+                panel.idleFrameSkipCounter = 0
+            }
             DispatchQueue.main.async { panel.displayLinkTick() }
             return kCVReturnSuccess
         }, opaque)
@@ -583,9 +925,12 @@ class OverlayPanel: NSPanel {
             rootView: OverlayPillView(
                 state: recordingState,
                 onTap: { [weak self] in self?.onTap?() },
+                onPolish: { [weak self] level in self?.onPolish?(level) },
                 onCancel: { [weak self] in self?.onCancel?() },
                 onConfirm: { [weak self] in self?.onConfirm?() },
                 onUndoCancel: { [weak self] in self?.onUndoCancel?() },
+                onUndoPaste: { [weak self] in self?.onUndoPaste?() },
+                onStopMeeting: { [weak self] in self?.onStopMeeting?() },
                 onPhaseChange: { [weak self] phase in
                     self?.applyClickThroughPolicy(phase: phase)
                 }
@@ -644,7 +989,7 @@ private final class PillHostingView<Content: View>: NSHostingView<Content> {
     // enough to never clip a real interactive control, tight enough that all
     // the click-through padding goes to the app below.
     private let visibleBandHeight: CGFloat = 34
-    private let visibleBandWidth: CGFloat = 170
+    private let visibleBandWidth: CGFloat = 176
 
     required init(rootView: Content) {
         super.init(rootView: rootView)
@@ -672,10 +1017,23 @@ private final class PillHostingView<Content: View>: NSHostingView<Content> {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         let bounds = self.bounds
-        let bandX = (bounds.width - visibleBandWidth) / 2
-        let bandY: CGFloat = (bounds.height > visibleBandHeight + 6) ? 4 : 0
-        let bandHeight = max(visibleBandHeight, bounds.height - bandY)
-        let band = NSRect(x: bandX, y: bandY, width: visibleBandWidth, height: bandHeight)
+        // Idle phase: shrink the hit-test band to roughly the dot's frame plus
+        // a generous halo. The halo matters for drag UX — once mouseDown lands
+        // on the dot, the user immediately moves the cursor sideways to corner-
+        // snap, and AppKit re-runs hitTest along the way. Too tight a band and
+        // the drag gets interrupted as the cursor exits. Active states keep
+        // the full 176×34 band.
+        //
+        // Halo size: ≥ visibleBandWidth horizontally so a drag spans the full
+        // width of the panel, ≥ visibleBandHeight vertically so the hover bar
+        // ABOVE the dot is also hittable (Polish buttons live there).
+        let isIdle = (self.window as? OverlayPanel)?.isIdlePhase ?? false
+        let bandW: CGFloat = visibleBandWidth
+        let bandH: CGFloat = visibleBandHeight
+        let bandX = (bounds.width - bandW) / 2
+        let bandY: CGFloat = (bounds.height > bandH + 6) ? 4 : 0
+        let bandHeight = isIdle ? bandH : max(bandH, bounds.height - bandY)
+        let band = NSRect(x: bandX, y: bandY, width: bandW, height: bandHeight)
         // Quick reject — point is in the dead padding. AppKit will forward the
         // click to whatever window is underneath.
         guard band.contains(point) else { return nil }
@@ -691,7 +1049,9 @@ enum PillPhase: Equatable {
     case locked           // 2x click mode
     case transcribing
     case polishingSelection  // Opt+1 flow — polishing externally selected text
-    case cancelled        // toast
+    case meetingCapture   // Google Meet / Zoom / Teams meeting recording
+    case cancelled        // cancelled toast (Undo cancel)
+    case undoPaste        // successful-paste toast (Undo paste)
 }
 
 // MARK: - Pill View
@@ -700,9 +1060,13 @@ struct OverlayPillView: View {
     @Bindable var state: RecordingState
 
     var onTap: (() -> Void)?
+    /// Polish closure carries the cleanup level: "light" / "medium" / "heavy".
+    var onPolish: ((String) -> Void)?
     var onCancel: (() -> Void)?
     var onConfirm: (() -> Void)?
     var onUndoCancel: (() -> Void)?
+    var onUndoPaste: (() -> Void)?
+    var onStopMeeting: (() -> Void)?
     var onPhaseChange: ((PillPhase) -> Void)?
 
     /// Phase priority. Order matters — `transcribing` must win over a stale
@@ -725,13 +1089,45 @@ struct OverlayPillView: View {
         if state.isRecording { return .recording }
         // polishingSelection: added by another agent — check defensively.
         if state.isPolishingSelection { return .polishingSelection }
+        // isCapturingMeeting no longer drives .meetingCapture — meeting is shown
+        // via MeetingRecordingDot overlay on top of whatever the active phase is.
         if state.showingCancelledToast { return .cancelled }
+        if state.showingUndoPasteToast { return .undoPaste }
         return .idle
     }
 
     @State private var displayPhase: PillPhase = .idle
     @State private var lastLoggedPhase: PillPhase = .idle
     @State private var settlingTask: Task<Void, Never>?
+    /// Independently-animated offset for the meeting dot. Driven by a separate
+    /// withAnimation so it always springs even when the pill snaps instantly
+    /// (e.g. idle → recording uses nil animation for zero-latency hotkey feel).
+    @State private var meetingDotAnimatedOffset: CGFloat = 0
+
+    /// Transient engine toast — captures the engine + latency of the last
+    /// polish so the user can SEE which model actually ran on every paste,
+    /// not just guess from the cloud/cpu/sparkles glyph during the in-flight
+    /// window. Driven by NotificationCenter.voicePolishComplete (posted by
+    /// PolishStatus.record) and falls back to .onChange(lastEngine) for the
+    /// transitional period before Qwen3Polisher is wired through record().
+    @State private var engineToastSnapshot: EngineToastSnapshot?
+    @State private var engineToastShownAt: Date?
+    @State private var engineToastDismissTask: Task<Void, Never>?
+    @State private var engineToastDetailsOpen: Bool = false
+    /// Mirror of PolishStatus.lastEngine so .onChange can detect updates even
+    /// when the value transitions from nil → "local:..." (Observable bindings
+    /// only fire onChange when the new value differs from the previous).
+    @State private var lastObservedEngine: String?
+    /// Power-user setting: when ON, an always-visible chip displays the last
+    /// polish engine + latency in the corner of the pill (and never auto-
+    /// dismisses). Default OFF — diagnostic affordance only.
+    @AppStorage("voice.showEnginePill") private var showEnginePill: Bool = false
+
+    /// Namespace for Liquid Glass morph between pill phases. Each phase pill
+    /// shares the same glassEffectID inside a GlassEffectContainer — when one
+    /// pill disappears and another appears, the system interpolates the glass
+    /// surface between their shapes instead of cross-fading.
+    @Namespace private var pillGlassNamespace
 
     // Per-edge animation specs. The single-spring approach (one curve for
     // every transition) reads as "the pill is animating" rather than "the
@@ -744,75 +1140,190 @@ struct OverlayPillView: View {
     //   - transcribing → idle: easeOut 0.25 — non-urgent "done"
     //   - cancelled → idle:    easeOut 0.35 — give user time to register
     //   - everything else:     a calm phaseSpring for ambient transitions
-    private let phaseSpring          = Animation.spring(response: 0.22, dampingFraction: 0.88)
-    private let recordingToLocked    = Animation.spring(response: 0.32, dampingFraction: 0.78)
-    private let recordingToTranscribe = Animation.spring(response: 0.28, dampingFraction: 0.82)
-    private let transcribeToIdle     = Animation.easeOut(duration: 0.25)
-    private let cancelledToIdle      = Animation.easeOut(duration: 0.35)
+    // Springs tuned for Liquid Glass morph — bouncier than before so the
+    // glass surface visibly springs into the new shape. Apple's .bouncy and
+    // .snappy curves are what Tahoe uses internally for glass transitions.
+    private let phaseSpring          = Animation.spring(response: 0.32, dampingFraction: 0.72)
+    private let recordingToLocked    = Animation.spring(response: 0.38, dampingFraction: 0.68)
+    private let recordingToTranscribe = Animation.spring(response: 0.34, dampingFraction: 0.74)
+    private let transcribeToIdle     = Animation.spring(response: 0.40, dampingFraction: 0.80)
+    private let cancelledToIdle      = Animation.spring(response: 0.45, dampingFraction: 0.82)
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            switch displayPhase {
-            case .idle:
-                IdlePill(onTap: { onTap?() })
-                    .transition(growFromBottom)
-            case .recording:
-                // NO transition into recording — the user pressed the hotkey
-                // and needs visual confirmation on the SAME frame. Any spring
-                // or fade here reads as "the app is slow". Removal still uses
-                // the standard transition (handled by the outgoing phase).
-                // BUGFIX: removed `.id(displayPhase)` — it forced SwiftUI to
-                // tear down and rebuild the RecordingPill on every parent
-                // re-render that touched displayPhase, which manifested as
-                // the occasional gradient "glitch" (AuroraBackground inside
-                // GlassCapsule remounted, re-running its onAppear and
-                // re-seeding the TimelineView phase). The switch case itself
-                // already provides correct identity per phase.
-                RecordingPill(state: state)
-                    .transition(.identity)
-            case .locked:
-                LockedPill(
-                    state: state,
-                    onCancel: { onCancel?() },
-                    onConfirm: { onConfirm?() }
-                )
-                .transition(growFromBottom)
-            case .transcribing:
-                TranscribingPill()
-                    .transition(growFromBottom)
-            case .polishingSelection:
-                PolishingSelectionPill()
-                    .transition(growFromBottom)
-            case .cancelled:
-                CancelledToast(
-                    shownAt: state.cancelToastShownAt ?? Date(),
-                    onUndo: { onUndoCancel?() }
-                )
-                .transition(crossFade)
+            // Side meeting dot removed — user found it visually noisy. Meeting
+            // state is already surfaced by the menu bar icon + Meetings tab in
+            // BigMenu, so the offset companion dot was redundant ornament.
+            // ── Main pill ────────────────────────────────────────────────────
+            // Dynamic-Island-style morph: GlassEffectContainer flattens all
+            // child glass shapes into one shared surface so the pill morphs
+            // between phases — not a cross-fade. The container's `spacing`
+            // is the merge distance: anything closer than this pulls toward
+            // its neighbor with surface tension during the transition.
+            //
+            // Per-case `.transition()` modifiers used to fight the morph by
+            // specifying their own appear/disappear curves — they're gone.
+            // Now each pill is a child of the container with the same
+            // glassEffectID, and the container does the morphing.
+            GlassEffectContainer(spacing: 36) {
+                switch displayPhase {
+                case .idle:
+                    if !state.isCapturingMeeting {
+                        IdlePill(
+                            onTap: { onTap?() },
+                            onPolish: { level in onPolish?(level) }
+                        )
+                        .glassEffectID("pill", in: pillGlassNamespace)
+                    }
+                case .recording:
+                    RecordingPill(state: state)
+                        .glassEffectID("pill", in: pillGlassNamespace)
+                case .locked:
+                    LockedPill(
+                        state: state,
+                        onCancel: { onCancel?() },
+                        onConfirm: { onConfirm?() }
+                    )
+                    .glassEffectID("pill", in: pillGlassNamespace)
+                case .transcribing:
+                    TranscribingPill()
+                        .glassEffectID("pill", in: pillGlassNamespace)
+                case .polishingSelection:
+                    PolishingSelectionPill()
+                        .glassEffectID("pill", in: pillGlassNamespace)
+                case .meetingCapture:
+                    EmptyView()
+                case .cancelled:
+                    CancelledToast(
+                        shownAt: state.cancelToastShownAt ?? Date(),
+                        onUndo: { onUndoCancel?() }
+                    )
+                    .glassEffectID("pill", in: pillGlassNamespace)
+                case .undoPaste:
+                    UndoPasteToast(
+                        shownAt: state.undoPasteToastShownAt ?? Date(),
+                        onUndo: { onUndoPaste?() }
+                    )
+                    .glassEffectID("pill", in: pillGlassNamespace)
+                }
             }
+            // Drive every phase change with a single bouncy spring so the
+            // glass surface morphs visibly — this is what makes it read as
+            // a Dynamic-Island-like pill instead of a generic SwiftUI fade.
+            .animation(.bouncy(duration: 0.42, extraBounce: 0.12), value: displayPhase)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .padding(.bottom, 6)
-        // Subtle scale: idle state contracts slightly (0.96) so transitions
-        // INTO active states feel like a physical "pop". The scale animates
-        // implicitly as part of the explicit `withAnimation` block driving
-        // `displayPhase` in applyPhase — no `.animation(_:value:)` modifier
-        // here, which would otherwise compete with that block and produce
-        // double-animation jank on every phase commit.
         .scaleEffect(displayPhase == .idle ? 0.96 : 1.0)
-        // Constrain hit-testing to the visible capsule. The 180x56 panel has
-        // ~60pt of empty space around the actual pill; without this, that
-        // padding still captures clicks when ignoresMouseEvents=false.
         .contentShape(Capsule())
-        // No static `.animation` modifier here — each phase commit drives its
-        // own withAnimation block so we can choose snap vs. spring per direction.
-        .onAppear { applyPhase(rawPhase, immediate: true) }
+        // Engine toast — overlays just above the pill, fades in/out after every
+        // polish completes. Tappable for details popover. See EnginePolishToast
+        // for the layout. Sits in an overlay so it doesn't fight the
+        // GlassEffectContainer morph happening below.
+        .overlay(alignment: .top) {
+            if let snapshot = engineToastSnapshot, let shownAt = engineToastShownAt {
+                EnginePolishToast(
+                    snapshot: snapshot,
+                    shownAt: shownAt,
+                    detailsOpen: $engineToastDetailsOpen,
+                    onTap: {
+                        // Keep the toast alive while details popover is open —
+                        // cancel any pending auto-dismiss the moment the user
+                        // shows interest.
+                        engineToastDismissTask?.cancel()
+                        engineToastDismissTask = nil
+                        engineToastDetailsOpen.toggle()
+                    }
+                )
+                .offset(y: -34)  // float above the pill body
+                .transition(.asymmetric(
+                    insertion: .opacity.combined(with: .move(edge: .bottom)),
+                    removal: .opacity
+                ))
+                .zIndex(10)
+            }
+        }
+        // Persistent debug chip — always-visible last-engine indicator gated
+        // by the @AppStorage flag. Sits to the right of the pill so it never
+        // overlaps the dynamic-island morph.
+        .overlay(alignment: .topTrailing) {
+            if showEnginePill {
+                EnginePolishDebugChip()
+                    .offset(x: -8, y: -4)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onAppear {
+            applyPhase(rawPhase, immediate: true)
+            meetingDotAnimatedOffset = meetingDotOffsetX(for: rawPhase)
+            // Seed the engine mirror so we don't fire the toast on first launch.
+            lastObservedEngine = PolishStatus.shared.lastEngine
+        }
         .onChange(of: rawPhase) { _, newPhase in applyPhase(newPhase, immediate: false) }
         .onChange(of: displayPhase) { old, new in
-            // Debug-gated. The pill ticks through many phase transitions per
-            // recording and the firehose drowns out real signal at runtime.
             if UserDefaults.standard.bool(forKey: "voicePillDebug") {
                 print("[VOICE-PILL/dbg] \(old) -> \(new) @ \(Date().timeIntervalSinceReferenceDate)")
+            }
+        }
+        // Primary trigger: PolishStatus.record() posts this notification after
+        // updating its main-actor state. Includes Qwen3Polisher direct-write
+        // updates ONCE the routing agent migrates those sites to record().
+        .onReceive(NotificationCenter.default.publisher(for: .voicePolishComplete)) { _ in
+            presentEngineToast()
+        }
+        // Fallback trigger: until every polish path calls PolishStatus.record(),
+        // Qwen3Polisher still writes lastEngine directly. Catch those updates
+        // by observing the field on the @Observable singleton. Re-firing the
+        // toast on the same engine value (e.g. two consecutive local polishes)
+        // is fine — we always snapshot a fresh timestamp.
+        .onChange(of: PolishStatus.shared.lastEngine) { _, newValue in
+            // Skip the first transition from the @State seed so we don't fire
+            // a phantom toast right after the view mounts.
+            if newValue != lastObservedEngine {
+                lastObservedEngine = newValue
+                presentEngineToast()
+            }
+        }
+    }
+
+    /// Capture the current PolishStatus snapshot and present the engine toast.
+    /// Schedules auto-dismiss after 2s unless the user opens the details popover.
+    private func presentEngineToast() {
+        let status = PolishStatus.shared
+        guard let engine = status.lastEngine, !engine.isEmpty else { return }
+        // Resolve latency: prefer the value PolishStatus records, fall back to
+        // the per-polisher singleton based on the engine prefix so we still
+        // show something honest before Qwen3Polisher is migrated.
+        let latencyMs: Int = {
+            if status.lastLatencyMs > 0 { return status.lastLatencyMs }
+            if engine.hasPrefix("cloud:groq") { return GroqPolisher.shared.lastLatencyMs }
+            if engine.hasPrefix("cloud:") { return CerebrasPolisher.shared.lastLatencyMs }
+            if engine.hasPrefix("local:") { return Qwen3Polisher.shared.lastLatencyMs }
+            return 0
+        }()
+        let snapshot = EngineToastSnapshot(
+            engine: engine,
+            latencyMs: latencyMs,
+            reason: status.lastReason,
+            inputWordCount: status.lastInputWordCount,
+            outputWordCount: status.lastOutputWordCount,
+            fallbackCount: status.lastFallbackCount,
+            sanitizerRejected: status.lastSanitizerRejected
+        )
+        withAnimation(.easeOut(duration: 0.22)) {
+            engineToastSnapshot = snapshot
+            engineToastShownAt = Date()
+            engineToastDetailsOpen = false
+        }
+        engineToastDismissTask?.cancel()
+        engineToastDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            if Task.isCancelled { return }
+            // Don't dismiss out from under an open details popover.
+            if engineToastDetailsOpen { return }
+            withAnimation(.easeIn(duration: 0.30)) {
+                engineToastSnapshot = nil
+                engineToastShownAt = nil
             }
         }
     }
@@ -821,19 +1332,23 @@ struct OverlayPillView: View {
         settlingTask?.cancel()
         settlingTask = nil
 
-        let commit: (PillPhase, Animation?) -> Void = { newValue, anim in
+        let commit: (PillPhase, Animation?) -> Void = { newValue, _ in
             if newValue != lastLoggedPhase {
                 if UserDefaults.standard.bool(forKey: "voicePillDebug") {
                     print("[VOICE/dbg] Pill phase: \(lastLoggedPhase) -> \(newValue)")
                 }
                 lastLoggedPhase = newValue
             }
-            if let anim {
-                withAnimation(anim) {
-                    displayPhase = newValue
-                }
-            } else {
-                displayPhase = newValue
+            // Just assign — the GlassEffectContainer has a `.animation(.bouncy,
+            // value: displayPhase)` modifier that drives the morph. Wrapping
+            // the assignment in withAnimation here fought the container's
+            // animation and produced a cross-fade instead of a glass morph.
+            displayPhase = newValue
+            // Meeting dot offset still animates separately so the dot springs
+            // even if the pill morph is happening on the container's clock.
+            let targetDotOffset = meetingDotOffsetX(for: newValue)
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.80)) {
+                meetingDotAnimatedOffset = targetDotOffset
             }
             onPhaseChange?(newValue)
         }
@@ -848,9 +1363,11 @@ struct OverlayPillView: View {
             let origin = displayPhase
             let idleAnim: Animation
             switch origin {
-            case .cancelled:    idleAnim = cancelledToIdle
-            case .transcribing: idleAnim = transcribeToIdle
-            default:            idleAnim = phaseSpring
+            case .cancelled:      idleAnim = cancelledToIdle
+            case .undoPaste:      idleAnim = cancelledToIdle
+            case .transcribing:   idleAnim = transcribeToIdle
+            case .meetingCapture: idleAnim = transcribeToIdle
+            default:              idleAnim = phaseSpring
             }
             settlingTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 300_000_000)
@@ -878,26 +1395,66 @@ struct OverlayPillView: View {
         }
     }
 
-    private var growFromBottom: AnyTransition {
-        .asymmetric(
-            insertion: .scale(scale: 0.88, anchor: .bottom)
-                .combined(with: .opacity),
-            removal: .scale(scale: 1.06, anchor: .bottom)
-                .combined(with: .opacity)
-        )
+    // MARK: - Meeting dot positioning
+    //
+    // Half-widths used to compute where the meeting dot sits, just to the
+    // right of whatever pill is currently on screen. Values reflect the
+    // actual pill structs in this file (not their visible mid-animation
+    // sizes — these are the steady-state widths).
+    private func pillHalfWidth(for phase: PillPhase) -> CGFloat {
+        switch phase {
+        case .idle:               return 7    // 14pt idle dot
+        case .recording:          return 58   // ~116pt: waveform 88 + h-padding 14*2
+        case .locked:
+            // The locked pill's controls row is ~144pt steady-state, but when a
+            // live-partial preview is showing the VStack's text area pushes the
+            // GlassCapsule background wider as the wrapped text fills more of
+            // the panel. Eyeballed bump keeps the dot clear of the partial
+            // preview's right edge without overlapping it.
+            let base: CGFloat = 72
+            return state.livePartialText.isEmpty ? base : base + 8
+        case .transcribing:       return 20   // 40pt fixed frame
+        case .polishingSelection: return 50   // ~100pt: ring + "Polishing" text + padding
+        case .meetingCapture:     return 50   // legacy dead case
+        case .cancelled:          return 82   // ~164pt: "Cancelled" + Undo capsule + padding
+        case .undoPaste:          return 72   // ~144pt: Undo capsule + padding
+        }
     }
 
-    private var crossFade: AnyTransition {
-        .asymmetric(
-            insertion: .opacity,
-            removal: .opacity
-        )
+    /// Where to place the persistent meeting dot horizontally. Centered while
+    /// idle (it IS the idle pill); otherwise just right of the visible pill.
+    /// Clamped so the visible dot stays inside the 180pt panel band and within
+    /// the 170pt hit-test band (PillHostingView.visibleBandWidth). Max safe
+    /// center offset = (170 - dotSize) / 2 → ~77pt for the 16pt companion dot.
+    /// Parameterised version used by both the computed var and the commit closure.
+    private func meetingDotOffsetX(for phase: PillPhase) -> CGFloat {
+        if phase == .idle { return 0 }
+        let dotSize: CGFloat = 16
+        let gap: CGFloat = 8
+        let dotHalf: CGFloat = dotSize / 2
+        let raw = pillHalfWidth(for: phase) + gap + dotHalf
+        let maxOffset: CGFloat = (170 - dotSize) / 2
+        return min(raw, maxOffset)
+    }
+
+    private var meetingDotOffsetX: CGFloat { meetingDotOffsetX(for: displayPhase) }
+
+    /// Slightly larger as the standalone idle indicator, smaller as a
+    /// companion alongside an active pill.
+    private var meetingDotSize: CGFloat {
+        displayPhase == .idle ? 20 : 16
     }
 }
 
 // MARK: - Shared glass surface
 
-private struct GlassCapsule: View {
+/// View-modifier version of GlassCapsule. We expose this as a modifier
+/// (not a background view) because GlassEffectContainer needs the .glassEffect
+/// to live on the SAME view node as the .glassEffectID. Previously the glass
+/// surface was buried inside GlassCapsule.body — the container couldn't see
+/// it through the .background() layer and fell back to crossfade between
+/// pill phases. Now the glass applies directly to the content view.
+private struct GlassCapsuleModifier: ViewModifier {
     var fillOpacity: Double = 0.55
     var glowLevel: CGFloat = 0
 
@@ -906,77 +1463,81 @@ private struct GlassCapsule: View {
     private var glowRadius: CGFloat { min(glowLevel * 12, 9) }
     private var glowOpacity: Double { min(Double(glowLevel) * 0.40, 0.16) }
 
-    var body: some View {
-        Capsule(style: .continuous)
-            .fill(.ultraThinMaterial)
-            .overlay(
-                Group {
-                    if pillSkin == "niche" {
-                        // The aurora mesh control points oscillate (amp 0.14 mid,
-                        // 0.06 edge) AND the corner points sit at -0.05 / 1.05.
-                        // Combined, the leftmost middle control point can swing
-                        // to ~-0.16 — outside the unit square. Add a generous
-                        // overscan via NEGATIVE padding so the gradient is laid
-                        // out in a frame ~8pt larger on each side than the
-                        // visible capsule. Then scale 1.35× (keeps the
-                        // off-center indigo blob inside the thin visible band)
-                        // and clip AFTER both — so the visible capsule is the
-                        // only mask, never the gradient's own frame. Order is
-                        // critical: padding (grow) → scaleEffect → clipShape.
-                        AuroraBackground()
-                            .padding(-8)
-                            .scaleEffect(1.35)
-                            .clipShape(Capsule(style: .continuous))
-                            // drawingGroup AFTER clipShape — rasterizes the
-                            // already-clipped gradient into a Metal layer.
-                            // If it ran before the clip (inside AuroraBackground),
-                            // the flat texture's edges didn't anti-alias with
-                            // the capsule path, causing the clipping glitch.
-                            .drawingGroup(opaque: false)
-                            .allowsHitTesting(false)
-                    } else {
-                        Capsule(style: .continuous)
-                            .fill(Color.black.opacity(fillOpacity))
-                    }
-                }
-            )
-            .overlay(
-                // Niche-only top sheen: subtle white highlight band across
-                // the top of the capsule sells the "glass over color" read.
-                Group {
-                    if pillSkin == "niche" {
-                        Capsule(style: .continuous)
-                            .fill(
-                                LinearGradient(
-                                    stops: [
-                                        .init(color: Color.white.opacity(0.22), location: 0.0),
-                                        .init(color: Color.white.opacity(0.0),  location: 0.45)
-                                    ],
-                                    startPoint: .top,
-                                    endPoint: .bottom
-                                )
-                            )
-                            .blendMode(.plusLighter)
-                            .allowsHitTesting(false)
-                    }
-                }
-            )
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: pillSkin == "niche"
-                                ? [Color.white.opacity(0.55), Color.white.opacity(0.12)]
-                                : [Color.white.opacity(0.36), Color.white.opacity(0.06)],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: pillSkin == "niche" ? 0.75 : 0.6
-                    )
-            )
-            .shadow(color: .white.opacity(glowOpacity), radius: glowRadius, y: 0)
-            .animation(.easeOut(duration: 0.06), value: glowRadius)
-            .animation(.easeOut(duration: 0.06), value: glowOpacity)
+    /// Skin classification — only three. Glass (default), Black, Niche.
+    /// - `glass`: native Liquid Glass with a subtle dark tint so the
+    ///   waveform and text on top stay readable over any wallpaper
+    /// - `black`: solid matte black, no refraction
+    /// - `aurora(.iris)`: niche pink/indigo aurora mesh
+    private enum SkinKind { case aurora(AuroraPalette), black, glass }
+    private var skinKind: SkinKind {
+        switch pillSkin {
+        case "black":  return .black
+        case "niche":  return .aurora(.iris)
+        // Default + glass + anything else → Glass. Glass is the new default.
+        default:       return .glass
+        }
+    }
+
+    func body(content: Content) -> some View {
+        switch skinKind {
+        case .glass:
+            // Glass applies DIRECTLY to the content view — this is the
+            // critical structural change. GlassEffectContainer + glassEffectID
+            // can now see this glass surface at the outer level (same view
+            // node as the .glassEffectID modifier on the pill). Previously
+            // the glass was inside a .background() and the container couldn't
+            // morph between phases.
+            //
+            // NOTE: No .animation() modifiers here. Attaching per-property
+            // .animation() on the glass/capsule level created a second
+            // animation context that competed with the GlassEffectContainer's
+            // .bouncy morph and caused cross-fade flicker instead of a glass
+            // morph between phases. The glow shadow updates (audioPeak-driven)
+            // are fast enough that they don't need easing at this layer.
+            content
+                .glassEffect(
+                    .regular.tint(Color.black.opacity(0.35)).interactive(),
+                    in: .capsule
+                )
+                .shadow(color: .white.opacity(max(glowOpacity, 0.10)), radius: max(glowRadius, 4), y: 0)
+        case .black:
+            // Solid matte black — no refraction. Critical layering: fill via
+            // .background, CLIP to capsule (prevents waveform/text from
+            // bleeding past the edge), then overlay the stroke on the SAME
+            // shape used for clipping so the hairline border sits exactly on
+            // the visible edge instead of being cut in half by the bounds.
+            content
+                .background(Capsule(style: .continuous).fill(Color.black))
+                .clipShape(Capsule(style: .continuous))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.6)
+                )
+                .shadow(color: .white.opacity(max(glowOpacity, 0.10)), radius: max(glowRadius, 4), y: 0)
+        case .aurora(let palette):
+            // Aurora skin: colored mesh background + clear Liquid Glass
+            // overlay that lenses the aurora at the edges. Glass at the
+            // outer level so morph works.
+            content
+                .background(
+                    AuroraBackground(palette: palette)
+                        .padding(-4)
+                        .clipShape(Capsule(style: .continuous))
+                        .drawingGroup(opaque: false)
+                        .allowsHitTesting(false)
+                )
+                .glassEffect(.clear.interactive(), in: .capsule)
+                .shadow(color: .white.opacity(max(glowOpacity, 0.10)), radius: max(glowRadius, 4), y: 0)
+        }
+    }
+}
+
+extension View {
+    /// Apply Voice's pill surface treatment (glass / black / niche) as a
+    /// modifier so the glass effect sits on the SAME view node as any
+    /// glassEffectID — required for GlassEffectContainer morphing.
+    func glassCapsule(fillOpacity: Double = 0.55, glowLevel: CGFloat = 0) -> some View {
+        modifier(GlassCapsuleModifier(fillOpacity: fillOpacity, glowLevel: glowLevel))
     }
 }
 
@@ -984,63 +1545,286 @@ private struct GlassCapsule: View {
 
 private struct IdlePill: View {
     let onTap: () -> Void
-    @State private var isHovering = false
+    let onPolish: (String) -> Void
+
+    // Hover spans pill + bar + a small invisible bridge so the bar stays open
+    // while the cursor travels from dot → bar (would otherwise drop hover and
+    // flicker the bar shut). The pill stays the trigger; the bar appears ABOVE
+    // it because the pill sits at the bottom of the screen.
+    @State private var isHoveringRegion = false
+    @State private var isHoveringDot = false
     @State private var isPressed = false
-    @State private var faded = false
+    /// Tracks whether the current press has moved far enough to count as a drag
+    /// (vs a tap). Threshold: ~4pt — small so the snap-while-dragging UX
+    /// engages quickly. When true, the gesture's onEnded posts
+    /// `voice.pillDragEnd` instead of firing onTap.
+    @State private var isDragging = false
+    private let dragThreshold: CGFloat = 4
+    /// Namespace for the dot ↔ bar Liquid Glass morph inside the
+    /// GlassEffectContainer. Shared between the two children so the system
+    /// treats them as a single morphing glass body.
+    @Namespace private var pillMorphNS
+
+    private let dotFrameW: CGFloat = 40
+    private let dotFrameH: CGFloat = 22
+    private let bridgeHeight: CGFloat = 6
 
     var body: some View {
-        let dotSize: CGFloat = isHovering ? 18 : (faded ? 10 : 14)
-        let bgOpacity: Double = isHovering ? 0.78 : (faded ? 0.32 : 0.62)
-        let strokeOpacity: Double = isHovering ? 0.55 : (faded ? 0.20 : 0.35)
-        let shadowOpacity: Double = isHovering ? 0.22 : (faded ? 0.12 : 0.22)
-        Color.clear
-            .frame(width: 40, height: 22)
-            .overlay(
-                Circle()
-                    .fill(Color.black.opacity(bgOpacity))
-                    .overlay(
-                        Circle()
-                            .strokeBorder(
-                                Color.white.opacity(strokeOpacity),
-                                lineWidth: 0.8
-                            )
+        let expanded = isHoveringRegion
+        // Flat dot — no opacity ramps, no size morph, no fade. The previous
+        // shaded variant was visual noise (per user feedback).
+
+        // True Liquid Glass morph (Dynamic-Island style). Three things matter:
+        //   1. Each glass child needs BOTH .glassEffect(_:in:) AND
+        //      .glassEffectID(_:in:) — Apple's docs are explicit. Without
+        //      glassEffect on the child, the container has no surface to
+        //      morph. We used to have a plain Circle().fill() here so the
+        //      container was inert.
+        //   2. spacing must be large enough that the two shapes' edges fall
+        //      within `spacing` points of each other when displayed — that's
+        //      when surface tension pulls them together with a visible neck.
+        //      18pt was way too tight; 32pt makes the merge visible.
+        //   3. No .transition() modifier on children. The container uses
+        //      .matchedGeometry by default; any explicit transition fights
+        //      that and produces a fade.
+        GlassEffectContainer(spacing: 32) {
+            VStack(spacing: 0) {
+                // Action bar above the pill — appears via glass morph from the dot.
+                if expanded {
+                    HoverActionBar(
+                        onDictate: onTap,
+                        onPolish: { level in onPolish(level) }
                     )
-                    .frame(width: dotSize, height: dotSize)
+                    .glassEffectID("bar", in: pillMorphNS)
+                    // Invisible bridge so the cursor can travel bar → dot without
+                    // dropping hover and dismissing the bar.
+                    Color.clear.frame(height: bridgeHeight)
+                }
+
+                // Flat dot, fades to ~45% when not hovered so it sits quietly
+                // on the screen. Pops to full opacity on hover so the
+                // affordance is unmistakable when the user reaches for it.
+                Circle()
+                    .fill(Color.black.opacity(expanded ? 1.0 : 0.45))
+                    .overlay(
+                        Circle().strokeBorder(Color.white.opacity(expanded ? 0.30 : 0.18), lineWidth: 0.6)
+                    )
+                    .frame(width: 14, height: 14)
+                    .glassEffectID("dot", in: pillMorphNS)
                     .scaleEffect(isPressed ? 0.82 : 1.0)
-                    .shadow(color: .black.opacity(shadowOpacity), radius: 4, x: 0, y: 1)
-            )
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { _ in isPressed = true }
-                    .onEnded { _ in
-                        isPressed = false
-                        onTap()
+                    .frame(width: dotFrameW, height: dotFrameH)
+                    .contentShape(Rectangle())
+                    // .simultaneousGesture (not .gesture) matches every other
+                    // press-drag handler in this file (HoverActionButton,
+                    // RecordingPill, LockedPill controls). With plain .gesture
+                    // the SwiftUI gesture can be cancelled by competing
+                    // implicit gestures from .onHover / parent containers,
+                    // which manifests as the drag dropping mid-motion. Global
+                    // coordinate space keeps the gesture's translation stable
+                    // even though the panel's local origin moves under the
+                    // cursor each time we snap to a new corner.
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                            .onChanged { value in
+                                isPressed = true
+                                let dist = hypot(value.translation.width, value.translation.height)
+                                if dist > dragThreshold {
+                                    if !isDragging { isDragging = true }
+                                    // Use the gesture's reported global location —
+                                    // more reliable than NSEvent.mouseLocation
+                                    // (which can lag a frame behind the gesture
+                                    // value) and already in the screen coord
+                                    // space NSPanel.setFrame uses.
+                                    let screenX = value.location.x
+                                    NotificationCenter.default.post(
+                                        name: Notification.Name("voice.pillDrag"),
+                                        object: nil,
+                                        userInfo: ["screenX": screenX]
+                                    )
+                                }
+                            }
+                            .onEnded { value in
+                                isPressed = false
+                                if isDragging {
+                                    isDragging = false
+                                    let screenX = value.location.x
+                                    NotificationCenter.default.post(
+                                        name: Notification.Name("voice.pillDragEnd"),
+                                        object: nil,
+                                        userInfo: ["screenX": screenX]
+                                    )
+                                } else {
+                                    onTap()
+                                }
+                            }
+                    )
+                    .onHover { hovering in
+                        isHoveringDot = hovering
+                        if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
                     }
+            }
+        }
+        // Bouncy spring drives the morph — extraBounce gives the surface
+        // tension snap as the neck collapses. The container reads this when
+        // `expanded` changes.
+        .animation(.bouncy(duration: 0.42, extraBounce: 0.15), value: expanded)
+        .onHover { hovering in
+            isHoveringRegion = hovering
+        }
+        .animation(.spring(response: 0.22, dampingFraction: 0.82), value: isHoveringRegion)
+        .animation(.spring(response: 0.16, dampingFraction: 0.82), value: isHoveringDot)
+        .animation(.spring(response: 0.14, dampingFraction: 0.78), value: isPressed)
+        .help("Hover to reveal Dictate + Polish actions.")
+    }
+}
+
+// MARK: - Hover action bar (Dictate / Polish)
+
+private struct HoverActionBar: View {
+    let onDictate: () -> Void
+    /// Called with the cleanup level the user picked: "light" / "medium" / "heavy".
+    /// Light = spelling + punctuation only. Medium = grammar + fillers. Heavy =
+    /// full rewrite (still keeps the speaker's intent, just tightens phrasing).
+    let onPolish: (String) -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            HoverActionButton(
+                icon: "mic.fill",
+                label: "Dictate",
+                hotkey: "fn",
+                action: onDictate
             )
-            .onHover { hovering in
-                isHovering = hovering
-                if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+
+            // Subtle divider between the dictate action and the polish levels.
+            Capsule()
+                .fill(Color.white.opacity(0.12))
+                .frame(width: 1, height: 18)
+                .padding(.horizontal, 2)
+
+            HoverActionButton(
+                icon: "text.badge.checkmark",
+                label: "Spell",
+                hotkey: "⌥1",
+                action: { onPolish("light") }
+            )
+            HoverActionButton(
+                icon: "text.badge.star",
+                label: "Grammar",
+                hotkey: "⌥2",
+                action: { onPolish("medium") }
+            )
+            HoverActionButton(
+                icon: "text.badge.xmark",
+                label: "Rewrite",
+                hotkey: "⌥3",
+                action: { onPolish("heavy") }
+            )
+        }
+        .padding(.horizontal, 5)
+        .padding(.vertical, 4)
+        // Native Liquid Glass background. Real refraction + specular highlight
+        // (no fake shadows). The interactive variant makes the surface deform
+        // subtly under cursor movement, which sells the "liquid" feel.
+        .glassEffect(
+            .regular.interactive(),
+            in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+        )
+        .fixedSize()
+    }
+}
+
+private struct HoverActionButton: View {
+    let icon: String
+    let label: String
+    let hotkey: String
+    let action: () -> Void
+
+    @State private var isHovering = false
+    @State private var isPressed = false
+    @State private var showTooltip = false
+    @State private var tooltipTask: Task<Void, Never>?
+
+    private let buttonSize: CGFloat = 28
+    private let tooltipDelayNs: UInt64 = 200_000_000
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.bodyMedium)
+                .foregroundStyle(.white.opacity(isHovering ? 1.0 : 0.82))
+                .frame(width: buttonSize, height: buttonSize)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.white.opacity(isHovering ? 0.14 : 0.0))
+                )
+                .scaleEffect(isPressed ? 0.90 : (isHovering ? 1.06 : 1.0))
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .top) {
+            // Tooltip sits ABOVE the button. We anchor to the top edge and
+            // push UP by buttonSize. `allowsHitTesting(false)` keeps the
+            // tooltip from stealing hover from its own button (which would
+            // cause a hover-flicker loop).
+            if showTooltip {
+                TooltipCapsule(label: label, hotkey: hotkey)
+                    .fixedSize()
+                    .offset(y: -(buttonSize + 2))
+                    .transition(.opacity.combined(with: .offset(y: 4)))
+                    .allowsHitTesting(false)
             }
-            .animation(.spring(response: 0.16, dampingFraction: 0.82), value: isHovering)
-            .animation(.spring(response: 0.14, dampingFraction: 0.78), value: isPressed)
-            .animation(.easeInOut(duration: 0.6), value: faded)
-            .onAppear {
-                Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 4_000_000_000)
-                    if !isHovering { faded = true }
+        }
+        .onHover { hovering in
+            isHovering = hovering
+            if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+            tooltipTask?.cancel()
+            if hovering {
+                tooltipTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: tooltipDelayNs)
+                    if !Task.isCancelled { showTooltip = true }
                 }
+            } else {
+                showTooltip = false
             }
-            .onChange(of: isHovering) { _, hovering in
-                if hovering {
-                    faded = false
-                } else {
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 4_000_000_000)
-                        if !isHovering { faded = true }
-                    }
-                }
-            }
+        }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in isPressed = true }
+                .onEnded { _ in isPressed = false }
+        )
+        .animation(.spring(response: 0.16, dampingFraction: 0.78), value: isHovering)
+        .animation(.spring(response: 0.12, dampingFraction: 0.75), value: isPressed)
+        .animation(.easeOut(duration: 0.14), value: showTooltip)
+    }
+}
+
+private struct TooltipCapsule: View {
+    let label: String
+    let hotkey: String
+
+    /// Pink/lilac accent for the hotkey hint, matching the reference design.
+    private static let hotkeyColor = Color(red: 1.0, green: 0.6, blue: 0.85)
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.sans(11, weight: .semibold))
+                .foregroundStyle(.white)
+            Text(hotkey)
+                .font(.sans(10, weight: .medium))
+                .foregroundStyle(Self.hotkeyColor)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.black.opacity(0.82))
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.6)
+                )
+                .shadow(color: .black.opacity(0.30), radius: 5, x: 0, y: 2)
+        )
     }
 }
 
@@ -1051,6 +1835,20 @@ private struct RecordingPill: View {
 
     private var audioPeak: Float {
         state.audioLevels.max() ?? 0
+    }
+
+    /// Stroke color driven by ASR confidence. White = high confidence,
+    /// amber = uncertain, red = low — gives the user a passive signal that
+    /// the model is struggling without interrupting the flow.
+    private var confidenceStrokeColor: Color {
+        let c = state.transcriptionConfidence
+        if c < 0.40 {
+            return Color(red: 0.95, green: 0.35, blue: 0.30)
+        } else if c < 0.55 {
+            return Color(red: 0.95, green: 0.65, blue: 0.20)
+        } else {
+            return Color.white.opacity(0.36)
+        }
     }
 
     var body: some View {
@@ -1072,7 +1870,15 @@ private struct RecordingPill: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 5)
-        .background(GlassCapsule(fillOpacity: 0.85, glowLevel: CGFloat(audioPeak)))
+        .glassCapsule(fillOpacity: 0.85, glowLevel: CGFloat(audioPeak))
+        // Confidence ring — sits on top of the GlassCapsule's own hairline
+        // stroke. Same line width as the underlying stroke, only kicks in
+        // when confidence dips below the comfortable threshold.
+        .overlay(
+            Capsule(style: .continuous)
+                .strokeBorder(confidenceStrokeColor, lineWidth: state.transcriptionConfidence < 0.55 ? 1.2 : 0)
+                .animation(.easeOut(duration: 0.18), value: state.transcriptionConfidence)
+        )
         .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
         // BUGFIX: scoping the implicit animation to ONLY noInputDetected
         // prevents it from being applied to every other state change that
@@ -1092,7 +1898,9 @@ private struct RecordingPill: View {
 
 private struct NoInputDot: View {
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+        // 1.2s breath — 20fps is plenty for a slow sin-driven pulse, and
+        // cuts the timeline tick rate by 33% vs. 30fps.
+        TimelineView(.animation(minimumInterval: 1.0 / 20.0, paused: false)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             // 1.2s breath
             let phase = (t.truncatingRemainder(dividingBy: 1.2)) / 1.2
@@ -1108,6 +1916,158 @@ private struct NoInputDot: View {
                 .help("No mic input. Check microphone permissions.")
         }
         .frame(width: 8, height: 8)
+    }
+}
+
+// MARK: - Meeting recording dot
+
+/// Gradient orb that persists while a meeting capture session is running.
+/// Uses the same `AuroraBackground` mesh gradient as the dictation pill,
+/// clipped to a circle — a static-looking rich field of color that may
+/// breathe subtly but does NOT spin.
+///
+/// The view does NOT impose its own frame — the parent applies
+/// `.frame(width:height:)` externally so SwiftUI can interpolate the size
+/// when `displayPhase` changes.
+private struct MeetingRecordingDot: View {
+    var onStop: (() -> Void)? = nil
+    @State private var isHovering = false
+    @State private var didEnter = false
+    @AppStorage("pillSkin") private var pillSkin: String = "default"
+
+    private enum DotSkin { case aurora(AuroraPalette), black, glass }
+    private var dotSkin: DotSkin {
+        switch pillSkin {
+        case "black":  return .black
+        case "niche":  return .aurora(.iris)
+        default:       return .glass
+        }
+    }
+
+    /// Per-skin dark base color so the gradient always pops regardless
+    /// of wallpaper. Tuned to the skin's anchor hue.
+    private var baseColor: Color {
+        switch dotSkin {
+        case .aurora:  return Color(red: 0.12, green: 0.10, blue: 0.22)  // iris anchor
+        case .black:   return Color.black
+        case .glass:   return Color.clear
+        }
+    }
+
+    /// Per-skin outer glow color so the shadow tints match the surface.
+    private var glowColor: Color {
+        switch dotSkin {
+        case .aurora:  return Color(red: 0.302, green: 0.251, blue: 1.0)
+        case .black:   return Color.white.opacity(0.08)
+        case .glass:   return Color.white.opacity(0.30)
+        }
+    }
+
+    var body: some View {
+        // 4s breath — 20fps cap (same pattern as NoInputDot / TranscribingGlyph).
+        // Replaces the `withAnimation(.repeatForever)` on breathPhase that was
+        // driving the sentinel ring at display-link rate (60–120 Hz).
+        TimelineView(.animation(minimumInterval: 1.0 / 20.0, paused: false)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let breathPhase = CGFloat((t.truncatingRemainder(dividingBy: 4.0)) / 4.0)
+            innerBody(breathPhase: breathPhase)
+        }
+    }
+
+    @ViewBuilder
+    private func innerBody(breathPhase: CGFloat) -> some View {
+        ZStack {
+            // Skin-dependent surface. Aurora skins get the mesh; black is
+            // solid; glass is pure Liquid Glass refraction; default is dark
+            // frosted glass.
+            switch dotSkin {
+            case .aurora(let palette):
+                Circle().fill(baseColor)
+                AuroraBackground(palette: palette)
+                    .padding(-3)
+                    .clipShape(Circle())
+            case .black:
+                Circle().fill(Color.black)
+            case .glass:
+                Circle()
+                    .glassEffect(
+                        .regular.tint(Color.black.opacity(0.30)).interactive(),
+                        in: .circle
+                    )
+            }
+
+            // Inner top-left sheen for 3-D orb depth.
+            GeometryReader { geo in
+                let d = min(geo.size.width, geo.size.height)
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            gradient: Gradient(stops: [
+                                .init(color: Color.white.opacity(0.50), location: 0.0),
+                                .init(color: Color.white.opacity(0.0),  location: 0.55)
+                            ]),
+                            center: UnitPoint(x: 0.30, y: 0.26),
+                            startRadius: 0,
+                            endRadius: d * 0.50
+                        )
+                    )
+                    .blendMode(.plusLighter)
+                    .allowsHitTesting(false)
+            }
+
+            // Rim vignette — darkens the edge so the orb feels bounded by a
+            // curved glass surface rather than a flat disc. Pairs with the
+            // top-left sheen: bright-near-pole + falloff-at-horizon = sphere.
+            GeometryReader { geo in
+                let d = min(geo.size.width, geo.size.height)
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            gradient: Gradient(stops: [
+                                .init(color: Color.black.opacity(0.0),  location: 0.55),
+                                .init(color: Color.black.opacity(0.18), location: 0.88),
+                                .init(color: Color.black.opacity(0.35), location: 1.0)
+                            ]),
+                            center: .center,
+                            startRadius: 0,
+                            endRadius: d * 0.50
+                        )
+                    )
+                    .blendMode(.multiply)
+                    .allowsHitTesting(false)
+            }
+
+            // Crisp edge so the orb pops against any wallpaper.
+            Circle()
+                .strokeBorder(Color.white.opacity(0.28), lineWidth: 0.75)
+        }
+        // Sentinel ring — slow outward pulse, in phase with the breath. A faint
+        // glow-tinted hoop expands and fades every 4s. Hidden on hover so it
+        // doesn't fight the click affordance.
+        .background(
+            Circle()
+                .stroke(glowColor.opacity(0.45 * (1 - breathPhase)), lineWidth: 1)
+                .scaleEffect(1.0 + 0.45 * breathPhase)
+                .opacity(isHovering ? 0 : 1)
+                .allowsHitTesting(false)
+                .animation(.easeOut(duration: 0.25), value: isHovering)
+        )
+        // Breath (1.0 → 1.035) composes multiplicatively with hover (1.15) and
+        // the entrance scale (0 → 1). Calm 4s sine — below conscious notice but
+        // alive in peripheral vision.
+        .scaleEffect((isHovering ? 1.15 : 1.0) * (didEnter ? 1.0 + 0.035 * sin(breathPhase * .pi) : 0.0))
+        // Tight glow — radius 5 reads as "lit from within" not "blurry blob".
+        .shadow(color: glowColor.opacity(0.70), radius: 5, y: 1)
+        .animation(.spring(response: 0.18, dampingFraction: 0.72), value: isHovering)
+        .onHover { h in
+            isHovering = h
+            if h { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+        }
+        .onTapGesture { onStop?() }
+        .help(onStop != nil ? "Meeting recording — tap to stop" : "Meeting recording in progress")
+        .onAppear {
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.70)) { didEnter = true }
+        }
     }
 }
 
@@ -1204,7 +2164,30 @@ private struct LockedPill: View {
             .padding(.horizontal, 4)
             .padding(.vertical, 3)
         }
-        .background(GlassCapsule(fillOpacity: 0.85))
+        // Apply glass surface using the shared glassCapsule modifier so that
+        // GlassEffectContainer can see the .glassEffect at the outer level and
+        // morph the surface between recording → locked instead of cross-fading.
+        // Shape switching for the live-partial tall variant is applied via
+        // .clipShape AFTER the glass modifier, which is safe — the glass
+        // renders at the capsule shape and the clip trims it to the rounded
+        // rect when text is present.
+        .glassCapsule(fillOpacity: 0.85)
+        .clipShape(
+            state.livePartialText.isEmpty
+                ? AnyShape(Capsule(style: .continuous))
+                : AnyShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        )
+        .overlay(
+            Group {
+                if state.livePartialText.isEmpty {
+                    Capsule(style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.6)
+                } else {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.6)
+                }
+            }
+        )
         .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
     }
 }
@@ -1218,6 +2201,16 @@ private struct ActionButton: View {
 
     @State private var isHovering = false
     @State private var isPressed = false
+    @AppStorage("pillSkin") private var pillSkin: String = "default"
+
+    /// True when the pill is rendering in glass skin. The cancel/confirm
+    /// buttons inside LockedPill ("halt button") used to render as a flat
+    /// solid disc regardless of skin, which broke visual consistency with
+    /// the glossy capsule around them. When glass skin is active we use
+    /// .glassEffect so the buttons inherit the same refraction treatment.
+    private var isGlassSkin: Bool {
+        pillSkin != "black" && pillSkin != "niche"
+    }
 
     var body: some View {
         // Custom gesture, not Button — SwiftUI's Button on macOS adds a
@@ -1231,11 +2224,21 @@ private struct ActionButton: View {
             .foregroundStyle(.white.opacity(0.95))
             .frame(width: 22, height: 22)
             .background(
-                Circle().fill(
-                    isPressed
-                        ? hoverTint.opacity(0.85)
-                        : (isHovering ? hoverTint : Color.white.opacity(0.28))
-                )
+                Group {
+                    if isPressed || isHovering {
+                        // Active states use the tint colour so the hit-target
+                        // is unambiguous regardless of skin.
+                        Circle().fill(isPressed ? hoverTint.opacity(0.85) : hoverTint)
+                    } else if isGlassSkin {
+                        // Glass skin: the resting state is a refractive
+                        // glass disc that matches the surrounding capsule.
+                        Circle()
+                            .glassEffect(.regular.interactive(), in: .circle)
+                    } else {
+                        // Black / niche skin: flat translucent white disc.
+                        Circle().fill(Color.white.opacity(0.28))
+                    }
+                }
             )
             .scaleEffect(isPressed ? 0.94 : (isHovering ? 1.06 : 1.0))
             // Two animation channels so press and hover don't fight each
@@ -1272,13 +2275,15 @@ private struct ActionButton: View {
 
 private struct TranscribingPill: View {
     var body: some View {
-        Color.clear
-            .frame(width: 40, height: 22)
-            .overlay(
-                TranscribingGlyph()
-                    .frame(width: 22, height: 22)
-                    .shadow(color: .black.opacity(0.22), radius: 4, x: 0, y: 1)
-            )
+        // No black background slab. The processing state used to render a
+        // dark capsule that looked like a stray UI element — user explicitly
+        // hated it. Just the glyph on its own, sized to match the idle dot
+        // so the morph from recording → transcribing reads as the same body
+        // shrinking back. No fill, no shadow.
+        TranscribingGlyph()
+            .frame(width: 22, height: 22)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 4)
     }
 }
 
@@ -1293,15 +2298,30 @@ private struct TranscribingPill: View {
 ///     symmetrically so neither ever fully disappears, just trades
 ///     emphasis. Reads as "this is the cloud engine working".
 private struct TranscribingGlyph: View {
-    /// Live polish-status observable. The cloud glyph appears ONLY while
-    /// `isCloudPolishing == true` — meaning a Cerebras request is currently
-    /// in flight, not just because the user has cloud mode enabled. During
-    /// ASR (which always runs locally) or local polish, only the breathing
-    /// circle shows.
+    /// Live polish-status observable. The engine glyph crossfades against
+    /// the breathing circle ONLY while a polish is actively in flight
+    /// (`isCloudPolishing == true`). The symbol shown reflects whether the
+    /// last/current polish used the cloud (cloud icon) or a local MLX model
+    /// (cpu icon) — previously this always showed the cloud icon, which
+    /// was wrong whenever the user ran a fully on-device polish.
     private let status = PolishStatus.shared
 
+    /// Engine kind derived from `PolishStatus.lastEngine`.
+    /// Format examples (see PolishStatus.swift): "cloud:cerebras",
+    /// "local:qwen3-4b", "rules-only", or nil.
+    private enum EngineKind { case cloud, local, unknown }
+    private func engineKind(from raw: String?) -> EngineKind {
+        guard let raw, !raw.isEmpty else { return .unknown }
+        if raw.hasPrefix("cloud:") { return .cloud }
+        if raw.hasPrefix("local:") { return .local }
+        return .unknown
+    }
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+        // 1.6s breath + 3.2s crossfade — slow enough that 20fps is visually
+        // identical to 30fps. This view is only mounted while transcribing,
+        // but the recording hot-path is sensitive enough that every ms counts.
+        TimelineView(.animation(minimumInterval: 1.0 / 20.0, paused: false)) { context in
             let phase = context.date.timeIntervalSinceReferenceDate
 
             // Breathing cycle for the circle (1.6s).
@@ -1310,25 +2330,41 @@ private struct TranscribingGlyph: View {
             let circleScale = 1.0 + 0.08 * breathS
             let circleOpacityBase = 0.70 + 0.18 * breathS
 
-            // Crossfade only when cloud polish is actually happening.
-            let cloudActive = status.isCloudPolishing
+            // Crossfade only when a polish is actually happening (cloud OR
+            // local). `isCloudPolishing` is the legacy flag name but the
+            // upstream sets it for both engines during the in-flight window.
+            let polishActive = status.isCloudPolishing
+            let kind = engineKind(from: status.lastEngine)
             let xfadeT = (phase.truncatingRemainder(dividingBy: 3.2)) / 3.2
             let xfade = 0.5 + 0.5 * cos(xfadeT * 2 * .pi)
 
+            // Pick the engine icon. Cloud → cloud.fill. Local → cpu (on-device).
+            // Unknown engine while in-flight → neutral "thinking" sparkles
+            // so we never claim a cloud round trip happened when it didn't.
+            let engineSymbol: String? = {
+                guard polishActive else { return nil }
+                switch kind {
+                case .cloud:   return "cloud.fill"
+                case .local:   return "cpu"
+                case .unknown: return "sparkles"
+                }
+            }()
+
             ZStack {
                 Circle()
-                    .stroke(Color.white.opacity(circleOpacityBase * (cloudActive ? xfade : 1.0)), lineWidth: 1.5)
+                    .stroke(Color.white.opacity(circleOpacityBase * (polishActive ? xfade : 1.0)), lineWidth: 1.5)
                     .scaleEffect(circleScale)
 
-                if cloudActive {
-                    Image(systemName: "cloud.fill")
+                if let symbol = engineSymbol {
+                    Image(systemName: symbol)
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(Color.white.opacity(0.85 * (1.0 - xfade)))
                         .scaleEffect(0.92 + 0.08 * (1.0 - xfade))
                         .transition(.opacity)
                 }
             }
-            .animation(.easeOut(duration: 0.18), value: cloudActive)
+            .animation(.easeOut(duration: 0.18), value: polishActive)
+            .animation(.easeOut(duration: 0.18), value: engineSymbol)
         }
     }
 }
@@ -1339,28 +2375,104 @@ private struct TranscribingGlyph: View {
 /// Click-through (user cannot interact) — same visual weight as TranscribingPill
 /// Minimal polishing indicator: rotating gear icon, no text. Reads as clean
 /// "processing in progress" without clutter.
+/// "Window cleaning" pill shown while polishing selected text.
+/// The animation is a wiper arc that sweeps the circle — suggests buffing
+/// or cleaning the text rather than mere "processing".
 private struct PolishingSelectionPill: View {
-    @State private var isSpinning = false
+    @State private var angle: Double = 0
+    @State private var shimmer: Double = 0
 
     var body: some View {
-        Image(systemName: "gearshape.fill")
-            .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(.primary.opacity(0.85))
-            .frame(width: 22, height: 22)
-            .rotationEffect(.degrees(isSpinning ? 360 : 0))
-            .animation(.linear(duration: 1.0).repeatForever(autoreverses: false), value: isSpinning)
-            .onAppear { isSpinning = true }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(GlassCapsule(fillOpacity: 0.80))
-            .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
+        HStack(spacing: 7) {
+            ZStack {
+                // Background ring
+                Circle()
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1.8)
+                    .frame(width: 17, height: 17)
+
+                // Wiper arc — tapered sweep, rotates continuously
+                Circle()
+                    .trim(from: 0.0, to: 0.32)   // ~115° arc = wiper blade
+                    .stroke(
+                        AngularGradient(
+                            stops: [
+                                .init(color: Color(nsColor: NSColor.controlAccentColor).opacity(0.9), location: 0.00),
+                                .init(color: Color(nsColor: NSColor.controlAccentColor).opacity(0.55), location: 0.16),
+                                .init(color: .clear,                                                   location: 0.32),
+                                .init(color: .clear,                                                   location: 1.00),
+                            ],
+                            center: .center
+                        ),
+                        style: StrokeStyle(lineWidth: 2.0, lineCap: .round)
+                    )
+                    .frame(width: 17, height: 17)
+                    .rotationEffect(.degrees(angle - 90))  // -90 so arc starts at top
+            }
+
+            Text("Polishing")
+                .font(.sans(11, weight: .medium))
+                .foregroundStyle(Color.white.opacity(0.6 + 0.2 * sin(shimmer * .pi)))
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .glassCapsule(fillOpacity: 0.80)
+        .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
+        .onAppear {
+            withAnimation(.linear(duration: 0.85).repeatForever(autoreverses: false)) {
+                angle = 360
+            }
+            withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+                shimmer = 1
+            }
+        }
+    }
+}
+
+// MARK: - Meeting Capture
+
+/// Shown while a meeting capture session is active (Google Meet / Zoom / Teams).
+/// Tap the pill to stop the capture session.
+private struct MeetingCapturePill: View {
+    let onTap: () -> Void
+    let durationSeconds: Int
+    @State private var pulse: Double = 0
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(Color.red.opacity(0.6 + 0.4 * pulse))
+                .frame(width: 7, height: 7)
+            Text(durationSeconds > 0 ? "Meeting \u{00B7} \(formatDuration(durationSeconds))" : "Meeting")
+                .font(.sans(11, weight: .medium))
+                .foregroundStyle(Color.primary.opacity(0.75))
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .glassCapsule(fillOpacity: 0.80)
+        .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
+        .contentShape(Capsule())
+        .onTapGesture { onTap() }
+        .onAppear {
+            withAnimation(.easeInOut(duration: 1.6).repeatForever(autoreverses: true)) {
+                pulse = 1
+            }
+        }
+    }
+
+    private func formatDuration(_ s: Int) -> String {
+        if s < 3600 {
+            return String(format: "%d:%02d", s / 60, s % 60)
+        }
+        return String(format: "%d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60)
     }
 }
 
 /// Sparkles icon that breathes in sync with the SweepingRing pulse pattern.
 private struct SparklesBreath: View {
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+        // 1.6s breath — 20fps is visually identical for a slow sin pulse.
+        TimelineView(.animation(minimumInterval: 1.0 / 20.0, paused: false)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             let phase = (t.truncatingRemainder(dividingBy: 1.6)) / 1.6
             let s = sin(phase * 2 * .pi)
@@ -1381,10 +2493,12 @@ private struct CancelledToast: View {
     let onUndo: () -> Void
     @State private var undoHovering = false
     @State private var undoPressed = false
-    private let totalDuration: TimeInterval = 4.0
+    private let totalDuration: TimeInterval = 3.0
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { context in
+        // 10 fps is plenty for a progress bar that drains over 3 seconds.
+        // 30fps was unnecessarily waking the main thread 3× more than needed.
+        TimelineView(.animation(minimumInterval: 1.0 / 10.0, paused: false)) { context in
             let elapsed = context.date.timeIntervalSince(shownAt)
             let remaining = max(0, 1.0 - elapsed / totalDuration)
 
@@ -1430,21 +2544,127 @@ private struct CancelledToast: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 5)
-            .background(
-                GlassCapsule(fillOpacity: 0.85)
-                    .overlay(alignment: .bottom) {
-                        GeometryReader { geo in
-                            Capsule()
-                                .fill(Color.white.opacity(0.40))
-                                .frame(width: geo.size.width * remaining, height: 1)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(height: 1)
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 3)
-                    }
-            )
+            .glassCapsule(fillOpacity: 0.85)
+            .overlay(alignment: .bottom) {
+                GeometryReader { geo in
+                    Capsule()
+                        .fill(Color.white.opacity(0.40))
+                        .frame(width: geo.size.width * remaining, height: 1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 1)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 3)
+            }
             .shadow(color: .black.opacity(0.30), radius: 14, x: 0, y: 5)
+        }
+    }
+}
+
+// MARK: - Undo Paste Toast
+
+private struct UndoPasteToast: View {
+    let shownAt: Date
+    let onUndo: () -> Void
+    @State private var undoHovering = false
+    @State private var undoPressed = false
+    @State private var toastHovering = false
+    /// Accumulated elapsed time NOT counting any periods when the toast was hovered.
+    /// We freeze this whenever `toastHovering` is true.
+    @State private var frozenElapsed: TimeInterval = 0
+    @State private var lastTick: Date? = nil
+    private let totalDuration: TimeInterval = 7.0
+
+    var body: some View {
+        // 10 fps is plenty for a progress bar that drains over 7 seconds.
+        // 30fps was unnecessarily waking the main thread 3× more than needed.
+        TimelineView(.animation(minimumInterval: 1.0 / 10.0, paused: false)) { context in
+            // Compute elapsed time, but PAUSE accumulation while the user is hovering
+            // over the toast. We can't mutate state inside `body`, so we read the
+            // last computed frozenElapsed and advance it via .onChange of the timeline
+            // tick using a side-effect-free derivation:
+            //   - if hovering, remaining freezes at last value
+            //   - if not hovering, remaining decrements normally
+            let now = context.date
+            let delta: TimeInterval = {
+                guard let last = lastTick else { return 0 }
+                return max(0, now.timeIntervalSince(last))
+            }()
+            let liveElapsed = toastHovering ? frozenElapsed : (frozenElapsed + delta)
+            let remaining = max(0, 1.0 - liveElapsed / totalDuration)
+
+            HStack(spacing: 8) {
+                // Same low-latency gesture pattern as ActionButton and CancelledToast.
+                Text("Undo")
+                    .font(.sans(11, weight: .semibold))
+                    .foregroundStyle(Color.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color.white.opacity(
+                                undoPressed ? 0.30 : (undoHovering ? 0.22 : 0.14)
+                            ))
+                    )
+                    .scaleEffect(undoPressed ? 0.96 : 1.0)
+                    .animation(.easeOut(duration: 0.10), value: undoPressed)
+                    .animation(.easeOut(duration: 0.14), value: undoHovering)
+                    .contentShape(Capsule())
+                    .onHover { hovering in
+                        undoHovering = hovering
+                        if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                    }
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in
+                                if !undoPressed { undoPressed = true }
+                            }
+                            .onEnded { value in
+                                undoPressed = false
+                                let t = value.translation
+                                let dist = (t.width * t.width + t.height * t.height).squareRoot()
+                                if dist < 40 { onUndo() }
+                            }
+                    )
+            }
+            .onChange(of: now) { _, newValue in
+                // Advance the accumulator only when not hovering. This is the
+                // single source of truth for elapsed-time progression and lets
+                // hover hold the depleting bar perfectly still.
+                if let last = lastTick {
+                    let d = max(0, newValue.timeIntervalSince(last))
+                    if !toastHovering {
+                        frozenElapsed += d
+                    }
+                }
+                lastTick = newValue
+            }
+            .onAppear {
+                // Seed lastTick from shownAt so the first frame doesn't jump.
+                lastTick = shownAt
+                frozenElapsed = max(0, now.timeIntervalSince(shownAt))
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .glassCapsule(fillOpacity: 0.85)
+            .overlay(alignment: .bottom) {
+                GeometryReader { geo in
+                    Capsule()
+                        .fill(Color.white.opacity(0.40))
+                        .frame(width: geo.size.width * remaining, height: 1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 1)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 3)
+            }
+            .shadow(color: .black.opacity(0.30), radius: 14, x: 0, y: 5)
+            .onHover { hovering in
+                // Freeze the depleting bar / dismissal countdown while the
+                // user is hovering the toast — gives them time to read or
+                // mouse over to Undo without the toast disappearing.
+                toastHovering = hovering
+            }
         }
     }
 }
@@ -1617,7 +2837,7 @@ struct WaveformView: View {
                 let lvl = smoothed.indices.contains(i) ? smoothed[i] : 0
                 let h = max(minBarHeight, barHeight(value: lvl, maxHeight: maxBarHeight))
                 Group {
-                    if pillSkin == "niche" {
+                    if pillSkin != "default" {
                         GlassBar(width: 2.5, height: h)
                     } else {
                         Capsule(style: .continuous)
@@ -1713,3 +2933,10 @@ struct WaveformView: View {
         return CGFloat(normalized) * (maxHeight - 4)
     }
 }
+
+// NOTE: EnginePolishToast, EnginePolishDetailsPopover, EnginePolishDebugChip,
+// EngineToastSnapshot, EngineFamily, prettyEngineLabel(), and formatLatency()
+// all live in Views/EnginePolishToast.swift. The Xcode project already
+// references that file path — keeping the polish-toast UI as a sibling file
+// matches the project layout and avoids growing OverlayPanel.swift past
+// 3000 lines.

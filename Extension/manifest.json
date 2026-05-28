@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Voice Meet Bridge",
+  "description": "Tells the Voice dictation app when you join or leave a Google Meet so it can capture the meeting automatically.",
+  "version": "1.0",
+  "permissions": ["tabs"],
+  "host_permissions": [
+    "http://127.0.0.1:59423/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Voice Meet Bridge"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://meet.google.com/*",
+        "https://discord.com/*",
+        "https://teams.microsoft.com/*",
+        "https://teams.live.com/*",
+        "https://app.slack.com/*",
+        "https://web.whatsapp.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

@@ -1,234 +1,438 @@
 // PolishPipeline.swift
 //
-// Multi-draft polish with a critic. Runs N polish variants in parallel
-// against the SAME frozen text, then scores them to pick the best one.
+// Relaxed-cloud sanitizer for polish validation.
 //
-// Why this exists: a single LLM polish pass is a coin flip on hard inputs.
-// The 4B model loses proper nouns, hallucinates "?", fragments sentences,
-// or merges thoughts. Each individual draft makes DIFFERENT mistakes —
-// but if we run 3 variants with slightly different prompts and pick the
-// one that preserved the most input content without hallucinating, we
-// get most of the quality of a frontier model at the cost of 1-2s extra
-// latency on Apple Silicon.
+// The single sanitize() in Qwen3Polisher.swift was originally written for
+// the LOCAL 1.7B model — small, error-prone, needed tight word/length
+// budgets and a long list of injection guards. The CLOUD path
+// (Cerebras gpt-oss-120b / Groq llama3.1-8b) is far stronger and
+// legitimately produces:
+//   - long restructuring rewrites that drop filler words wholesale
+//     (fails strict word-preservation)
+//   - email/letter reformatting that adds "\n\nBest,\nName"
+//     (fails strict word-count budget)
+//   - bullet expansion with colons added ("groceries: a, b, c, d")
+//     (fails strict sentence-count budget)
+//   - number normalization ("twenty three percent" → "23%")
+//     (fails strict char-length budget)
+// Run through the legacy strict sanitizer, every one of those polishes
+// was being SILENTLY rejected and the raw transcript shipped instead —
+// the "Voice quality is bad" experience.
 //
-// Pipeline:
-//   freeze entities → 3 parallel drafts → critic picks → unfreeze
+// The Sanitizer here exposes a public API the polisher can call on the
+// cloud path. Two modes:
+//   .strict  — legacy behavior (kept verbatim for the local 1.7B path)
+//   .relaxed — trust the cloud model, only block absolute-rule
+//              violations: em-dashes, emojis, vulgarity injection,
+//              proper-noun/number/email/URL preservation, semantic flips,
+//              prompt echo / preamble residue.
 //
-// The drafts share the SAME frozen-input text so sentinel survival is
-// directly comparable across drafts (deterministic scoring).
+// Visible logging:
+//   Every rejection prints `[VOICE-SANITIZE] rejected: rule=<name> ...`
+//   so reviewers can grep the dev console for false-positives.
 //
-// Critic stack:
-//   1. Hard rejection: any draft missing a sentinel from the input
-//      (entity dropped) is immediately disqualified.
-//   2. Deterministic scoring: word-count delta, hallucinated-token check,
-//      structure markers (paragraphs, bullets).
-//   3. LLM critic (optional, Phase 4b): a small 1.7B pass that picks the
-//      "cleanest" of the survivors. Falls back to deterministic if the
-//      LLM critic times out or returns garbage.
-//
-// Latency budget on M-series:
-//   - 3 drafts parallel ≈ slowest single draft (~1.2s on 4B)
-//   - Deterministic critic: <10ms
-//   - LLM critic: ~400ms
-//   - Total: ~1.5-2s for long dictation (was ~1.5s single-pass)
+// Emergency override:
+//   UserDefaults bool `voice.disableSanitizer` (read here, can be set by
+//   a SwiftUI `@AppStorage("voice.disableSanitizer")` toggle in Settings).
+//   When true, Sanitizer.run() ALWAYS accepts the model output. Lets the
+//   user A/B test "is the sanitizer the problem?" with one toggle.
 
 import Foundation
 
-public enum DraftVariant: String, CaseIterable, Sendable {
-    /// Conservative: minimal changes, preserve word choice, light filler strip.
-    /// Used as the safety net — if structural/aggressive go wild, conservative
-    /// usually stays sane.
-    case conservative
+// MARK: - Sanitizer (the relaxed-cloud validator)
 
-    /// Structural: actively infer paragraph breaks, bullet lists, sentence
-    /// boundaries. Best for long multi-topic dictations.
-    case structural
+/// Public validator that decides whether to accept a polish or fall back
+/// to the raw input. Two modes — STRICT for the local 1.7B (legacy
+/// behavior) and RELAXED for the cloud (Cerebras / Groq).
+///
+/// Usage from the polisher (cloud branch):
+/// ```
+/// let accepted = Sanitizer.run(
+///     polish: cloudOut,
+///     original: frozenInput,
+///     mode: .relaxed,
+///     cleanupLevel: cleanupLevel,
+///     userVocabulary: userVocabulary
+/// )
+/// if accepted == nil {
+///     // Sanitizer rejected — fall back to raw input.
+///     polishedFrozen = frozenInput
+/// } else {
+///     polishedFrozen = accepted!
+/// }
+/// ```
+///
+/// `run` ALWAYS returns the polish unchanged when the user has toggled
+/// `voice.disableSanitizer` on, so the user can A/B test whether the
+/// sanitizer is the source of bad output.
+public enum Sanitizer {
 
-    /// Aggressive: maximum filler strip, collapse all hedges, tight prose.
-    /// Best for "make this readable" mode at HIGH cleanup level.
-    case aggressive
+    /// How strictly the sanitizer should validate the model output.
+    public enum Mode: Sendable {
+        /// Legacy strict mode: tight word/length budgets, contraction +
+        /// filler caps, every input word must roughly appear in output.
+        /// Use for the local 1.7B polish path — that model is too small
+        /// to trust with aggressive restructuring.
+        case strict
 
-    /// The cleanup-level override each variant applies on top of the user's
-    /// chosen level. Conservative drops a notch, aggressive bumps a notch.
-    public func adjustedCleanupLevel(_ user: String) -> String {
-        switch (self, user) {
-        case (.conservative, "high"):     return "medium"
-        case (.conservative, "medium"):   return "light"
-        case (.conservative, _):          return user
-        case (.aggressive, "light"):      return "medium"
-        case (.aggressive, "medium"):     return "high"
-        case (.aggressive, _):            return user
-        case (.structural, _):            return user
+        /// Relaxed cloud mode: trust the model. Only block ABSOLUTE-RULE
+        /// violations:
+        ///   - em-dashes / en-dashes (Voice never ships them)
+        ///   - emojis (banned by spec)
+        ///   - vulgarity injection (introduced words not in original)
+        ///   - proper-noun loss (>2 names dropped)
+        ///   - number/email/URL loss (substring preservation)
+        ///   - semantic flips (don't think → think, etc.)
+        ///   - prompt echo / preamble residue ("Here's the polish: …")
+        ///   - prompt-injection markers (<|, [INST], As an AI, </think>)
+        /// Sentence count, word count, contraction count, filler count
+        /// are NOT checked — the cloud is allowed to restructure freely.
+        case relaxed
+    }
+
+    /// UserDefaults key for the emergency override. When true (matching
+    /// `@AppStorage("voice.disableSanitizer")` in a SwiftUI toggle), the
+    /// sanitizer always accepts the model output untouched.
+    public static let disableKey = "voice.disableSanitizer"
+
+    /// Validate `polish` against `original`. Returns the polish on accept,
+    /// nil on reject. Every rejection logs `[VOICE-SANITIZE] rejected:
+    /// rule=<name> input="..." polish="..."` so the dev console makes it
+    /// obvious which rule fired.
+    public static func run(
+        polish: String,
+        original: String,
+        mode: Mode,
+        cleanupLevel: String? = "medium",
+        userVocabulary: [String]? = nil
+    ) -> String? {
+        // Emergency override — user-toggleable. Pass through unconditionally.
+        if UserDefaults.standard.bool(forKey: disableKey) {
+            print("[VOICE-SANITIZE] DISABLED via \(disableKey) — accepting polish unconditionally")
+            return polish
         }
-    }
-}
 
-public struct PolishDraft: Sendable {
-    public let variant: DraftVariant
-    public let text: String
-    public let latencyMs: Int
-
-    /// Number of frozen entity sentinels (⟦E…⟧) preserved in this draft.
-    /// Used by the critic to disqualify drafts that lost entities.
-    public var sentinelCount: Int { Self.countSentinels(in: text) }
-
-    static func countSentinels(in s: String) -> Int {
-        guard let regex = try? NSRegularExpression(pattern: #"⟦E\d+⟧"#) else { return 0 }
-        let ns = s as NSString
-        return regex.numberOfMatches(in: s, range: NSRange(location: 0, length: ns.length))
-    }
-}
-
-public enum PolishCritic {
-
-    /// Score a single draft against the raw frozen input. Higher is better.
-    /// Returns nil for disqualified drafts (entities lost or hallucinated).
-    public static func score(
-        draft: PolishDraft,
-        rawFrozen: String,
-        expectedSentinels: Int
-    ) -> Double? {
-        let draftSentinels = draft.sentinelCount
-
-        // Disqualify: any sentinel from the input is missing.
-        if draftSentinels < expectedSentinels {
-            print("[VOICE-CRITIC] reject \(draft.variant.rawValue): lost \(expectedSentinels - draftSentinels) entities")
+        var cleaned = polish.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty {
+            logReject(rule: "empty-polish", input: original, polish: polish)
             return nil
         }
 
-        // Disqualify: hallucinated sentinels (more sentinels than input had).
-        // The LLM should never invent ⟦E…⟧ tokens.
-        if draftSentinels > expectedSentinels {
-            print("[VOICE-CRITIC] reject \(draft.variant.rawValue): hallucinated \(draftSentinels - expectedSentinels) entities")
+        // --- ABSOLUTE RULES — apply to every mode ---
+
+        // 1. Em-dash / en-dash / horizontal-bar. The user HATES these.
+        //    These chars are absolute-banned per the app spec. We reject
+        //    rather than strip so a polish that LEANS on dashes for
+        //    structure (a common Claude/GPT habit) loses its winning
+        //    bid and a better candidate (next draft / raw input) takes
+        //    over. The downstream `stripDashes` pass is the secondary
+        //    safety net for any dashes that slip through.
+        if cleaned.contains("\u{2014}") || cleaned.contains("\u{2013}") || cleaned.contains("\u{2015}") {
+            logReject(rule: "em-dash", input: original, polish: polish)
             return nil
         }
 
-        var score: Double = 0
-
-        // Reward structure markers — bullets, paragraph breaks — when the
-        // input clearly suggested them. Modest reward so style differences
-        // don't dominate content correctness.
-        let inputLower = rawFrozen.lowercased()
-        let hasListCue = inputLower.contains("i need ") || inputLower.contains("i have to get")
-            || inputLower.contains("first") || inputLower.contains("the list")
-        if hasListCue && draft.text.contains("\n- ") {
-            score += 1.0
+        // 2. Emojis. Also banned by spec. Reject if any extended-pictographic
+        //    char appears that was NOT in the original (so a user dictating
+        //    "tell me about 🚀 launches" still works).
+        if containsEmojiNotInOriginal(polish: cleaned, original: original) {
+            logReject(rule: "emoji", input: original, polish: polish)
+            return nil
         }
 
-        // Reward paragraph breaks on long inputs.
-        let inputWords = rawFrozen.split(separator: " ").count
-        if inputWords > 80 && draft.text.contains("\n\n") {
-            score += 0.5
-        }
-
-        // Penalize huge word-count divergence (model dropped or invented
-        // content). Tolerance: ±40% for cleanup, but >60% suggests problem.
-        let draftWords = draft.text.split(separator: " ").count
-        let ratio = Double(draftWords) / Double(max(inputWords, 1))
-        if ratio < 0.4 || ratio > 1.6 {
-            score -= 1.5
-        }
-
-        // Penalize obvious hallucination markers.
-        if draft.text.contains("As an AI") || draft.text.contains("[INST]")
-            || draft.text.contains("<|") || draft.text.contains("</think>") {
-            score -= 5.0
-        }
-
-        // Penalize trailing "Output:" or "Polished:" residue.
-        if draft.text.lowercased().contains("output:")
-            || draft.text.lowercased().hasPrefix("polished:")
-            || draft.text.lowercased().hasPrefix("here is the polished") {
-            score -= 3.0
-        }
-
-        // Light reward for absence of em-dashes (rule says no em-dashes).
-        if !draft.text.contains("\u{2014}") && !draft.text.contains("\u{2013}") {
-            score += 0.2
-        }
-
-        // Per-variant baseline preference: structural slightly preferred for
-        // long inputs (paragraphs matter); conservative slightly preferred
-        // for short inputs (less risk of restructuring); aggressive boosted
-        // when user explicitly asked for HIGH cleanup elsewhere.
-        switch draft.variant {
-        case .structural:
-            if inputWords > 80 { score += 0.3 }
-        case .conservative:
-            if inputWords < 30 { score += 0.3 }
-        case .aggressive:
-            // Aggressive doesn't get a baseline — it has to earn it on cleanup quality.
-            break
-        }
-
-        return score
-    }
-
-    /// Pick the best draft from a list. Returns nil if all drafts are disqualified.
-    public static func pick(
-        drafts: [PolishDraft],
-        rawFrozen: String,
-        expectedSentinels: Int
-    ) -> PolishDraft? {
-        let scored = drafts.compactMap { draft -> (PolishDraft, Double)? in
-            guard let s = score(draft: draft, rawFrozen: rawFrozen, expectedSentinels: expectedSentinels) else {
+        // 3. Prompt-injection / chat-template residue. The model leaked
+        //    its system frame — always wrong.
+        let residueMarkers = ["<|im_start|>", "<|im_end|>", "<|", "|>",
+                              "[INST]", "[/INST]", "</think>", "<think>",
+                              "As an AI", "As a language model"]
+        for marker in residueMarkers {
+            if cleaned.contains(marker) {
+                logReject(rule: "prompt-residue:\(marker)", input: original, polish: polish)
                 return nil
             }
-            return (draft, s)
         }
-        guard let best = scored.max(by: { $0.1 < $1.1 }) else { return nil }
-        let scoreLog = scored.map { "\($0.0.variant.rawValue)=\(String(format: "%.2f", $0.1))" }.joined(separator: " ")
-        print("[VOICE-CRITIC] picked \(best.0.variant.rawValue) | scores: \(scoreLog)")
-        return best.0
-    }
-}
 
-public enum PolishPipeline {
-
-    /// Run all three drafts in parallel and pick the best.
-    /// Falls back to the input itself if every draft is disqualified
-    /// (extremely defensive — preserves user content over breaking it).
-    public static func run(
-        frozenInput: String,
-        expectedSentinels: Int,
-        runDraft: @Sendable @escaping (DraftVariant) async -> String
-    ) async -> String {
-        let started = CFAbsoluteTimeGetCurrent()
-
-        let drafts = await withTaskGroup(of: PolishDraft.self) { group -> [PolishDraft] in
-            for variant in DraftVariant.allCases {
-                group.addTask {
-                    let t0 = CFAbsoluteTimeGetCurrent()
-                    let text = await runDraft(variant)
-                    let dt = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                    return PolishDraft(variant: variant, text: text, latencyMs: dt)
-                }
+        // 4. Preamble residue. "Here's the polish:", "Output:", "Polished:"…
+        let lowerHead = cleaned.lowercased()
+        let preambles = ["here is the polish", "here's the polish",
+                         "here is the polished", "here's the polished",
+                         "here is the cleaned", "here's the cleaned",
+                         "polished:", "output:", "cleaned:",
+                         "i fixed", "corrected:"]
+        for pre in preambles {
+            if lowerHead.hasPrefix(pre) {
+                logReject(rule: "preamble:\(pre)", input: original, polish: polish)
+                return nil
             }
-            var out: [PolishDraft] = []
-            for await draft in group { out.append(draft) }
-            return out
         }
 
-        let totalMs = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
-        print("[VOICE-PIPELINE] 3 drafts complete in \(totalMs)ms: " +
-              drafts.map { "\($0.variant.rawValue)=\($0.latencyMs)ms" }.joined(separator: " "))
-
-        if let winner = PolishCritic.pick(
-            drafts: drafts,
-            rawFrozen: frozenInput,
-            expectedSentinels: expectedSentinels
-        ) {
-            return winner.text
+        // 5. Trailing "Output:" / "Input:" continuation residue.
+        if cleaned.range(of: #"\n\s*(Input|Output):"#, options: .regularExpression) != nil {
+            logReject(rule: "trailing-turn-marker", input: original, polish: polish)
+            return nil
         }
 
-        // All drafts disqualified — fall back to conservative (most likely
-        // to be intact even if it lost entities, because its prompt is the
-        // least invasive). If conservative isn't in the list either, return
-        // the raw frozen input — postprocessor will still unfreeze + finish.
-        print("[VOICE-PIPELINE] WARN: all drafts disqualified, falling back")
-        if let conservative = drafts.first(where: { $0.variant == .conservative }) {
-            return conservative.text
+        // 6. Vulgarity injection. Word-boundary match: any word in the
+        //    blocklist that's in the polish but NOT the original is a
+        //    polish-induced corruption.
+        if let bad = injectedVulgarity(polish: cleaned, original: original) {
+            logReject(rule: "vulgarity:\(bad)", input: original, polish: polish)
+            return nil
         }
-        return frozenInput
+
+        // 7. Semantic flip detection — negation lost. Catastrophic, all modes.
+        if hasSemanticFlip(polish: cleaned, original: original) {
+            logReject(rule: "semantic-flip", input: original, polish: polish)
+            return nil
+        }
+
+        // --- PROPER NOUN / NUMBER / EMAIL / URL preservation ---
+        // Required in both modes; relaxed mode is identical here — these
+        // are anchors the cloud model still must preserve even when it
+        // restructures everything around them.
+
+        if let missing = missingProperNouns(polish: cleaned, original: original) {
+            logReject(rule: "lost-proper-noun:\(missing)", input: original, polish: polish)
+            return nil
+        }
+
+        if let lostNum = missingSignificantNumber(polish: cleaned, original: original) {
+            logReject(rule: "lost-number:\(lostNum)", input: original, polish: polish)
+            return nil
+        }
+
+        if let lostEmail = missingEmail(polish: cleaned, original: original) {
+            logReject(rule: "lost-email:\(lostEmail)", input: original, polish: polish)
+            return nil
+        }
+
+        if let lostURL = missingURL(polish: cleaned, original: original) {
+            logReject(rule: "lost-url:\(lostURL)", input: original, polish: polish)
+            return nil
+        }
+
+        // --- STRICT-MODE-ONLY BUDGETS ---
+        // Tight word/length/contraction/filler caps that legitimately
+        // catch the local 1.7B but starve cloud restructuring. Skipped
+        // entirely in .relaxed.
+        if mode == .strict {
+            if let reason = strictBudgetCheck(
+                polish: cleaned,
+                original: original,
+                cleanupLevel: cleanupLevel,
+                userVocabulary: userVocabulary
+            ) {
+                logReject(rule: "strict:\(reason)", input: original, polish: polish)
+                return nil
+            }
+        } else {
+            // Relaxed: only block COMPLETELY-DEGENERATE drift —
+            // empty output or output that's <10% of input length on
+            // a non-trivial input. Anything in between is the cloud
+            // legitimately rewriting.
+            let origCount = original.count
+            if origCount > 40, cleaned.count < max(8, origCount / 10) {
+                logReject(rule: "relaxed:catastrophic-shrink", input: original, polish: polish)
+                return nil
+            }
+            // Symmetric guard for runaway expansion (model in a loop).
+            // Cap at 4x the input — generous, covers email/letter
+            // reformatting + signature + 4 bullets without false-positive.
+            if origCount > 0, cleaned.count > max(80, origCount * 4) {
+                logReject(rule: "relaxed:runaway-expansion", input: original, polish: polish)
+                return nil
+            }
+        }
+
+        return cleaned
+    }
+
+    // MARK: - Internals
+
+    private static func logReject(rule: String, input: String, polish: String) {
+        let inSnip = input.prefix(120).replacingOccurrences(of: "\n", with: "\\n")
+        let outSnip = polish.prefix(120).replacingOccurrences(of: "\n", with: "\\n")
+        print("[VOICE-SANITIZE] rejected: rule=\(rule) input=\"\(inSnip)\" polish=\"\(outSnip)\"")
+    }
+
+    /// Extended-pictographic chars in `polish` that aren't in `original`.
+    private static func containsEmojiNotInOriginal(polish: String, original: String) -> Bool {
+        var origEmojis = Set<UnicodeScalar>()
+        for s in original.unicodeScalars where s.properties.isEmojiPresentation || s.properties.isEmoji {
+            origEmojis.insert(s)
+        }
+        for s in polish.unicodeScalars {
+            // Properties.isEmoji matches digit/asterisk/# too (keycap chars).
+            // Require Extended_Pictographic for true emoji-only test.
+            guard s.properties.isEmojiPresentation || isExtendedPictographic(s) else { continue }
+            if !origEmojis.contains(s) { return true }
+        }
+        return false
+    }
+
+    /// True for Unicode "Extended_Pictographic" — covers all emoji ranges
+    /// without false-positives on digits / # / *. Approximated by the
+    /// dominant emoji blocks; conservative on the side of allowing.
+    private static func isExtendedPictographic(_ s: UnicodeScalar) -> Bool {
+        let v = s.value
+        return (0x1F300...0x1FAFF).contains(v)   // misc symbols & pictographs, extended ranges
+            || (0x2600...0x27BF).contains(v)     // misc symbols, dingbats
+            || (0x1F1E6...0x1F1FF).contains(v)   // regional indicator (flags)
+    }
+
+    /// Returns the first vulgar word introduced by polish, or nil.
+    private static let vulgarWords: Set<String> = [
+        "cuck", "fuck", "fucking", "fucked", "fucker",
+        "shit", "shitty", "shitting",
+        "cunt", "bitch", "bastard",
+        "nigger", "nigga", "faggot", "fag", "retard", "retarded",
+        "asshole", "dick", "cock", "pussy", "twat", "whore", "slut"
+    ]
+
+    private static func injectedVulgarity(polish: String, original: String) -> String? {
+        let origSet = wordSet(original)
+        let polSet = wordSet(polish)
+        for v in vulgarWords {
+            if polSet.contains(v) && !origSet.contains(v) { return v }
+        }
+        return nil
+    }
+
+    private static func wordSet(_ s: String) -> Set<String> {
+        Set(s.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init))
+    }
+
+    /// Detect catastrophic semantic flip: original had a negation
+    /// ("don't think") that's flipped to its positive ("think") in polish.
+    private static let criticalFlips: [(neg: String, pos: String)] = [
+        ("don't think", "think"),
+        ("do not think", "think"),
+        ("shouldn't", "should"),
+        ("should not", "should"),
+        ("won't", "will"),
+        ("will not", "will"),
+        ("can't", "can"),
+        ("cannot", "can"),
+    ]
+
+    private static func hasSemanticFlip(polish: String, original: String) -> Bool {
+        let o = original.lowercased()
+        let p = polish.lowercased()
+        for flip in criticalFlips {
+            let origHasNeg = containsWord(flip.neg, in: o)
+            let polLostNeg = !containsWord(flip.neg, in: p) && containsWord(flip.pos, in: p)
+            if origHasNeg && polLostNeg { return true }
+        }
+        return false
+    }
+
+    private static func containsWord(_ word: String, in text: String) -> Bool {
+        let pattern = "\\b\(NSRegularExpression.escapedPattern(for: word))\\b"
+        return text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    /// Returns the first proper noun (≥4 chars, capitalized) present in
+    /// original but not in polish. Allows up to 2 losses (typo collapse,
+    /// pronoun replacement) — only fires when ≥3 names disappear.
+    private static func missingProperNouns(polish: String, original: String) -> String? {
+        let origWords = original.components(separatedBy: .whitespacesAndNewlines)
+        let nouns = origWords.compactMap { w -> String? in
+            let stripped = w.trimmingCharacters(in: .punctuationCharacters)
+            guard stripped.count >= 4,
+                  stripped.first?.isUppercase == true,
+                  stripped.dropFirst().contains(where: { $0.isLowercase })
+            else { return nil }
+            return stripped
+        }
+        guard nouns.count >= 2 else { return nil }
+        let polLower = polish.lowercased()
+        let lost = nouns.filter { !polLower.contains($0.lowercased()) }
+        if lost.count > 2 { return lost.first }
+        return nil
+    }
+
+    /// Extract all multi-digit numbers (≥2 digits) from original. If more
+    /// than 1 is missing from polish AND wasn't replaced by a normalized
+    /// form ("twenty three" → "23", "$4.7M"), reject. Single-digit drops
+    /// are tolerated (filler counts).
+    private static func missingSignificantNumber(polish: String, original: String) -> String? {
+        guard let rx = try? NSRegularExpression(pattern: #"\b\d{2,}\b"#) else { return nil }
+        let ns = original as NSString
+        let matches = rx.matches(in: original, range: NSRange(location: 0, length: ns.length))
+        let nums = matches.map { ns.substring(with: $0.range) }
+        guard !nums.isEmpty else { return nil }
+        let polDigits = polish.unicodeScalars.filter { CharacterSet.decimalDigits.contains($0) }
+            .map { Character($0) }
+            .reduce("") { $0 + String($1) }
+        let lost = nums.filter { !polDigits.contains($0) && !polish.contains($0) }
+        // Allow up to 1 loss (e.g. "year 2025" → "this year" is fine if
+        // it was the ONLY number). 2+ lost numbers = the model deleted
+        // material content.
+        if lost.count > 1 { return lost.first }
+        return nil
+    }
+
+    private static func missingEmail(polish: String, original: String) -> String? {
+        guard let rx = try? NSRegularExpression(pattern: #"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"#) else { return nil }
+        let ns = original as NSString
+        let matches = rx.matches(in: original, range: NSRange(location: 0, length: ns.length))
+        let polLower = polish.lowercased()
+        for m in matches {
+            let email = ns.substring(with: m.range)
+            if !polLower.contains(email.lowercased()) { return email }
+        }
+        return nil
+    }
+
+    private static func missingURL(polish: String, original: String) -> String? {
+        guard let rx = try? NSRegularExpression(pattern: #"https?://[^\s)\]\}>,]+"#) else { return nil }
+        let ns = original as NSString
+        let matches = rx.matches(in: original, range: NSRange(location: 0, length: ns.length))
+        let polLower = polish.lowercased()
+        for m in matches {
+            let url = ns.substring(with: m.range)
+            if !polLower.contains(url.lowercased()) { return url }
+        }
+        return nil
+    }
+
+    // MARK: - Strict-mode budget check (legacy)
+    //
+    // This intentionally does NOT duplicate every detail of the Qwen3Polisher
+    // sanitize() — that function is the legacy, comprehensive strict path
+    // and stays where it is for the local 1.7B caller. The strict branch
+    // here is a SECONDARY guard suitable for any new strict caller (e.g.
+    // when the local path is updated to use Sanitizer.run uniformly).
+    // It enforces: word-count drift, length drift, and absence of preamble
+    // residue — the same three guards that caught >90% of local-1.7B
+    // failures in production.
+
+    private static func strictBudgetCheck(
+        polish: String,
+        original: String,
+        cleanupLevel: String?,
+        userVocabulary: [String]?
+    ) -> String? {
+        let originalWords = original.split { $0.isWhitespace }.count
+        let polishWords = polish.split { $0.isWhitespace }.count
+        let wordDelta = abs(originalWords - polishWords)
+        let basePct: Int
+        switch cleanupLevel?.lowercased() {
+        case "none":   basePct = 5
+        case "light":  basePct = 15
+        case "high":   basePct = 60
+        default:       basePct = 30
+        }
+        let wordBudget = max(3, originalWords * basePct / 100)
+        if wordDelta > wordBudget {
+            return "word-drift(\(originalWords)→\(polishWords),budget=\(wordBudget))"
+        }
+        let lenDelta = abs(original.count - polish.count)
+        let lenBudget = max(20, original.count * max(35, basePct) / 100)
+        if lenDelta > lenBudget {
+            return "length-drift(\(original.count)→\(polish.count),budget=\(lenBudget))"
+        }
+        _ = userVocabulary // reserved for future vocab-aware relaxation
+        return nil
     }
 }

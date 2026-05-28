@@ -50,6 +50,11 @@ public enum RestartCorrectionPreprocessor {
         /// 0.0–1.0. Lower = more aggressive (drop more). Default 0.55 is
         /// conservative — only drops when n-gram overlap is clearly high.
         public var nearDuplicateThreshold: Double
+        /// When true, the no-cue frame-restart pass runs ("I want pepperoni
+        /// pizza / I want hawaiian pizza tonight" -> "I want hawaiian pizza
+        /// tonight"). Off-by-default-style false-positive prone, so users can
+        /// disable via @AppStorage("voice.aggressiveRestart").
+        public var aggressiveRestart: Bool
 
         public init(
             stutterRemoval: Bool = true,
@@ -59,7 +64,8 @@ public enum RestartCorrectionPreprocessor {
             discourseFiller: Bool = true,
             partialWordComma: Bool = true,
             confidenceScores: [Float]? = nil,
-            nearDuplicateThreshold: Double = 0.55
+            nearDuplicateThreshold: Double = 0.55,
+            aggressiveRestart: Bool? = nil
         ) {
             self.stutterRemoval = stutterRemoval
             self.phraseRepetition = phraseRepetition
@@ -69,6 +75,14 @@ public enum RestartCorrectionPreprocessor {
             self.partialWordComma = partialWordComma
             self.confidenceScores = confidenceScores
             self.nearDuplicateThreshold = nearDuplicateThreshold
+            // Resolve from @AppStorage if not explicitly provided. Default true.
+            if let v = aggressiveRestart {
+                self.aggressiveRestart = v
+            } else if UserDefaults.standard.object(forKey: "voice.aggressiveRestart") != nil {
+                self.aggressiveRestart = UserDefaults.standard.bool(forKey: "voice.aggressiveRestart")
+            } else {
+                self.aggressiveRestart = true
+            }
         }
 
         public static let `default` = Options()
@@ -78,7 +92,58 @@ public enum RestartCorrectionPreprocessor {
             explicitCorrections: false,
             nearDuplicates: false,
             discourseFiller: false,
-            partialWordComma: false
+            partialWordComma: false,
+            aggressiveRestart: false
+        )
+
+        /// Light-touch configuration for the CLOUD polish path. The cloud
+        /// model is large enough to detect frame-restart and near-duplicate
+        /// patterns itself given the full input — running our heuristic
+        /// passes first only strips signal it could have used and risks
+        /// destroying valid parallel phrasing.
+        ///
+        /// Kept ON:
+        ///   - explicitCorrections — high-precision cue matching ("scratch
+        ///     that", "no wait", "i mean") with similarity gating. Low
+        ///     false-positive rate, and removes content the cloud model
+        ///     would also drop, just at lower latency.
+        ///   - stutterRemoval — pure ASR artefact ("the the the"), zero
+        ///     semantic value.
+        ///   - partialWordComma — narrow ASR artefact pattern ("so I'm tr,
+        ///     I got"), the cut-off fragment is never meaningful.
+        ///
+        /// Turned OFF (cloud model handles natively):
+        ///   - phraseRepetition — heuristic-heavy, can collapse intentional
+        ///     parallel phrasing.
+        ///   - nearDuplicates — adjacent-clause heuristic, false-positive
+        ///     prone on lists / parallel constructions.
+        ///   - discourseFiller — strips "like" in patterns where the cloud
+        ///     model could decide context.
+        ///   - aggressiveRestart — disables the `frameSimilarityPass` and
+        ///     `noCueFrameRestartPass` entirely (they're gated on this).
+        public static let cloudLight = Options(
+            stutterRemoval: true,
+            phraseRepetition: false,
+            explicitCorrections: true,
+            nearDuplicates: false,
+            discourseFiller: false,
+            partialWordComma: true,
+            aggressiveRestart: false
+        )
+
+        /// Hard-bypass for the raw cloud path. Identical structurally to
+        /// `.off`, but named to make the intent obvious at the call site:
+        /// "do not touch the text — the cloud model is the editor." When
+        /// passed, `process()` short-circuits and returns the input
+        /// unchanged with no applied rules.
+        public static let skip = Options(
+            stutterRemoval: false,
+            phraseRepetition: false,
+            explicitCorrections: false,
+            nearDuplicates: false,
+            discourseFiller: false,
+            partialWordComma: false,
+            aggressiveRestart: false
         )
     }
 
@@ -144,6 +209,30 @@ public enum RestartCorrectionPreprocessor {
                 rules.append("near-duplicate")
             }
             current = r.cleaned
+
+            // Frame-similarity restart pass — catches "I went to the store /
+            // I went to the market" style corrections that share the entire
+            // frame except the final content word. Gated by aggressiveRestart
+            // because it can false-positive on intentional parallel phrasing.
+            if options.aggressiveRestart {
+                let fs = frameSimilarityPass(current)
+                if fs.cleaned != current {
+                    dropped.append(contentsOf: fs.dropped)
+                    rules.append("frame-similarity")
+                }
+                current = fs.cleaned
+
+                // No-cue frame restart — looser variant for cases where the
+                // speaker restarts with a different inner noun phrase and a
+                // different token count ("I want pepperoni pizza / I want
+                // hawaiian pizza tonight" -> drops first).
+                let nf = noCueFrameRestartPass(current)
+                if nf.cleaned != current {
+                    dropped.append(contentsOf: nf.dropped)
+                    rules.append("no-cue-frame-restart")
+                }
+                current = nf.cleaned
+            }
         }
 
         if options.discourseFiller {
@@ -503,13 +592,34 @@ public enum RestartCorrectionPreprocessor {
     static func explicitCorrectionPass(_ text: String) -> (cleaned: String, dropped: [DroppedSpan]) {
         // Markers must be standalone (word-boundary on both sides). We allow
         // optional leading punctuation/whitespace.
+        // Expanded cue list. Each entry is a regex matching a self-correction
+        // marker. Includes common ASR misfires:
+        //   - "scratch out" — Whisper sometimes hears "scratch that" as
+        //     "scratch out".
+        //   - "no way" — Whisper sometimes hears "no wait" as "no way".
+        //     This will produce some false positives on emphatic "no way!"
+        //     but the similarity gate below (≥0.20 stemmed overlap with the
+        //     replacement clause) suppresses most of them.
         let markers: [String] = [
             #"\bno\s+wait\b"#,
+            #"\bno\s+way\b"#,                // ASR misfire of "no wait"
             #"\bwait\s+no\b"#,
+            #"\bwait\s+actually\b"#,
             #"\bactually\s+no\b"#,
+            #"\bactually\s+wait\b"#,
+            #"\bno\s+actually\b"#,
             #"\bscratch\s+that\b"#,
+            #"\bscratch\s+out\b"#,           // ASR misfire of "scratch that"
+            #"\bscratch\s+all\s+that\b"#,
+            #"\bignore\s+that\b"#,
+            #"\bignore\s+all\s+that\b"#,
+            #"\bdelete\s+that\b"#,
+            #"\bnever\s*mind\b"#,
+            #"\bforget\s+(?:that|it)\b"#,
             #"\blet\s+me\s+start\s+over\b"#,
+            #"\bi\s+meant\b"#,
             #"\bi\s+mean\b"#,
+            #"\bor\s+rather\b"#,
             #"\blet\s+me\s+rephrase\b"#
         ]
 
@@ -533,17 +643,30 @@ public enum RestartCorrectionPreprocessor {
                 // found within 20 words, give up — too risky.
                 let priorTextRange = NSRange(location: 0, length: markerStart)
                 let priorText = ns.substring(with: priorTextRange)
-                guard let abandonedStart = findClauseStart(in: priorText) else { break }
-
-                // Extract the abandoned attempt + what follows the marker for
-                // similarity check.
-                let abandoned = (priorText as NSString)
-                    .substring(with: NSRange(location: abandonedStart, length: priorText.count - abandonedStart))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let initialAbandonedStart = findClauseStart(in: priorText) else { break }
 
                 // The "replacement" is the next clause after the marker.
                 let afterMarker = ns.substring(with: NSRange(location: markerEnd, length: ns.length - markerEnd))
                 let replacement = firstClause(of: afterMarker)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // Tighten the abandoned span: find the shortest suffix of
+                // priorText[initialAbandonedStart...] whose stemmed-overlap
+                // with `replacement` peaks. This protects against gobbling up
+                // a legitimate prefix when the speaker corrects only the tail
+                // of a sentence (e.g. "send a message to alice saying I'll be
+                // there at three. Scratch out I'll be there at four." — we
+                // want to drop only "I'll be there at three", not the whole
+                // sentence).
+                let abandonedStart = tightenAbandonedStart(
+                    priorText: priorText,
+                    initialStart: initialAbandonedStart,
+                    replacement: replacement
+                )
+
+                // Extract the abandoned attempt for the similarity check.
+                let abandoned = (priorText as NSString)
+                    .substring(with: NSRange(location: abandonedStart, length: priorText.count - abandonedStart))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
 
                 // Similarity gate — without similarity we cannot tell whether
@@ -568,6 +691,7 @@ public enum RestartCorrectionPreprocessor {
                     dropped: droppedText,
                     keptInstead: replacement
                 ))
+                print("[VOICE-RESTART] explicit-cue matched pattern=\(markerPattern) dropped=\"\(droppedText)\" kept=\"\(replacement)\" sim=\(String(format: "%.2f", sim))")
                 working = ns.replacingCharacters(in: NSRange(location: absoluteDropStart, length: dropLen), with: "")
                 // Loop continues — there may be more correction markers further in.
             }
@@ -607,6 +731,61 @@ public enum RestartCorrectionPreprocessor {
         let wordCount = prior.split(whereSeparator: { $0.isWhitespace }).count
         if wordCount <= 25 { return 0 }
         return nil
+    }
+
+    /// Given the abandoned-clause start chosen by `findClauseStart`, try to
+    /// tighten it so we only drop the tokens that actually overlap with the
+    /// replacement clause. Walks the candidate start forward by token,
+    /// computing stemmed overlap with `replacement` at each step, and picks
+    /// the shortest suffix whose overlap is within 90% of the maximum.
+    /// Returns the new start offset (always >= initialStart).
+    static func tightenAbandonedStart(
+        priorText: String,
+        initialStart: Int,
+        replacement: String
+    ) -> Int {
+        guard !replacement.isEmpty else { return initialStart }
+        let chars = Array(priorText)
+        guard initialStart < chars.count else { return initialStart }
+
+        // Compute token boundaries (character offsets where a token starts)
+        // within the candidate abandoned span.
+        var tokenStarts: [Int] = []
+        var inToken = false
+        for k in initialStart..<chars.count {
+            if chars[k].isWhitespace {
+                inToken = false
+            } else {
+                if !inToken { tokenStarts.append(k); inToken = true }
+            }
+        }
+        guard tokenStarts.count > 1 else { return initialStart }
+
+        // Try each candidate start, find the one that maximizes overlap.
+        // Prefer shorter spans on ties (tighter is safer).
+        var best: (start: Int, sim: Double) = (initialStart, -1.0)
+        for start in tokenStarts {
+            let span = String(chars[start..<chars.count])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if span.isEmpty { continue }
+            let sim = stemmedPhraseOverlap(span, replacement)
+            // Prefer shorter spans within 0.05 of the best score so far.
+            if sim > best.sim + 0.001 {
+                best = (start, sim)
+            } else if abs(sim - best.sim) <= 0.05 && start > best.start {
+                // Same-quality but shorter: prefer it.
+                best = (start, sim)
+            }
+        }
+        // Only accept the tightened start if it improves the score over the
+        // initial one by a meaningful margin; otherwise fall back.
+        let initialSpan = String(chars[initialStart..<chars.count])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let initialSim = stemmedPhraseOverlap(initialSpan, replacement)
+        if best.sim >= initialSim {
+            return best.start
+        }
+        return initialStart
     }
 
     /// Take the first clause of `text` up to the next `. ? ! , \n` boundary
@@ -691,10 +870,225 @@ public enum RestartCorrectionPreprocessor {
         return (rebuilt, dropped)
     }
 
+    // MARK: - Pass 3b: Frame-similarity restart detection
+    //
+    // Catches adjacent clauses that share the entire frame except the final
+    // content word ("I went to the store" / "I went to the market"). When
+    // the prefix matches and only the tail content word differs, the second
+    // clause is treated as the speaker's correction and the first is dropped.
+    //
+    //   - Adjacent clauses only, within a 6-token gap.
+    //   - Both clauses must have the same token count (frame match).
+    //   - Every token except the final content word must match (case-insens).
+    //   - Skip if either clause ends with a question word or starts with an
+    //     imperative-style verb — those are likely intentional, not restarts.
+
+    private static let frameSimilarityQuestionWords: Set<String> = [
+        "what", "where", "when", "why", "how", "who", "which", "whose"
+    ]
+    private static let frameSimilarityImperativeVerbs: Set<String> = [
+        "go", "stop", "wait", "listen", "look", "come", "give", "take",
+        "make", "do", "let", "tell", "send", "open", "close", "try",
+        "check", "find", "put", "get", "use", "call", "run", "show",
+        "please"
+    ]
+
+    static func frameSimilarityPass(_ text: String) -> (cleaned: String, dropped: [DroppedSpan]) {
+        let clauses = splitIntoClauses(text)
+        guard clauses.count >= 2 else { return (text, []) }
+
+        var keepFlags = Array(repeating: true, count: clauses.count)
+        var dropped: [DroppedSpan] = []
+
+        for i in 0..<(clauses.count - 1) {
+            guard keepFlags[i] else { continue }
+            let a = clauses[i].text
+            let b = clauses[i + 1].text
+
+            // Tokenize. Keep only alphanumeric word tokens for comparison.
+            let aTokens = a.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map { String($0) }
+            let bTokens = b.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map { String($0) }
+
+            // Frame match requires equal token count, and within a 6-token gap.
+            guard aTokens.count == bTokens.count else { continue }
+            guard aTokens.count >= 2, aTokens.count <= 6 else { continue }
+
+            // Skip imperative-style openings.
+            if let firstA = aTokens.first?.lowercased(),
+               frameSimilarityImperativeVerbs.contains(firstA) { continue }
+            if let firstB = bTokens.first?.lowercased(),
+               frameSimilarityImperativeVerbs.contains(firstB) { continue }
+
+            // Skip if either clause ends with a question word (suggests a real
+            // question, not a restart).
+            if let lastA = aTokens.last?.lowercased(),
+               frameSimilarityQuestionWords.contains(lastA) { continue }
+            if let lastB = bTokens.last?.lowercased(),
+               frameSimilarityQuestionWords.contains(lastB) { continue }
+
+            // Compare every token except the last. They must all match
+            // case-insensitively. The last tokens must DIFFER (otherwise this
+            // is a literal repeat, handled elsewhere).
+            var framesMatch = true
+            for idx in 0..<(aTokens.count - 1) {
+                if aTokens[idx].lowercased() != bTokens[idx].lowercased() {
+                    framesMatch = false
+                    break
+                }
+            }
+            guard framesMatch else { continue }
+            guard aTokens.last?.lowercased() != bTokens.last?.lowercased() else { continue }
+
+            // Drop the first clause — the speaker corrected themselves.
+            keepFlags[i] = false
+            dropped.append(DroppedSpan(
+                reason: "frame-similarity",
+                dropped: a,
+                keptInstead: b
+            ))
+            print("[VOICE-RESTART] frame-similarity matched dropped=\"\(a)\" kept=\"\(b)\"")
+        }
+
+        let kept = zip(clauses, keepFlags).compactMap { $1 ? $0.text : nil }
+        let rebuilt = kept.joined(separator: " ")
+        return (rebuilt, dropped)
+    }
+
+    // MARK: - Pass 3c: No-cue frame restart
+    //
+    // Catches "I want pepperoni pizza / I want hawaiian pizza tonight" style
+    // restarts where the speaker re-uses the same frame ("I want ___ pizza")
+    // with a different inner noun phrase, and may extend the second clause.
+    // The frameSimilarityPass above requires equal token counts AND identical
+    // prefixes — too strict. This looser variant:
+    //
+    //   - Operates on adjacent clauses (no sentence boundary between them).
+    //   - Requires ≥3 of the first 4 tokens to match case-insensitively.
+    //   - Requires at least one inner token to differ (otherwise it's a
+    //     duplicate, handled by nearDuplicatePass).
+    //   - Skips imperative openings and very short clauses (< 3 tokens).
+    //   - Logs every decision under [VOICE-RESTART].
+    //
+    // Drops the FIRST clause (the speaker's abandoned attempt).
+    static func noCueFrameRestartPass(_ text: String) -> (cleaned: String, dropped: [DroppedSpan]) {
+        // Use a looser splitter that also breaks on commas — the speaker's
+        // pause between abandoned and replacement clauses is often only a
+        // comma in the ASR transcript. Sentence boundaries (`.?!\n`) are
+        // honored as well.
+        let clauses = splitOnClauseAndComma(text)
+        guard clauses.count >= 2 else { return (text, []) }
+
+        var keepFlags = Array(repeating: true, count: clauses.count)
+        var dropped: [DroppedSpan] = []
+
+        for i in 0..<(clauses.count - 1) {
+            guard keepFlags[i] else { continue }
+            let a = clauses[i].text
+            let b = clauses[i + 1].text
+
+            // Reject if there's a hard sentence terminator inside `a` (other
+            // than the trailing one). The clause splitter already separates
+            // on `.?!\n`, so adjacent clauses ARE sentence-separated. We treat
+            // a trailing `.` as a soft boundary here — speakers typically pause
+            // mid-restart and ASR inserts a period. Allow it.
+
+            let aTokens = a.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" }).map { String($0) }
+            let bTokens = b.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" }).map { String($0) }
+
+            guard aTokens.count >= 3, bTokens.count >= 3 else { continue }
+            // Cap absolute length — long clauses are unlikely to be a true
+            // restart and false positives here are costly.
+            guard aTokens.count <= 12, bTokens.count <= 14 else { continue }
+
+            // Skip imperative-style openings to avoid wiping legitimate
+            // parallel commands ("send a message to alice / send a message
+            // to bob" — those are intentional, not restarts).
+            if let firstA = aTokens.first?.lowercased(),
+               frameSimilarityImperativeVerbs.contains(firstA) { continue }
+            if let firstB = bTokens.first?.lowercased(),
+               frameSimilarityImperativeVerbs.contains(firstB) { continue }
+
+            // First-4-token overlap. Need ≥3 of the first min(4, len) tokens
+            // to match case-insensitively, in order.
+            let headLen = min(4, min(aTokens.count, bTokens.count))
+            var matches = 0
+            for k in 0..<headLen {
+                if aTokens[k].lowercased() == bTokens[k].lowercased() {
+                    matches += 1
+                }
+            }
+            guard matches >= 3 else { continue }
+
+            // Require that the clauses differ overall — otherwise this is a
+            // literal repeat (handled by nearDuplicatePass).
+            let aLower = aTokens.map { $0.lowercased() }
+            let bLower = bTokens.map { $0.lowercased() }
+            guard aLower != bLower else { continue }
+
+            // Require at least one inner token (positions 1..<aTokens.count-1)
+            // to differ — protects against pure suffix-extension which is
+            // usually a continuation, not a restart.
+            // Compare the smallest common inner window.
+            let innerLen = min(aTokens.count, bTokens.count) - 1
+            var innerDiffers = false
+            if innerLen > 1 {
+                for k in 1..<innerLen {
+                    if aLower[k] != bLower[k] { innerDiffers = true; break }
+                }
+            }
+            guard innerDiffers else { continue }
+
+            keepFlags[i] = false
+            dropped.append(DroppedSpan(
+                reason: "no-cue-frame-restart",
+                dropped: a,
+                keptInstead: b
+            ))
+            print("[VOICE-RESTART] no-cue-frame-restart matched dropped=\"\(a)\" kept=\"\(b)\" headMatches=\(matches)/\(headLen)")
+        }
+
+        let kept = zip(clauses, keepFlags).compactMap { $1 ? $0.text : nil }
+        let rebuilt = kept.joined(separator: " ")
+        return (rebuilt, dropped)
+    }
+
     struct Clause {
         let text: String
         let startOffset: Int
         let endOffset: Int
+    }
+
+    /// Like `splitIntoClauses` but also breaks on commas. Used by the no-cue
+    /// frame-restart pass — the speaker's pause between abandoned and
+    /// replacement clauses is often only a comma in the ASR transcript.
+    static func splitOnClauseAndComma(_ text: String) -> [Clause] {
+        var clauses: [Clause] = []
+        var current = ""
+        var startOffset = 0
+        var i = 0
+        let chars = Array(text)
+        while i < chars.count {
+            current.append(chars[i])
+            let c = chars[i]
+            if c == "." || c == "?" || c == "!" || c == "\n" || c == "," {
+                while i + 1 < chars.count, chars[i + 1] == " " || chars[i + 1] == "\n" {
+                    i += 1
+                    current.append(chars[i])
+                }
+                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    clauses.append(Clause(text: trimmed, startOffset: startOffset, endOffset: i))
+                }
+                current = ""
+                startOffset = i + 1
+            }
+            i += 1
+        }
+        let trailing = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trailing.isEmpty {
+            clauses.append(Clause(text: trailing, startOffset: startOffset, endOffset: chars.count - 1))
+        }
+        return clauses
     }
 
     static func splitIntoClauses(_ text: String) -> [Clause] {

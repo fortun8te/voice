@@ -232,6 +232,12 @@ class TextFormatter {
 
         // 2. Voice commands (they introduce newlines that change structure).
         if config.interpretVoiceCommands {
+            // "scratch that" / "strike that" — wipes the immediately preceding
+            // sentence (or, if no sentence boundary exists yet, the whole
+            // utterance up to the command). Must run BEFORE the general
+            // voice-command pass so the trailing "scratch that" tokens are
+            // still verbatim text we can pattern-match against.
+            result = applyScratchThat(result)
             result = applyVoiceCommands(result)
         }
 
@@ -490,6 +496,60 @@ class TextFormatter {
     private static let ambiguousVoiceCommands: Set<String> = [
         "period", "comma", "colon", "semicolon"
     ]
+
+    /// "scratch that" / "strike that" — the verbal eraser. The user said
+    /// something, didn't like it, and wants the previous sentence (or the
+    /// entire utterance so far if no sentence boundary exists) removed.
+    ///
+    /// Strategy:
+    ///   1. Repeatedly find an occurrence of "(scratch|strike) that" (with
+    ///      optional trailing punctuation, case-insensitive).
+    ///   2. Look LEFT for the nearest sentence terminator (`.!?`). Drop
+    ///      everything from after that terminator up to and including the
+    ///      "scratch that" command itself.
+    ///   3. If no sentence terminator exists to the left, drop everything
+    ///      from the start of the buffer up to and including the command.
+    ///   4. Loop — multiple "scratch thats" in one utterance all resolve.
+    private func applyScratchThat(_ text: String) -> String {
+        guard let regex = try? NSRegularExpression(
+            pattern: "\\b(?:scratch|strike)\\s+that\\b[.!?,]?",
+            options: .caseInsensitive
+        ) else { return text }
+
+        var result = text
+        // Cap iterations defensively — pathological input shouldn't hang.
+        for _ in 0..<32 {
+            let nsRange = NSRange(result.startIndex..., in: result)
+            guard let match = regex.firstMatch(in: result, range: nsRange),
+                  let cmdRange = Range(match.range, in: result) else { break }
+
+            // Walk LEFT from cmdRange.lowerBound to find the previous
+            // sentence terminator. Everything after that terminator (or
+            // start-of-string) up to and including the command is deleted.
+            let leftSlice = result[result.startIndex..<cmdRange.lowerBound]
+            let terminators: Set<Character> = [".", "!", "?", "\n"]
+            let cutStart: String.Index = {
+                if let lastTerm = leftSlice.lastIndex(where: { terminators.contains($0) }) {
+                    // Keep the terminator itself; start the cut just past it.
+                    return result.index(after: lastTerm)
+                }
+                return result.startIndex
+            }()
+
+            result.removeSubrange(cutStart..<cmdRange.upperBound)
+            // Collapse any leftover double-spaces / leading whitespace from
+            // the gap we just created.
+            result = result.replacingOccurrences(
+                of: "[ \\t]{2,}",
+                with: " ",
+                options: .regularExpression
+            )
+            // Trim leading whitespace on the line where the cut landed.
+            // Simple heuristic — strip any whitespace immediately after the
+            // cut point if it's there.
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     /// Replace word-bounded spoken commands with their punctuation/structure.
     /// Word boundaries prevent "exclamation pointing" → "! ing".

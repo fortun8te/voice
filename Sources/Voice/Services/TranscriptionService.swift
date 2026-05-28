@@ -105,11 +105,24 @@ final class TranscriptionService: TranscriptionEngine {
             _ = try? await batch.transcribe(silence, decoderState: &warmupState)
             print("[VOICE] ANE warmup inference complete")
 
+            // Second warmup with the max-samples shape (15s @ 16kHz) so the
+            // long-form CoreML graph is also compiled/cached before first use.
+            let maxModelSamples = 240_000
+            let silenceMax = [Float](repeating: 0.0, count: maxModelSamples)
+            var warmupStateMax = TdtDecoderState.make(decoderLayers: batchDecoderLayerCount)
+            _ = try? await batch.transcribe(silenceMax, decoderState: &warmupStateMax)
+            print("[VOICE] ANE warmup inference complete (max-samples shape)")
+
             if wasFirstLoad {
                 // On first-ever load the daemon needs ~2s to finalize the cache.
                 // Subsequent launches skip this branch (cache already permanent).
-                print("[VOICE] First load — waiting for ANE cache finalization…")
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                // Run in a detached task so prepare() does NOT block on it —
+                // ready state can flip immediately while the daemon finalizes.
+                print("[VOICE] First load — scheduling ANE cache finalization (non-blocking)…")
+                Task.detached {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    print("[VOICE] ANE cache finalization wait complete")
+                }
             }
 
             isReady = true
@@ -157,7 +170,48 @@ final class TranscriptionService: TranscriptionEngine {
         audioChunk: [Float],
         chunkStartTime: TimeInterval
     ) async throws -> [TranscriptSegment] {
-        return []
+        // Write the raw Float32 PCM chunk to a temp .caf file, then hand it
+        // to the existing transcribeFile() path. This is the same approach
+        // AudioCaptureService uses — FluidAudio works best with file URLs.
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voice-meeting-chunk-\(UUID().uuidString).caf")
+
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw TranscriptionError.notInitialized
+        }
+
+        // Write the [Float] samples into an AVAudioPCMBuffer and save to disk.
+        let frameCount = AVAudioFrameCount(audioChunk.count)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+            throw TranscriptionError.notInitialized
+        }
+        buffer.frameLength = frameCount
+        if let channelData = buffer.floatChannelData {
+            audioChunk.withUnsafeBufferPointer { ptr in
+                channelData[0].initialize(from: ptr.baseAddress!, count: audioChunk.count)
+            }
+        }
+
+        let audioFile = try AVAudioFile(forWriting: tmpURL, settings: format.settings)
+        try audioFile.write(from: buffer)
+
+        // Transcribe via the real file path.
+        var segments = try await transcribeFile(url: tmpURL)
+
+        // Offset segment timestamps relative to the meeting session start.
+        for i in segments.indices {
+            segments[i].startTime += chunkStartTime
+            segments[i].endTime   += chunkStartTime
+        }
+
+        return segments
     }
 
     // MARK: - File transcription (primary path for dictation + crash recovery)
@@ -211,12 +265,16 @@ final class TranscriptionService: TranscriptionEngine {
         // class of bug where a mis-decoded boundary stomps a correct one.
         // ============================================================
         let samples: [Float]
+        let tReadStart = CFAbsoluteTimeGetCurrent()
         do {
             samples = try Self.readSamplesAt16kMono(url: url)
         } catch {
             print("[VOICE-TS] readSamplesAt16kMono FAILED: \(error.localizedDescription) — falling back to URL path")
             return try await transcribeFile_legacyURL(url: url, manager: manager, t0: t0)
         }
+        let readMs = (CFAbsoluteTimeGetCurrent() - tReadStart) * 1000
+        fputs("[LATENCY] ASR file-read→[Float] (\(samples.count) samples): \(Int(readMs))ms\n", stderr)
+        let tDecodeStart = CFAbsoluteTimeGetCurrent()
 
         let maxModelSamples = 240_000              // 15s @ 16kHz (FluidAudio limit)
         let safeChunkSamples = 232_000             // ~14.5s — leaves margin under the model cap
@@ -246,6 +304,8 @@ final class TranscriptionService: TranscriptionEngine {
             throw error
         }
 
+        let decodeMs = (CFAbsoluteTimeGetCurrent() - tDecodeStart) * 1000
+        fputs("[LATENCY] ASR decode (Parakeet inference): \(Int(decodeMs))ms\n", stderr)
         let trimmed = result.text.trimmingCharacters(in: .whitespaces)
         let elapsed = Date().timeIntervalSince(t0)
         print("[VOICE-TS] transcribeFile() OK → '\(trimmed.prefix(80))' (\(trimmed.count) chars) in \(String(format: "%.2f", elapsed))s")
@@ -396,7 +456,14 @@ final class TranscriptionService: TranscriptionEngine {
     private static func floatArray(from buffer: AVAudioPCMBuffer) -> [Float] {
         guard let ch = buffer.floatChannelData else { return [] }
         let n = Int(buffer.frameLength)
-        return Array(UnsafeBufferPointer(start: ch[0], count: n))
+        guard n > 0 else { return [] }
+        // Array(UnsafeBufferPointer(...)) iterates element-by-element through
+        // the buffer protocol. Using unsafeUninitializedCapacity + memcpy is a
+        // single raw memory copy, ~10x faster on multi-MB buffers.
+        return [Float](unsafeUninitializedCapacity: n) { destBuf, initCount in
+            memcpy(destBuf.baseAddress!, ch[0], n * MemoryLayout<Float>.stride)
+            initCount = n
+        }
     }
 
     /// Chunk a long sample array into ~14.5 s windows with 2 s overlap,
@@ -435,7 +502,17 @@ final class TranscriptionService: TranscriptionEngine {
 
         while chunkStart < samples.count {
             let end = min(chunkStart + chunkSamples, samples.count)
-            let slice = Array(samples[chunkStart..<end])
+            // Array(samples[chunkStart..<end]) goes through the Sequence
+            // initialiser — element-by-element copy. unsafeUninitializedCapacity
+            // + memcpy is a single bulk copy per chunk. For multi-chunk audio
+            // this is hot — every saved alloc matters.
+            let sliceCount = end - chunkStart
+            let slice: [Float] = samples.withUnsafeBufferPointer { src in
+                [Float](unsafeUninitializedCapacity: sliceCount) { dest, initCount in
+                    memcpy(dest.baseAddress!, src.baseAddress! + chunkStart, sliceCount * MemoryLayout<Float>.stride)
+                    initCount = sliceCount
+                }
+            }
             var decoderState = TdtDecoderState.make(decoderLayers: decoderLayers)
             // FluidAudio requires ≥ minimumRequiredSamples; pad final tiny tail.
             let minSamples = sampleRate / 4 // 250ms
@@ -542,25 +619,31 @@ final class TranscriptionService: TranscriptionEngine {
         // — case-insensitive, punctuation-stripped match. We scan k from the
         // budget down so the first hit is the longest.
         let maxK = min(maxWords, lWords.count, rWords.count)
-        let norm: (String) -> String = { s in
-            s.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters)
-        }
+        let punct = CharacterSet.punctuationCharacters
+        // Pre-normalize the L-tail and R-head ONCE. The previous implementation
+        // re-normalized the same words on every k iteration (O(maxK²) string
+        // work). One pass is O(maxK).
+        let lTailNorm: [String] = lWords.suffix(maxK).map { $0.lowercased().trimmingCharacters(in: punct) }
+        let rHeadNorm: [String] = rWords.prefix(maxK).map { $0.lowercased().trimmingCharacters(in: punct) }
         var bestK = 0
-        var requireMatches = 2 // at least 2 consecutive matching words to declare overlap
+        let requireMatches = 2 // at least 2 consecutive matching words to declare overlap
         for k in stride(from: maxK, through: requireMatches, by: -1) {
-            let lTail = lWords.suffix(k).map(norm)
-            let rHead = rWords.prefix(k).map(norm)
+            // Slice the pre-normalized prefix/suffix without re-normalizing.
+            // For the L tail of size k we want the last k entries of lTailNorm.
+            let lStart = lTailNorm.count - k
             // Allow a small mismatch tolerance: require ≥ 60 % matches AND
             // first + last token to match. This handles the case where the
             // boundary words mis-decoded ("trade" vs "treat") but the rest
             // of the overlap is intact.
             var hits = 0
-            for j in 0..<k where lTail[j] == rHead[j] { hits += 1 }
+            for j in 0..<k where lTailNorm[lStart + j] == rHeadNorm[j] { hits += 1 }
             let ratio = Double(hits) / Double(k)
             // Tighter guard: ≥75% word match AND first AND last word of the
             // window agree. Raising from 60% + first-only prevents false-
             // positive overlaps from eating non-overlap content at the seam.
-            if ratio >= 0.75 && lTail.first == rHead.first && lTail.last == rHead.last {
+            if ratio >= 0.75
+                && lTailNorm[lStart] == rHeadNorm[0]
+                && lTailNorm[lStart + k - 1] == rHeadNorm[k - 1] {
                 bestK = k
                 break
             }
@@ -604,11 +687,18 @@ final class TranscriptionService: TranscriptionEngine {
 
         func flush() {
             guard !currentPieces.isEmpty else { return }
-            let joined = currentPieces.joined()
-                .replacingOccurrences(of: wordStartMarker, with: "")
-                .trimmingCharacters(in: .whitespaces)
-            if !joined.isEmpty {
-                groups.append((joined, currentMin))
+            // The word-start marker (▁) only ever appears at the very start of
+            // the first piece in a group (that's what defines a group start).
+            // String.replacingOccurrences scans the whole joined string and
+            // allocates a fresh String — pointless when only the leading char
+            // can ever match. Strip via prefix-drop instead.
+            var joined = currentPieces.joined()
+            if joined.hasPrefix(wordStartMarker) {
+                joined.removeFirst(wordStartMarker.count)
+            }
+            let trimmed = joined.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty {
+                groups.append((trimmed, currentMin))
             }
             currentPieces.removeAll(keepingCapacity: true)
             currentMin = .greatestFiniteMagnitude

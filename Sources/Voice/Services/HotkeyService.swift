@@ -54,6 +54,10 @@ extension Notification.Name {
     static let voiceHotkeyChanged = Notification.Name("voiceHotkeyChanged")
     /// Posted when the user presses ⌥1 to trigger Polish Selection.
     static let voicePolishSelection = Notification.Name("voice.polishSelection")
+    /// Posted when the user presses the Escape key globally. The AppDelegate
+    /// decides whether to act on it (only when a dictation is past the
+    /// recording stage — idle ESC is a no-op so we don't shadow system Esc).
+    static let voiceEscapePressed = Notification.Name("voice.escapePressed")
 }
 
 // MARK: - Captured Hotkey
@@ -201,29 +205,44 @@ struct CapturedHotkey: Codable, Hashable, Identifiable {
 enum HotkeyRole: String, CaseIterable {
     case pushToTalk = "ptt"
     case handsFree  = "lock"
+    case polish     = "polish"
 
     var displayName: String {
         switch self {
         case .pushToTalk: return "Push to talk"
         case .handsFree:  return "Hands-free mode"
+        case .polish:     return "Polish selection"
         }
     }
     var subtitle: String {
         switch self {
-        case .pushToTalk: return "Hold to say something short"
-        case .handsFree:  return "Dictate hands-free by pressing this hotkey to start and stop"
+        case .pushToTalk: return "Hold fn to say something short, release to paste"
+        case .handsFree:  return "Double-tap fn to start hands-free, tap fn again to stop"
+        case .polish:     return "Select any text, press this to polish it in place"
         }
     }
 
     /// Sensible defaults so first launch works without setup.
+    ///
+    /// These match Wispr Flow exactly:
+    ///   - Push to talk:  hold `fn` alone (modifier-only, fn bit = 0x800000).
+    ///   - Hands-free:    `fn + Space`.
+    /// On keyboards without an Apple fn key, the user can rebind PTT to
+    /// Ctrl+Opt (and hands-free to Ctrl+Opt+Space) via Settings; the NSEvent
+    /// fallback monitor handles those non-fn bindings.
     var defaultBindings: [CapturedHotkey] {
         switch self {
         case .pushToTalk:
-            // Right Option, modifier-only.
-            return [CapturedHotkey(keyCode: nil, modifiersRaw: 0x40)]
+            // fn alone, modifier-only.
+            return [CapturedHotkey(keyCode: nil, modifiersRaw: 0x800000)]
         case .handsFree:
-            // fn + Space.
-            return [CapturedHotkey(keyCode: 49, modifiersRaw: 0x800000)]
+            // No separate binding — hands-free is entered by double-tapping fn
+            // (two quick fn presses within the double-tap window). The PTT state
+            // machine handles this natively; no extra binding needed.
+            return []
+        case .polish:
+            // Option+1 — matches prior hardcoded binding so existing users keep it.
+            return [CapturedHotkey(keyCode: 18, modifiersRaw: NSEvent.ModifierFlags.option.rawValue)]
         }
     }
 
@@ -231,6 +250,7 @@ enum HotkeyRole: String, CaseIterable {
         switch self {
         case .pushToTalk: return "hotkeys.captured.ptt"
         case .handsFree:  return "hotkeys.captured.lock"
+        case .polish:     return "hotkeys.captured.polish"
         }
     }
 
@@ -240,7 +260,28 @@ enum HotkeyRole: String, CaseIterable {
               !parsed.isEmpty else {
             return defaultBindings
         }
+        // PTT bindings must never be Option-key based — Option is not fn, and
+        // any Option binding from legacy installs breaks the fn tap. Sanitize
+        // on every load (cheap; only writes UserDefaults if a fix is needed).
+        if self == .pushToTalk { return Self.sanitizePTTBindings(parsed) }
         return parsed
+    }
+
+    /// Remove any Option-key bits (Left⌥ 0x20, Right⌥ 0x40) from PTT bindings.
+    /// If all bindings were Option-only, falls back to the fn default.
+    /// Runs on every load but only writes UserDefaults when a fix is needed.
+    private static func sanitizePTTBindings(_ parsed: [CapturedHotkey]) -> [CapturedHotkey] {
+        let optionBits: UInt = 0x20 | 0x40
+        let cleaned = parsed.filter { ($0.modifiersRaw & optionBits) == 0 }
+        guard cleaned.count != parsed.count else { return parsed }   // nothing to fix
+
+        let result = cleaned.isEmpty ? HotkeyRole.pushToTalk.defaultBindings : cleaned
+        if let data = try? JSONEncoder().encode(result) {
+            UserDefaults.standard.set(data, forKey: "hotkeys.captured.ptt")
+        }
+        let names = result.map { $0.displayName }.joined(separator: ", ")
+        print("[VOICE-HK] Sanitized Option-key PTT binding(s) → \(names)")
+        return result
     }
 
     func saveBindings(_ bindings: [CapturedHotkey]) {
@@ -324,10 +365,13 @@ class HotkeyService {
     // MARK: Public surface
 
     @ObservationIgnored
-    private var pttBindings: [CapturedHotkey] { HotkeyRole.pushToTalk.loadBindings() }
+    private var pttBindings:    [CapturedHotkey] { HotkeyRole.pushToTalk.loadBindings() }
 
     @ObservationIgnored
-    private var lockBindings: [CapturedHotkey] { HotkeyRole.handsFree.loadBindings() }
+    private var lockBindings:   [CapturedHotkey] { HotkeyRole.handsFree.loadBindings() }
+
+    @ObservationIgnored
+    private var polishBindings: [CapturedHotkey] { HotkeyRole.polish.loadBindings() }
 
     /// Whether the hotkey-driven recording session is active (PTT held or
     /// locked). Mirrors transition state for UI binding.
@@ -351,9 +395,56 @@ class HotkeyService {
     @ObservationIgnored private var globalMonitor: Any?
     @ObservationIgnored private var localMonitor: Any?
     @ObservationIgnored private var polishSelectionMonitor: Any?
+    /// Passive global monitor for the Escape key (virtual keycode 53). Used
+    /// to cancel an in-flight dictation when the user presses Esc anywhere on
+    /// the system. We don't consume the event — Esc continues to dismiss the
+    /// active app's UI as usual. The AppDelegate gates the action so idle Esc
+    /// is a no-op (no interference with normal Esc semantics).
+    @ObservationIgnored private var escapeGlobalMonitor: Any?
+    /// Local mirror of escapeGlobalMonitor so the cancel still works while
+    /// VOICE itself is frontmost (e.g. BigMenu open, settings sheet shown).
+    @ObservationIgnored private var escapeLocalMonitor: Any?
     @ObservationIgnored private var hotkeyChangeObserver: NSObjectProtocol?
     @ObservationIgnored private var hotkeyIsDown = false
     @ObservationIgnored private var doubleTapTimer: Timer?
+
+    // === RELIABILITY: tap health watchdog + system-event re-arm ===
+    //
+    // CGEventTaps installed at .cghidEventTap can die silently in several
+    // well-known ways: callback timeout (tapDisabledByTimeout),
+    // Accessibility permission toggle, display sleep/wake, screen lock/unlock.
+    // The in-callback re-enable in FnKeyTap.handle() covers the timeout case
+    // but cannot recover if the tap CFMachPort itself is invalidated. These
+    // belt-and-suspenders mechanisms detect a dead tap and recreate it.
+    @ObservationIgnored private var healthTimer: Timer?
+    @ObservationIgnored private var systemObservers: [NSObjectProtocol] = []
+    @ObservationIgnored private var distributedObservers: [NSObjectProtocol] = []
+
+    /// True while the CURRENT press was initiated by the CGEventTap (fnKeyDown),
+    /// false when NSEvent initiated it (handleEvent LATCH ON). Used to prevent
+    /// the NSEvent monitor from firing a spurious LATCH OFF while fn is still
+    /// physically held — the tap's fnKeyUp() is the only authoritative release
+    /// for fn presses. Without this guard, any unmatched NSEvent (e.g. a keyDown
+    /// for any character key) would enter the `!isDown && hotkeyIsDown` branch
+    /// and prematurely fire transition(.keyUp), dropping the recording.
+    @ObservationIgnored private var pressInitiatedByFnTap = false
+
+    /// The CGEventTap that consumes the `fn` key so macOS doesn't pop the
+    /// emoji / dictation picker. Drives the SAME state machine as the NSEvent
+    /// path. Created lazily in `startMonitoring()`; nil if tap creation failed
+    /// (then we rely purely on the passive NSEvent monitor).
+    @ObservationIgnored private var fnKeyTap: FnKeyTap?
+
+    /// True when the CGEventTap is live and successfully consuming fn. While
+    /// true, the NSEvent monitor must NOT also process fn-based bindings (the
+    /// tap already drives them) — otherwise every fn press would fire twice.
+    @ObservationIgnored private var fnTapActive = false
+
+    /// fn modifier bit, matching `CapturedHotkey` / NSEvent.ModifierFlags.function.
+    @ObservationIgnored private static let fnMask: UInt = 0x800000
+
+    /// One-time guard so we only write the `AppleFnUsageType` default once.
+    @ObservationIgnored private static var didWriteFnUsageDefault = false
 
     /// Which role (PTT vs hands-free) owns the current press. Captured on
     /// keyDown, cleared on keyUp. Lets us route the release correctly
@@ -373,6 +464,35 @@ class HotkeyService {
     func startMonitoring() {
         stopMonitoring()
 
+        // Belt-and-suspenders emoji suppression. The CGEventTap consuming the
+        // fn flagsChanged is the PRIMARY mechanism; this preference is honored
+        // by some macOS versions to make the fn key "Do Nothing". One-time.
+        Self.disableFnEmojiSystemBindingIfNeeded()
+
+        // === Primary: CGEventTap for fn / fn+Space (can CONSUME events) ===
+        // Only install when at least one fn-based binding exists (the default).
+        // If the user rebinds everything off fn (e.g. to Ctrl+Opt on an
+        // external keyboard), the tap is unnecessary and the NSEvent monitor
+        // below handles it.
+        fnTapActive = false
+        if anyFnBinding {
+            let tap = FnKeyTap()
+            tap.delegate = self
+            if tap.start() {
+                fnKeyTap = tap
+                fnTapActive = true
+            } else {
+                // tapCreate failed (logged inside FnKeyTap) — fall back to the
+                // passive NSEvent monitor below. fn suppression won't work, but
+                // the hotkey itself still functions.
+                fnKeyTap = nil
+            }
+        }
+
+        // === Fallback / non-fn bindings: passive NSEvent monitor ===
+        // Always installed. When the fn tap is active it SKIPS fn-based events
+        // (handleEvent guards on fnTapActive) so we never double-fire; it still
+        // services any non-fn bindings (e.g. Ctrl+Opt) the user added.
         let mask: NSEvent.EventTypeMask = [.flagsChanged, .keyDown, .keyUp]
 
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
@@ -384,16 +504,53 @@ class HotkeyService {
             return event
         }
 
-        // Opt+1 global shortcut — triggers "Polish Selected Text" flow.
-        // keyCode 18 = "1". Fires only when option is the sole modifier.
+        // Polish-selection global shortcut — configurable via HotkeyRole.polish.
+        // Defaults to ⌥1 (matching prior hardcoded binding) but the user can
+        // change it in Settings > Polish.
+        let polishHotkeys = polishBindings
         polishSelectionMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard event.keyCode == 18 else { return }
-            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-            guard mods == .option else { return }  // option only, no cmd/ctrl/shift
+            guard let self else { return }
+            let matched = polishHotkeys.contains { binding in
+                if let kc = binding.keyCode {
+                    guard event.keyCode == kc else { return false }
+                }
+                let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                let required = NSEvent.ModifierFlags(rawValue: binding.modifiersRaw)
+                    .intersection(.deviceIndependentFlagsMask)
+                return mods == required
+            }
+            guard matched else { return }
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .voicePolishSelection, object: nil)
             }
-            _ = self
+        }
+
+        // === Escape key cancel-in-flight monitor ===
+        // Virtual keycode 53 (kVK_Escape) WITHOUT any modifiers. We listen
+        // GLOBALLY (events outside VOICE) and LOCALLY (when VOICE is
+        // frontmost) so the cancel works regardless of app focus. The
+        // monitors do NOT consume the event — Esc continues to dismiss the
+        // host app's UI as usual. The AppDelegate decides whether to act on
+        // it; idle Esc is a no-op so we never shadow system-wide Esc semantics.
+        let escapeKeyCode: UInt16 = 53
+        let isPlainEscape: (NSEvent) -> Bool = { event in
+            guard event.keyCode == escapeKeyCode else { return false }
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            return mods.isEmpty
+        }
+        escapeGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { event in
+            guard isPlainEscape(event) else { return }
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .voiceEscapePressed, object: nil)
+            }
+        }
+        escapeLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard isPlainEscape(event) else { return event }
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .voiceEscapePressed, object: nil)
+            }
+            // Return the event unmodified so first-responder dismissal still works.
+            return event
         }
 
         if hotkeyChangeObserver == nil {
@@ -407,17 +564,185 @@ class HotkeyService {
             }
         }
 
+        // === Reliability watchdogs ===
+        installHealthTimer()
+        installSystemObservers()
+
         let pttDesc = pttBindings.map { $0.displayName }.joined(separator: ", ")
         let lockDesc = lockBindings.map { $0.displayName }.joined(separator: ", ")
-        print("[VOICE-HK] Monitoring started — PTT: \(pttDesc)  Hands-free: \(lockDesc)")
+        print("[VOICE-HK] Monitoring started — PTT: \(pttDesc)  Hands-free: \(lockDesc)  fnTap=\(fnTapActive ? "active" : "off")")
     }
 
     func stopMonitoring() {
+        fnKeyTap?.stop()
+        fnKeyTap = nil
+        fnTapActive = false
+        pressInitiatedByFnTap = false
+        hotkeyIsDown = false
+        activeRole = nil
         if let m = globalMonitor { NSEvent.removeMonitor(m); globalMonitor = nil }
         if let m = localMonitor { NSEvent.removeMonitor(m); localMonitor = nil }
         if let m = polishSelectionMonitor { NSEvent.removeMonitor(m); polishSelectionMonitor = nil }
+        if let m = escapeGlobalMonitor { NSEvent.removeMonitor(m); escapeGlobalMonitor = nil }
+        if let m = escapeLocalMonitor { NSEvent.removeMonitor(m); escapeLocalMonitor = nil }
         doubleTapTimer?.invalidate()
         doubleTapTimer = nil
+
+        // Tear down reliability watchdogs. They're reinstalled by every
+        // startMonitoring() call (used on first start AND on every re-arm path),
+        // so it's safe to release them unconditionally here.
+        healthTimer?.invalidate()
+        healthTimer = nil
+        for obs in systemObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+        systemObservers.removeAll()
+        for obs in distributedObservers {
+            DistributedNotificationCenter.default().removeObserver(obs)
+        }
+        distributedObservers.removeAll()
+    }
+
+    // MARK: - Reliability: Tap Health Watchdog
+    //
+    // CGEventTaps at .cghidEventTap die in several well-known ways:
+    //   • Callback timeout → tapDisabledByTimeout (handled in-callback in FnKeyTap)
+    //   • Accessibility permission toggle → tap silently invalidated
+    //   • Display sleep/wake, screen lock/unlock → tap may go inert
+    // These watchdogs detect a dead tap and recreate it.
+
+    /// Periodic check that re-enables the fn tap if macOS disabled it.
+    /// In-callback re-enable in FnKeyTap.handle() is the primary defense;
+    /// this catches cases where the disabled-event never reaches the callback.
+    private func installHealthTimer() {
+        healthTimer?.invalidate()
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            self?.healthCheck()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        healthTimer = timer
+    }
+
+    private func healthCheck() {
+        guard fnTapActive, let tap = fnKeyTap else { return }
+        if !tap.isAlive() {
+            print("[VOICE-HK] health check: fn tap is dead — recreating")
+            recreateTapIfNeeded()
+        }
+    }
+
+    /// Subscribes to system events that historically kill CGEventTaps.
+    /// Each handler funnels through `recreateTapIfNeeded`, which re-arms
+    /// in place when possible and fully rebuilds when necessary.
+    private func installSystemObservers() {
+        for obs in systemObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+        systemObservers.removeAll()
+        for obs in distributedObservers {
+            DistributedNotificationCenter.default().removeObserver(obs)
+        }
+        distributedObservers.removeAll()
+
+        let wsnc = NSWorkspace.shared.notificationCenter
+        for name in [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.sessionDidBecomeActiveNotification,
+        ] {
+            let rawName = name.rawValue
+            let obs = wsnc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                print("[VOICE-HK] system event \(rawName) — checking tap health")
+                self.recreateTapIfNeeded()
+                self.resyncModifierLatchAfterSystemEvent()
+            }
+            systemObservers.append(obs)
+        }
+
+        // Distributed notifications: screen unlock + Accessibility permission
+        // change. The .cghidEventTap requires Accessibility, so if it was just
+        // granted, recreateTapIfNeeded() succeeds here.
+        let dnc = DistributedNotificationCenter.default()
+        for name in ["com.apple.screenIsUnlocked", "com.apple.accessibility.api"] {
+            let obs = dnc.addObserver(
+                forName: NSNotification.Name(name),
+                object: nil, queue: .main
+            ) { [weak self] _ in
+                print("[VOICE-HK] distributed event \(name) — checking tap health")
+                self?.recreateTapIfNeeded()
+                self?.resyncModifierLatchAfterSystemEvent()
+            }
+            distributedObservers.append(obs)
+        }
+    }
+
+    /// If the fn tap should be active but isn't, recreate it. No-op when healthy.
+    private func recreateTapIfNeeded() {
+        // Case A: tap should be on AND is healthy → nothing to do.
+        if fnTapActive, let tap = fnKeyTap, tap.isAlive() {
+            return
+        }
+        // Case B: tap exists but disabled → cheap re-arm first.
+        if fnTapActive, let tap = fnKeyTap {
+            tap.rearm()
+            if tap.isAlive() {
+                print("[VOICE-HK] tap rearmed in place")
+                return
+            }
+        }
+        // Case C: full rebuild. startMonitoring() tears down and reinstalls
+        // everything (tap, NSEvent monitors, observers, timer).
+        print("[VOICE-HK] recreating event tap from scratch")
+        startMonitoring()
+    }
+
+    /// Fix 5: modifier-flag desync recovery. If sleep/lock dropped the physical
+    /// key-up event for the bound modifier, we'd be stuck in `hotkeyIsDown=true`
+    /// forever and the recording would never stop. After every system event,
+    /// if no relevant modifier is currently held, force the latch off so the
+    /// next press is treated as fresh.
+    private func resyncModifierLatchAfterSystemEvent() {
+        guard hotkeyIsDown else { return }
+        let currentFlags = NSEvent.modifierFlags.rawValue
+        let relevantMask: UInt =
+            0x40 | 0x20 | 0x10 | 0x8 | 0x2000 | 0x1 | 0x4 | 0x2 | 0x800000
+        if (currentFlags & relevantMask) == 0 {
+            print("[VOICE-HK] modifier latch desync detected — clearing stale hotkeyIsDown")
+            hotkeyIsDown = false
+            activeRole = nil
+            pressInitiatedByFnTap = false
+            // If state machine thinks something is held, release safely.
+            if case .pressed = state {
+                transition(event: .keyUp)
+            }
+        }
+    }
+
+    /// True if any PTT or hands-free binding uses the fn modifier. When true we
+    /// install the CGEventTap to suppress the OS emoji popup; otherwise the
+    /// passive NSEvent monitor alone is enough.
+    @ObservationIgnored
+    private var anyFnBinding: Bool {
+        let usesFn: (CapturedHotkey) -> Bool = { ($0.modifiersRaw & Self.fnMask) != 0 }
+        return pttBindings.contains(where: usesFn) || lockBindings.contains(where: usesFn)
+    }
+
+    /// Belt-and-suspenders: write `AppleFnUsageType = 0` ("Do Nothing") to the
+    /// global (NSGlobalDomain) preferences so the fn key does not trigger the
+    /// emoji picker or dictation. Honored on some macOS versions; the event-tap
+    /// consumption in `FnKeyTap` is the primary, reliable mechanism. One-time
+    /// per launch, behind a static flag, and logged.
+    private static func disableFnEmojiSystemBindingIfNeeded() {
+        guard !didWriteFnUsageDefault else { return }
+        didWriteFnUsageDefault = true
+        // suiteName: nil targets the global (NSGlobalDomain / .GlobalPreferences) domain.
+        if let global = UserDefaults(suiteName: nil) {
+            global.set(0, forKey: "AppleFnUsageType")
+            print("[VOICE-HK] Wrote AppleFnUsageType=0 to global prefs (fn → Do Nothing). Primary suppression is the CGEventTap.")
+        } else {
+            print("[VOICE-HK] Could not open global prefs to write AppleFnUsageType — relying on CGEventTap only.")
+        }
     }
 
     // MARK: - Raw Event Handling
@@ -428,6 +753,7 @@ class HotkeyService {
 
         if isDown && !hotkeyIsDown {
             hotkeyIsDown = true
+            pressInitiatedByFnTap = false  // this press came from NSEvent, not the fn tap
             activeRole = matchedRoleNow
             print("[VOICE-HK] LATCH ON  role=\(matchedRoleNow?.rawValue ?? "?") eventType=\(event.type.rawValue) keyCode=\(event.keyCode) mods=0x\(String(event.modifierFlags.rawValue, radix: 16))")
             if matchedRoleNow == .handsFree {
@@ -437,6 +763,14 @@ class HotkeyService {
                 transition(event: .keyDown)
             }
         } else if !isDown && hotkeyIsDown {
+            // If the CGEventTap owns this press, it — not NSEvent — is authoritative
+            // for the release. fnKeyUp() will fire when fn is physically lifted.
+            // Letting NSEvent fire LATCH OFF here would prematurely drop the recording:
+            // any unmatched event (e.g. pressing a letter key while fn is held) would
+            // enter this branch and call transition(.keyUp) while fn is still down.
+            if pressInitiatedByFnTap {
+                return
+            }
             hotkeyIsDown = false
             let prevRole = activeRole
             activeRole = nil
@@ -457,8 +791,19 @@ class HotkeyService {
     /// first and short-circuits, so PTT semantics win deterministically.
     /// This matters for any single press to behave consistently across launches.
     private func matchedRole(_ event: NSEvent) -> HotkeyRole? {
-        for b in pttBindings where b.matches(event, hotkeyIsDown: hotkeyIsDown) { return .pushToTalk }
-        for b in lockBindings where b.matches(event, hotkeyIsDown: hotkeyIsDown) { return .handsFree }
+        // When the CGEventTap is live it owns all fn-based bindings (it both
+        // drives the state machine AND consumes the event). The NSEvent monitor
+        // must therefore SKIP fn bindings here, or every fn press fires twice.
+        // Non-fn bindings (e.g. a user-added Ctrl+Opt) still flow through.
+        let skipFn = fnTapActive
+        for b in pttBindings {
+            if skipFn && (b.modifiersRaw & Self.fnMask) != 0 { continue }
+            if b.matches(event, hotkeyIsDown: hotkeyIsDown) { return .pushToTalk }
+        }
+        for b in lockBindings {
+            if skipFn && (b.modifiersRaw & Self.fnMask) != 0 { continue }
+            if b.matches(event, hotkeyIsDown: hotkeyIsDown) { return .handsFree }
+        }
         return nil
     }
 
@@ -514,12 +859,24 @@ class HotkeyService {
             isHotkeyActive = true
             fireDelegateSync { $0.hotkeyDidActivate() }
 
-        // .pressed ── keyUp ──▶ branch on hold duration
+        // .pressed ── keyUp ──▶ .idle (long hold) or .armed (short tap)
+        //
+        // Long hold (≥ threshold): PTT commit immediately on release.
+        //
+        // Short tap (< threshold): enter the double-tap window (.armed). The
+        // recording from the first tap stays live. If a second fn press arrives
+        // within `doubleTapWindow` → lock mode (hands-free). If the timer fires
+        // with no second tap → hotkeyDidQuickRelease (silent discard).
+        //
+        // Safety: the CGEventTap synthesizes fnKeyUp on re-enable after a timeout,
+        // and fnKeyUp now always clears hotkeyIsDown, so a dropped fn-up can no
+        // longer leave the machine stuck in .pressed.
         case (.pressed(let since), .keyUp):
             let held = Date().timeIntervalSince(since)
             if held < shortTapThreshold {
-                state = .armed
-                startDoubleTapTimer()
+                state = .armed          // wait for possible second tap
+                startDoubleTapTimer()   // fires hotkeyDidQuickRelease if no second tap
+                // isHotkeyActive stays true — recording is still live during the window
             } else {
                 state = .idle
                 isHotkeyActive = false
@@ -583,10 +940,40 @@ class HotkeyService {
             pressDownAt = nil
             fireDelegateSync { $0.hotkeyDidActivate() }
 
-        // Defensive — handsFreeTap from other states: log & ignore.
-        case (.pressed, .handsFreeTap),
-             (.armed, .handsFreeTap),
-             (.lockedAndPressed, .handsFreeTap):
+        // .pressed ── handsFreeTap ──▶ .locked
+        // fn + Space: fn alone already fired .keyDown (PTT), so a recording is
+        // live and state is .pressed. The Space half then arrives as a
+        // handsFreeTap. Promote the in-flight PTT recording to lock mode — same
+        // path a double-tap takes from .armed. We do NOT re-activate (recording
+        // already started); we only fire hotkeyDidDoubleTap so the delegate
+        // calls enterLockMode() and the existing recording continues seamlessly.
+        case (.pressed, .handsFreeTap):
+            state = .locked
+            isLocked = true
+            isHotkeyActive = true
+            // Keep pressDownAt — the recording that began on the fn .keyDown
+            // owns it; lock mode doesn't restart the recording.
+            fireDelegateSync { $0.hotkeyDidDoubleTap() }
+
+        // .armed ── handsFreeTap ──▶ .locked
+        // Same as above but the fn tap was so brief it already released into
+        // .armed before Space landed. Cancel the pending quick-tap discard and
+        // lock the still-running recording.
+        case (.armed, .handsFreeTap):
+            cancelDoubleTapTimer()
+            state = .locked
+            isLocked = true
+            isHotkeyActive = true
+            // BUGFIX: clear hotkeyIsDown + pressDownAt so a subsequent fn tap
+            // is treated as a fresh press against the lock state, not as a
+            // continuation of the prior (already-released) press. Prevents
+            // third-tap collision after fn+Space combo.
+            hotkeyIsDown = false
+            pressDownAt = nil
+            fireDelegateSync { $0.hotkeyDidDoubleTap() }
+
+        // Defensive — handsFreeTap while a lock-exit press is mid-flight: ignore.
+        case (.lockedAndPressed, .handsFreeTap):
             print("[VOICE-HK] Unhandled handsFreeTap in state \(state) — ignored")
             return
 
@@ -639,6 +1026,75 @@ class HotkeyService {
 
     deinit {
         stopMonitoring()
+        // `hotkeyChangeObserver` is intentionally registered once for the
+        // lifetime of the service (so .voiceHotkeyChanged re-arms even when
+        // monitoring is paused), so it isn't torn down in stopMonitoring().
+        // Clean it up here on final teardown to avoid a stranded NotificationCenter
+        // token. The observer captures `[weak self]` so this is belt-and-suspenders.
+        if let token = hotkeyChangeObserver {
+            NotificationCenter.default.removeObserver(token)
+            hotkeyChangeObserver = nil
+        }
+    }
+}
+
+// MARK: - FnKeyTapDelegate
+//
+// The CGEventTap delivers these on the MAIN thread (its run-loop source is on
+// the main run loop). Each one drives the SAME state machine the NSEvent path
+// uses, with identical latch bookkeeping (hotkeyIsDown / activeRole), so PTT
+// hold/release and the double-tap-to-lock semantics are byte-for-byte the same
+// whether they arrive via the tap or the fallback monitor.
+//
+// Mapping (matches Wispr Flow):
+//   fn held alone           → PTT  → .keyDown / .keyUp through the state machine
+//   fn + Space              → hands-free toggle → .handsFreeTap (the delegate
+//                             routes this to lock via hotkeyDidDoubleTap, i.e.
+//                             the same "locked" path double-tap uses)
+extension HotkeyService: FnKeyTapDelegate {
+
+    func fnKeyDown() {
+        // Fresh PTT press. Mirror handleEvent's LATCH ON.
+        // Guard against double-fire if fn generates repeated events while held.
+        guard !hotkeyIsDown else { return }
+        hotkeyIsDown = true
+        pressInitiatedByFnTap = true  // NSEvent must not steal the LATCH OFF
+        activeRole = .pushToTalk
+        print("[VOICE-HK] LATCH ON  role=ptt source=fnTap (fn down)")
+        transition(event: .keyDown)
+    }
+
+    func fnKeyUp() {
+        // fn lifted. Always clear the fn-tap ownership flag so NSEvent can
+        // operate normally again after this point.
+        pressInitiatedByFnTap = false
+
+        guard hotkeyIsDown else {
+            // Already cleared (e.g. tap re-enabled and synthesized early keyUp).
+            activeRole = nil
+            return
+        }
+        let wasOwnedByPTT = (activeRole == .pushToTalk)
+        hotkeyIsDown = false
+        activeRole = nil
+
+        guard wasOwnedByPTT else {
+            // fn went down as part of a non-PTT context; nothing to commit.
+            return
+        }
+        print("[VOICE-HK] LATCH OFF role=ptt source=fnTap (fn up)")
+        // The state machine handles all cases correctly:
+        //   .pressed + .keyUp  → commit or quickRelease
+        //   .locked  + .keyUp  → no-op (lock continues; user must press fn again
+        //                        to exit, which now works because hotkeyIsDown=false)
+        //   .idle    + .keyUp  → defensive no-op (log)
+        transition(event: .keyUp)
+    }
+
+    func fnSpacePressed() {
+        // fn+Space is no longer the hands-free trigger (double-tap fn replaced it).
+        // FnKeyTap no longer calls this — kept as a no-op so the delegate
+        // protocol conformance compiles without changes to the protocol itself.
     }
 }
 

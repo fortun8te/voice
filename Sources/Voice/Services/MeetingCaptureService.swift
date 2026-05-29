@@ -25,6 +25,7 @@ import Foundation
 import AVFoundation
 import ScreenCaptureKit
 import AppKit
+import os
 
 // MARK: - MeetingCaptureError
 
@@ -151,8 +152,20 @@ final class MeetingCaptureService: NSObject {
     /// by the 10s health log to verify mic + sys are both flowing. If
     /// `micSampleCount` stops growing while `sysSampleCount` keeps growing,
     /// the user's own voice is missing from the recording — we log loudly.
-    private var micSampleCount: UInt64 = 0
-    private var sysSampleCount: UInt64 = 0
+    ///
+    /// Both counters are mutated with `&+=` from two real-time threads (the
+    /// AVAudioEngine input-tap callback and the SCStream sample-buffer delegate)
+    /// and read concurrently from the MainActor mic-health Task and the
+    /// watchdog. Guard them with a dedicated `OSAllocatedUnfairLock` wrapping a
+    /// tiny `SampleCounters` struct so increments and snapshot-reads are atomic
+    /// without ever touching `accumulatorLock` (which is held for longer
+    /// accumulator work and would stall the audio thread). Critical sections are
+    /// minimal — never held across an `await` or any audio processing.
+    private struct SampleCounters {
+        var mic: UInt64 = 0
+        var sys: UInt64 = 0
+    }
+    private let sampleCounters = OSAllocatedUnfairLock(initialState: SampleCounters())
     private var lastMicHealthSnapshotMic: UInt64 = 0
     private var lastMicHealthSnapshotSys: UInt64 = 0
     private var micHealthTask: Task<Void, Never>?
@@ -272,6 +285,23 @@ final class MeetingCaptureService: NSObject {
         self.transcriptionEngine = transcriptionEngine
         super.init()
         accumulator.reserveCapacity(chunkSamples * 2)
+    }
+
+    /// Safety-net teardown. `stopCapture()` is the normal path and already tears
+    /// down all of these, but if the service is deallocated without a
+    /// `stopCapture()` call, the block-based NotificationCenter observer would be
+    /// stranded and the background tasks/timer left running. Mirror the relevant
+    /// teardown from `stopCapture()` here — synchronous only. We deliberately do
+    /// NOT invoke any MainActor-isolated async work from `deinit`; we just remove
+    /// the observer token and cancel the tasks.
+    deinit {
+        if let token = configChangeObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
+        micHealthTask?.cancel()
+        durationTimer?.cancel()
+        watchdogTask?.cancel()
+        statusLogTask?.cancel()
     }
 
     // MARK: - Permission
@@ -606,8 +636,7 @@ final class MeetingCaptureService: NSObject {
         // in Console.app and confirm both sources are alive. If mic stops
         // growing while sys keeps growing, we post a notification so the
         // UI layer can surface a "mic dropped" warning.
-        micSampleCount = 0
-        sysSampleCount = 0
+        sampleCounters.withLock { $0 = SampleCounters() }
         lastMicHealthSnapshotMic = 0
         lastMicHealthSnapshotSys = 0
         micHealthTask?.cancel()
@@ -615,8 +644,9 @@ final class MeetingCaptureService: NSObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 10_000_000_000) // 10s
                 guard let self, !Task.isCancelled else { break }
-                let mic = self.micSampleCount
-                let sys = self.sysSampleCount
+                let snapshot = self.sampleCounters.withLock { $0 }
+                let mic = snapshot.mic
+                let sys = snapshot.sys
                 let micDelta = mic - self.lastMicHealthSnapshotMic
                 let sysDelta = sys - self.lastMicHealthSnapshotSys
                 self.lastMicHealthSnapshotMic = mic
@@ -686,7 +716,8 @@ final class MeetingCaptureService: NSObject {
         durationTimer = nil
         micHealthTask?.cancel()
         micHealthTask = nil
-        print("[VOICE-MEET-MIC] capture stopped — final totals: mic=\(micSampleCount) sys=\(sysSampleCount) samples")
+        let finalCounts = sampleCounters.withLock { $0 }
+        print("[VOICE-MEET-MIC] capture stopped — final totals: mic=\(finalCounts.mic) sys=\(finalCounts.sys) samples")
 
         // Cancel watchdog + status logger and unregister the config observer.
         // (Strictly additive — existing teardown above still runs unchanged.)
@@ -1112,8 +1143,10 @@ final class MeetingCaptureService: NSObject {
         // mic samples stop arriving while sys keeps coming, that's the
         // failure mode where the user would record a meeting and discover
         // on playback that their own voice is missing. We surface it.
-        if let m = mic { micSampleCount &+= UInt64(m.count) }
-        if let s = sys { sysSampleCount &+= UInt64(s.count) }
+        sampleCounters.withLock {
+            if let m = mic { $0.mic &+= UInt64(m.count) }
+            if let s = sys { $0.sys &+= UInt64(s.count) }
+        }
 
         let polish = audioPolishEnabled
 

@@ -129,6 +129,15 @@ class RecordingCoordinator {
     private var slidingWindowManager: SlidingWindowAsrManager?
     private var livePartialsTask: Task<Void, Never>?
 
+    /// Fired when the user speaks the configured stop word (default
+    /// "finito") at the trailing edge of a hands-free (locked) recording.
+    /// AppDelegate wires this to exitLockMode() + finishRecording() — the
+    /// same commit path as a third-tap lock exit. Only ever fires during
+    /// lock mode, where live partials run and there's no key to release.
+    var onStopWordDetected: (() -> Void)?
+    /// Debounce so a stop word can't double-fire across rapid confirmed updates.
+    private var lastStopWordFireAt: Date?
+
     init(state: RecordingState) {
         self.state = state
     }
@@ -1100,12 +1109,21 @@ class RecordingCoordinator {
                 if Task.isCancelled { break }
                 let confirmed = await manager.confirmedTranscript
                 let volatile = await manager.volatileTranscript
+                let isConfirmed = update.isConfirmed
                 await MainActor.run {
                     var parts: [String] = []
                     if !confirmed.isEmpty { parts.append(confirmed) }
                     if !volatile.isEmpty && volatile != confirmed { parts.append(volatile) }
                     self.state.livePartialText = parts.joined(separator: " ")
                     self.state.livePartialIsVolatile = !update.isConfirmed
+
+                    // Stop-word detection. Only on the CONFIRMED transcript
+                    // (volatile partials churn and mis-decode), only while
+                    // hands-free (locked) and recording, and only at the
+                    // trailing edge — the phrase must be the last thing said,
+                    // so a mid-utterance mention ("...we should definitively...")
+                    // never triggers. Debounced to a single fire.
+                    if isConfirmed { self.checkStopWord(in: confirmed) }
                 }
             }
         }
@@ -1133,7 +1151,55 @@ class RecordingCoordinator {
 
         state.livePartialText = ""
         state.livePartialIsVolatile = true
+        lastStopWordFireAt = nil
 
         vlog("[VOICE-LP] Live partials stopped")
+    }
+
+    // MARK: - Stop word
+
+    /// Evaluate the confirmed live transcript for the trailing stop word and
+    /// fire `onStopWordDetected` once (debounced). Gated to hands-free
+    /// (locked) recordings — PTT stops on key release and needs no stop word.
+    @MainActor
+    private func checkStopWord(in confirmed: String) {
+        guard state.isLocked, state.isRecording else { return }
+        let enabled = UserDefaults.standard.object(forKey: "voice.stopWordEnabled") as? Bool ?? true
+        guard enabled else { return }
+        let stopWord = (UserDefaults.standard.string(forKey: "voice.stopWord") ?? "finito")
+            .lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stopWord.isEmpty, Self.endsWithStopWord(confirmed, stopWord: stopWord) else { return }
+        if let last = lastStopWordFireAt, Date().timeIntervalSince(last) < 1.5 { return }
+        lastStopWordFireAt = Date()
+        vlog("[VOICE-STOPWORD] trailing stop word \"\(stopWord)\" detected — committing recording")
+        onStopWordDetected?()
+    }
+
+    /// True if `text`, ignoring trailing whitespace/punctuation, ends with
+    /// `stopWord` as a whole word (the char before it is a boundary).
+    static func endsWithStopWord(_ text: String, stopWord: String) -> Bool {
+        let trimmed = text.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: " \t\n.,!?;:\"'"))
+        guard trimmed.hasSuffix(stopWord), trimmed.count >= stopWord.count else { return false }
+        let idx = trimmed.index(trimmed.endIndex, offsetBy: -stopWord.count)
+        if idx == trimmed.startIndex { return true }
+        let before = trimmed[trimmed.index(before: idx)]
+        return !before.isLetter && !before.isNumber
+    }
+
+    /// Remove a trailing stop-word command token (and any dangling
+    /// punctuation/whitespace before it) from a FINAL transcript. Trailing
+    /// only — a legitimately-dictated earlier mention is preserved. Returns
+    /// the text unchanged when the stop word is disabled or absent at the end.
+    static func strippingTrailingStopWord(from text: String) -> String {
+        let enabled = UserDefaults.standard.object(forKey: "voice.stopWordEnabled") as? Bool ?? true
+        guard enabled else { return text }
+        let stopWord = (UserDefaults.standard.string(forKey: "voice.stopWord") ?? "finito")
+            .lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stopWord.isEmpty, endsWithStopWord(text, stopWord: stopWord),
+              let range = text.range(of: stopWord, options: [.caseInsensitive, .backwards])
+        else { return text }
+        let head = String(text[..<range.lowerBound])
+        return head.trimmingCharacters(in: CharacterSet(charactersIn: " \t\n.,!?;:"))
     }
 }

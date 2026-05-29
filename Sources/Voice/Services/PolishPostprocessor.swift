@@ -1699,7 +1699,18 @@ public enum PolishPostprocessor {
             return "\(n) degrees \(scale)"
         }
 
-        // 5) "<spelled> percent" -> "<N>%"
+        // 5a) "<spelled> point <digit> percent" -> "<N>.<M>%"
+        //     Must run BEFORE the integer-percent branch below so the greedy
+        //     integer match ("one percent") never wins on a decimal phrase.
+        //     "two point one percent" -> "2.1%", "ninety nine point five percent" -> "99.5%".
+        let spelledIntAlt = #"(?:(?:one\s+hundred)|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\s-](?:one|two|three|four|five|six|seven|eight|nine))?|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|one|two|three|four|five|six|seven|eight|nine)"#
+        s = replaceRegex(s, pattern: #"\b("# + spelledIntAlt + #")\s+point\s+(one|two|three|four|five|six|seven|eight|nine|zero)\s+percent\b"#, options: [.caseInsensitive]) { groups in
+            guard let whole = parseSpelledNumber(groups[1]),
+                  let frac = digitWordMap[groups[2].lowercased()] else { return groups[0] }
+            return "\(whole).\(frac)%"
+        }
+
+        // 5b) "<spelled> percent" -> "<N>%"
         //    Cover: "one hundred", "fifty", "twenty five", "ten"..."nineteen", "one"..."nine".
         s = replaceRegex(s, pattern: #"\b((?:one\s+hundred)|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\s-](?:one|two|three|four|five|six|seven|eight|nine))?|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|one|two|three|four|five|six|seven|eight|nine)\s+percent\b"#, options: [.caseInsensitive]) { groups in
             guard let n = parseSpelledNumber(groups[1]) else { return groups[0] }
@@ -1709,27 +1720,69 @@ public enum PolishPostprocessor {
         return s
     }
 
-    /// Parse "twenty five", "one hundred", "fourteen", "five" -> Int.
+    /// Parse "twenty five", "one hundred", "fourteen", "five",
+    /// "ninety five", "one hundred and forty", "eight hundred and twenty thousand" -> Int.
+    /// Conservative cardinal parser: accepts hundreds/thousands/millions and
+    /// "and" connectors. Returns nil for anything it cannot interpret as a
+    /// clear cardinal-number phrase, so callers (percent/currency/degrees
+    /// passes) never fire on ambiguous input.
     private static func parseSpelledNumber(_ raw: String) -> Int? {
-        let normalized = raw.lowercased()
+        let tokens = raw.lowercased()
             .replacingOccurrences(of: "-", with: " ")
             .split(whereSeparator: { $0.isWhitespace })
             .map { String($0) }
-        guard !normalized.isEmpty else { return nil }
-        // "one hundred"
-        if normalized == ["one", "hundred"] { return 100 }
-        if normalized == ["hundred"] { return 100 }
-        // teens
-        if normalized.count == 1, let v = teensMap[normalized[0]] { return v }
-        // single digit
-        if normalized.count == 1, let v = digitWordMap[normalized[0]] { return v }
-        // tens (single token)
-        if normalized.count == 1, let v = tensMap[normalized[0]] { return v }
-        // tens + digit
-        if normalized.count == 2, let tens = tensMap[normalized[0]], let ones = digitWordMap[normalized[1]] {
-            return tens + ones
+            .filter { $0 != "and" }   // "one hundred and forty" -> drop connector
+        guard !tokens.isEmpty else { return nil }
+
+        // Validate every token is a recognized number word; reject otherwise.
+        let scaleWords: Set<String> = ["hundred", "thousand", "million", "billion"]
+        for tok in tokens {
+            let known = digitWordMap[tok] != nil
+                || teensMap[tok] != nil
+                || tensMap[tok] != nil
+                || scaleWords.contains(tok)
+            if !known { return nil }
         }
-        return nil
+
+        // Standard accumulator: `current` builds the running group (< 1000),
+        // `total` accumulates scaled groups. Handles "eight hundred and twenty
+        // thousand" = (8*100 + 20) * 1000 = 820000.
+        var total = 0
+        var current = 0
+        var sawValue = false
+        for tok in tokens {
+            if let unit = digitWordMap[tok] {
+                current += unit
+                sawValue = true
+            } else if let teen = teensMap[tok] {
+                current += teen
+                sawValue = true
+            } else if let ten = tensMap[tok] {
+                current += ten
+                sawValue = true
+            } else if tok == "hundred" {
+                // "hundred" with no preceding digit means 1 hundred.
+                current = (current == 0 ? 1 : current) * 100
+                sawValue = true
+            } else if tok == "thousand" {
+                current = (current == 0 ? 1 : current) * 1000
+                total += current
+                current = 0
+                sawValue = true
+            } else if tok == "million" {
+                current = (current == 0 ? 1 : current) * 1_000_000
+                total += current
+                current = 0
+                sawValue = true
+            } else if tok == "billion" {
+                current = (current == 0 ? 1 : current) * 1_000_000_000
+                total += current
+                current = 0
+                sawValue = true
+            }
+        }
+        guard sawValue else { return nil }
+        return total + current
     }
 
     /// Replace any descending run of 3+ digit-word tokens (0-9), strictly
@@ -2566,6 +2619,20 @@ public enum PolishPostprocessor {
                 return "\(symbol)\(groups[1])"
             }
         }
+
+        // Spelled-out currency: "ninety five dollars" -> "$95",
+        // "five hundred euros" -> "€500". Only fires when an explicit currency
+        // word follows, so a clear cardinal phrase is required — never touches
+        // bare "one"/"a" articles, years, or ordinals.
+        let spelledNumAlt = #"(?:(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion|and)(?:[\s-]+|$))+"#
+        for (name, symbol) in map {
+            let pattern = #"\b("# + spelledNumAlt + #")("# + name + #")\b"#
+            s = replaceRegex(s, pattern: pattern, options: [.caseInsensitive]) { groups in
+                let phrase = groups[1].trimmingCharacters(in: .whitespaces)
+                guard let n = parseSpelledNumber(phrase) else { return groups[0] }
+                return "\(symbol)\(n)"
+            }
+        }
         return s
     }
 
@@ -3018,6 +3085,22 @@ public enum PolishPostprocessor {
         if let regex = try? NSRegularExpression(pattern: thousandPattern) {
             let range = NSRange(result.startIndex..., in: result)
             result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: "$1.$2 thousand")
+        }
+
+        // Word-prefixed variant: the model leaves the integer spelled but
+        // applies European separators to the magnitude, e.g.
+        // "four point 5.000.000" -> "4.5 million", "four point 5.000" -> "4.5 thousand".
+        let wordNumAlt = #"(one|two|three|four|five|six|seven|eight|nine)"#
+        // Million first (longer match) so the thousand pattern can't pre-empt it.
+        let wordMillionPattern = #"\b"# + wordNumAlt + #"\s+point\s+(\d)\.0{3}\.0{3}\b"#
+        result = replaceRegex(result, pattern: wordMillionPattern, options: [.caseInsensitive]) { groups in
+            guard let whole = digitWordMap[groups[1].lowercased()] else { return groups[0] }
+            return "\(whole).\(groups[2]) million"
+        }
+        let wordThousandPattern = #"\b"# + wordNumAlt + #"\s+point\s+(\d)\.0{3}\b"#
+        result = replaceRegex(result, pattern: wordThousandPattern, options: [.caseInsensitive]) { groups in
+            guard let whole = digitWordMap[groups[1].lowercased()] else { return groups[0] }
+            return "\(whole).\(groups[2]) thousand"
         }
         return result
     }

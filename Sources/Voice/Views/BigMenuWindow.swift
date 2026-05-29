@@ -2193,6 +2193,13 @@ private struct SettingsSheet: View {
     @AppStorage("voice.wakeWordMode") private var wakeWordMode: String = "off"
     /// Window duration in minutes for the "activatedWindow" wake mode.
     @AppStorage("voice.wakeWordWindowMinutes") private var wakeWordWindowMinutes: Int = 5
+    /// Stop word — the hands-free counterpart to the wake word. Spoken at the
+    /// end of a locked recording to commit it. On by default. Only active in
+    /// hands-free (locked) mode; PTT stops on key release.
+    @AppStorage("voice.stopWordEnabled") private var stopWordEnabled: Bool = true
+    /// Editable stop word. Default "finito" — a single distinctive word a user
+    /// would not naturally dictate, so false positives are near zero.
+    @AppStorage("voice.stopWord") private var stopWord: String = "finito"
     /// Master kill switch — disable the meeting auto-detection heuristic so
     /// VOICE never opens a recording on its own.
     @AppStorage("voice.disableMeetingDetection") private var disableMeetingDetection: Bool = false
@@ -2514,6 +2521,30 @@ private struct SettingsSheet: View {
                                             wakeWordPhrase = newValue.lowercased()
                                         }
                                 }
+                            }
+
+                            // Stop word — the spoken counterpart to lock-exit.
+                            // Always shown: hands-free lock mode is reachable
+                            // via the hotkey triple-tap too, not only the wake
+                            // word, so this isn't gated on wakeWordEnabled.
+                            Divider().opacity(0.4)
+                            toggle("Stop word \"\(stopWord)\" ends hands-free dictation", isOn: $stopWordEnabled)
+                            if stopWordEnabled {
+                                HStack(spacing: Sp.xs) {
+                                    Text("Stop word")
+                                        .font(.bodySmall)
+                                        .foregroundStyle(.secondary)
+                                    TextField("finito", text: $stopWord)
+                                        .textFieldStyle(.roundedBorder)
+                                        .controlSize(.small)
+                                        .frame(maxWidth: 200)
+                                        .onChange(of: stopWord) { _, newValue in
+                                            stopWord = newValue.lowercased()
+                                        }
+                                }
+                                Text("Say it at the end of a hands-free recording to finish. Push-to-talk stops when you release the key.")
+                                    .font(.bodySmall)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }

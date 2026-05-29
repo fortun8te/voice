@@ -828,6 +828,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // each other's clipboard / synthesized-keystroke state. Each finish task
     // appends its paste step to this chain.
     private var pasteChain: Task<Void, Never>?
+    // The in-flight Opt+1 polish-selection task. Stored so cancelInFlightProcessing
+    // can cancel it — otherwise an ESC can't stop a polish that's about to mutate
+    // the user's selected text after they cancelled.
+    private var polishSelectionTask: Task<Void, Never>?
     private var bigMenuWindow: NSWindow?
     // Floor for "this is too short to bother transcribing". The hotkey state
     // machine has its own short-tap gate at 0.35s and only fires deactivate
@@ -2525,7 +2529,7 @@ extension AppDelegate {
 
         recordingState.isPolishingSelection = true
 
-        Task { @MainActor in
+        polishSelectionTask = Task { @MainActor in
             defer {
                 self.recordingState.isPolishingSelection = false
                 print("[VOICE-POLISH] DONE")
@@ -2556,6 +2560,11 @@ extension AppDelegate {
                 text,
                 preset: preset.rawValue
             )
+
+            // ESC-cancel checkpoint: if cancelInFlightProcessing() fired while
+            // the polish round-trip ran, bail BEFORE mutating the user's
+            // selected text — they already cancelled.
+            guard !Task.isCancelled, !self.recordingState.sessionCancelled else { return }
 
             guard let polished,
                   polished.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4074,6 +4083,7 @@ extension AppDelegate: NSWindowDelegate {
             // session and bail (matches Path 2/3 in hotkeyDidActivate).
             recordingState.recordingSessionID = UUID()
             recordingState.sessionCancelled = false
+            recordingState.cancelledSessionID = nil
             coordinator.startRecording()
             SoundEffects.playStart()
             // Arm the max-duration cap for this safety-net start. (The far more
@@ -4170,6 +4180,8 @@ extension AppDelegate: NSWindowDelegate {
             print("[VOICE-PERSONALITY] restored on cancel: \(saved)")
         }
         recordingState.sessionCancelled = true
+        // Scope the cancel to the CURRENT session (see cancelInFlightProcessing).
+        recordingState.cancelledSessionID = recordingState.recordingSessionID
         print("[VOICE] Cancel → stop transcribing, retain recording")
         // Stop the max-duration watchdog — this recording is ending.
         cancelMaxDurationWatchdog()
@@ -4304,6 +4316,9 @@ extension AppDelegate: NSWindowDelegate {
         //    `guard !recordingState.sessionCancelled else { return }` checkpoint
         //    along the polish → paste path will now bail.
         recordingState.sessionCancelled = true
+        // Scope the cancel to the CURRENT session so an in-flight background
+        // finish task (an older, legitimately-running session) isn't dropped.
+        recordingState.cancelledSessionID = recordingState.recordingSessionID
 
         // 2. Salvage whatever partial transcript exists RIGHT NOW (before we
         //    cancel the Task, which may still be appending). Mirrors the
@@ -4335,6 +4350,9 @@ extension AppDelegate: NSWindowDelegate {
         //    decrement it — `max(0, count - 1)` floors it.
         recordingState.transcribingCount = 0
         recordingState.isPolishingSelection = false
+        // Kill the in-flight Opt+1 polish-selection task so it can't paste over
+        // the user's selection after they pressed ESC.
+        polishSelectionTask?.cancel()
         recordingState.livePartialText = ""
         recordingState.currentTranscript = []
         coordinator.stopLivePartials()
@@ -4652,7 +4670,13 @@ extension AppDelegate: NSWindowDelegate {
 
             // Run formatter — paragraph-aware, synchronous (no Ollama round-trip).
             let tFormatStart = CFAbsoluteTimeGetCurrent()
-            let formatted = textFormatter.formatSegments(segmentsForFormat)
+            // Strip a trailing stop-word command token ("finito") so the word
+            // the user spoke to END the recording never lands in the pasted /
+            // saved text. Trailing-only and gated on the feature flag, so a
+            // genuine earlier mention is preserved and PTT is unaffected.
+            let formatted = RecordingCoordinator.strippingTrailingStopWord(
+                from: textFormatter.formatSegments(segmentsForFormat)
+            )
             let formatterMs = (CFAbsoluteTimeGetCurrent() - tFormatStart) * 1000
             fputs("[LATENCY] TextFormatter: \(Int(formatterMs))ms\n", stderr)
             vlog("[VOICE-FUNNEL] STAGE 2 FORMATTER out=\"\(formatted)\" chars=\(formatted.count) diff=\(formatted != rawText)")
@@ -4660,7 +4684,7 @@ extension AppDelegate: NSWindowDelegate {
             // the formatter ran, bail before we sink time into Ollama polish.
             // The `defer` above still runs (transcribingCount decrement, live
             // partial cleanup) so the pill flips back to idle cleanly.
-            if Task.isCancelled || recordingState.sessionCancelled {
+            if Task.isCancelled || recordingState.isCancelled(for: mySession) {
                 print("[VOICE-CANCEL-INFLIGHT] post-formatter cancellation detected — bailing before polish")
                 return
             }
@@ -4800,7 +4824,7 @@ extension AppDelegate: NSWindowDelegate {
                 let optimisticPolishOwnedFormatting = false  // pre-polish — paster runs its rule-based adjuster
                 let optimisticTask: Task<Void, Never> = Task { @MainActor in
                     _ = await priorChain.value
-                    guard !self.recordingState.sessionCancelled else { return }
+                    guard !self.recordingState.isCancelled(for: mySession) else { return }
                     vlog("[VOICE-RACE] PASTE-FIRE site=optimistic session=\(mySession) chars=\(optimisticText.count) text=\"\(optimisticText.prefix(60))\"")
                     vlog("[VOICE] OPTIMISTIC paste START (\(optimisticText.prefix(60))…)")
                     var didReactivate = false
@@ -4890,7 +4914,7 @@ extension AppDelegate: NSWindowDelegate {
                     }
                 }
             } else {
-                guard !recordingState.sessionCancelled else { return }
+                guard !recordingState.isCancelled(for: mySession) else { return }
                 finalText = await Qwen3Polisher.shared.polish(
                     formatted,
                     context: polishContext,
@@ -4921,7 +4945,7 @@ extension AppDelegate: NSWindowDelegate {
             // during the polish round-trip, don't enqueue the paste step.
             // The cancelled-dictation History row was already written by
             // cancelInFlightProcessing(), so we just exit cleanly here.
-            if Task.isCancelled || recordingState.sessionCancelled {
+            if Task.isCancelled || recordingState.isCancelled(for: mySession) {
                 print("[VOICE-CANCEL-INFLIGHT] post-polish cancellation detected — skipping paste enqueue")
                 return
             }
@@ -5016,6 +5040,10 @@ extension AppDelegate: NSWindowDelegate {
             let optimisticSig = optimisticPasteboardSig
             pasteChain = Task { @MainActor in
                 _ = await prior?.value
+                // ESC-cancel checkpoint: unlike the optimistic first paste, the
+                // swap (Cmd+Z undo + repaste) had no early guard — so an ESC
+                // could still trigger an undo/repaste after cancellation. Bail.
+                guard !Task.isCancelled, !self.recordingState.isCancelled(for: mySession) else { return }
                 let tPasteStart = CFAbsoluteTimeGetCurrent()
                 if optimisticSwapNeeded, let sig = optimisticSig {
                     // SWAP PATH — optimistic paste already ran, try to replace.
@@ -5136,7 +5164,7 @@ extension AppDelegate: NSWindowDelegate {
                     // the audio claim and now (race between finishRecording's async
                     // task and cancelRecording), skip the paste entirely. Audio drain
                     // and cleanup above already ran — only the cursor write is skipped.
-                    guard !self.recordingState.sessionCancelled else {
+                    guard !self.recordingState.isCancelled(for: mySession) else {
                         print("[VOICE-HK] finishRecording: session was cancelled — skipping paste")
                         return
                     }
@@ -5336,6 +5364,18 @@ extension AppDelegate: NSWindowDelegate {
     /// from Settings, which sets `voice.wakeWordEnabled = true`. We observe
     /// that flag and start/stop the service accordingly.
     private func setupWakeWord() {
+        // Stop word ("finito" by default): the hands-free counterpart to the
+        // wake word. Fired from the live-partials stream when the user speaks
+        // it at the trailing edge of a locked recording. Drives the exact
+        // same commit path as a third-tap lock exit, so it inherits all the
+        // session-claim / paste race safety for free.
+        coordinator.onStopWordDetected = { [weak self] in
+            guard let self else { return }
+            guard self.recordingState.isLocked, self.recordingState.isRecording else { return }
+            print("[VOICE-STOPWORD] committing locked recording via stop word")
+            self.exitLockMode()
+            self.finishRecording()
+        }
         WakeWordService.shared.onWakeWordDetected = { [weak self] in
             guard let self else { return }
             // Same entry point a hotkey press uses, except we also want to
@@ -5560,6 +5600,7 @@ extension AppDelegate: HotkeyServiceDelegate {
             recordingState.recordingSessionID = UUID()
             // Clear the cancel flag for the fresh session.
             recordingState.sessionCancelled = false
+            recordingState.cancelledSessionID = nil
             dismissUndoPasteToast()
             // Start recording — synchronously flips isRecording=true. pendingRecordingStart
             // will be cleared by finishRecording() when the user releases (not here);
@@ -5592,6 +5633,7 @@ extension AppDelegate: HotkeyServiceDelegate {
         recordingState.recordingSessionID = UUID()
         // Clear the cancel flag for the fresh session.
         recordingState.sessionCancelled = false
+        recordingState.cancelledSessionID = nil
         dismissUndoPasteToast()
         // coordinator.startRecording() synchronously flips state.isRecording=true.
         coordinator.startRecording()
@@ -5736,6 +5778,18 @@ class RecordingState {
     /// Set true the moment cancel fires. Checked by finishRecording() before
     /// pasting — if true, the paste is skipped. Cleared when a new recording starts.
     var sessionCancelled = false
+    /// The session ID that the in-flight cancel was meant for. Set alongside
+    /// `sessionCancelled` so the cancel is SESSION-SCOPED: an ESC aimed at the
+    /// current recording must not silently drop an UNRELATED background finish
+    /// task that's still legitimately in flight. `nil` means "cancel applies to
+    /// whatever session is current" (legacy/global semantics). Cleared when a
+    /// new recording starts.
+    var cancelledSessionID: UUID? = nil
+    /// Session-scoped cancel check. True only when a cancel is active AND it
+    /// targets `session` (or was a global cancel with no specific session).
+    func isCancelled(for session: UUID) -> Bool {
+        sessionCancelled && (cancelledSessionID == nil || cancelledSessionID == session)
+    }
     var showingUndoPasteToast = false
     var undoPasteToastShownAt: Date? = nil
     var lastPastedText: String = ""

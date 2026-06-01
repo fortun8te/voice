@@ -711,6 +711,33 @@ class StorageService {
     /// can find them.
     var audioDirectoryURL: URL { audioDirectory }
 
+    /// Map of normalized segment text → audioFilePath, used by the
+    /// `--rerun-audio` harness to bridge a `RecentDictation` (which stores no
+    /// audio path) to its retained `.caf`. The segments table stores the raw
+    /// Parakeet text, which equals `RecentDictation.parakeetRawText`, so a
+    /// normalized-text lookup resolves the audio file. Read-only.
+    func audioPathsByNormalizedSegmentText() -> [String: String] {
+        guard let db = dbPool else { return [:] }
+        func norm(_ s: String) -> String {
+            s.lowercased().split(separator: " ", omittingEmptySubsequences: true).joined(separator: " ")
+        }
+        return (try? db.read { db -> [String: String] in
+            var out: [String: String] = [:]
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT s.text AS text, m.audioFilePath AS audioFilePath
+                FROM segments s JOIN meetings m ON m.id = s.meetingId
+                WHERE m.audioFilePath IS NOT NULL
+                """)
+            for r in rows {
+                let path: String? = r["audioFilePath"]
+                let text: String? = r["text"]
+                guard let p = path, !p.isEmpty, let t = text else { continue }
+                out[norm(t)] = p   // last write wins; fine for our purpose
+            }
+            return out
+        }) ?? [:]
+    }
+
     /// Disk-safety pruner. If the total size of `audioDirectory` exceeds
     /// `highWatermark` bytes, deletes the oldest audio files (by modification
     /// date) until total drops below `lowWatermark`. Skips files that are

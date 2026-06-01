@@ -5,16 +5,18 @@
 // Detection strategy (event-driven, not polling):
 //   • NSWorkspace notifications fire instantly when any app activates,
 //     launches, or terminates — no CPU cost at idle.
-//   • A lightweight 30s fallback poll catches edge cases such as browser
-//     tab switches to Google Meet (where the frontmost app never changes).
-//   • SCShareableContent.excludingDesktopWindows() is called ONLY when the
-//     frontmost app is a known browser, since it is expensive (WindowServer
-//     round-trip). For native call apps the bundle ID alone is sufficient.
+//   • A lightweight 30s fallback poll catches edge cases such as a call app
+//     gaining/losing the mic without an app-activation event.
+//   • This detector NEVER touches ScreenCaptureKit. It relies solely on
+//     non-screen signals (NSWorkspace running applications, frontmost bundle
+//     id, and the mic-in-use probe), so it cannot light the macOS
+//     screen-recording indicator. Browser-tab call detection (e.g. Google
+//     Meet in a tab) degrades gracefully — it is no longer detected here;
+//     native desktop call apps (Zoom/Teams/Discord/etc.) still are.
 //
 // Heuristic per evaluation:
 //   active(app) == (bundleID in knownCallApps)
-//               && (for native apps: app is running)
-//               && (for browsers: bundle appears in SCShareableContent.applications)
+//               && (app is running, via NSRunningApplication)
 //               && (default input device is in use by some process)
 //               && (app is frontmost)
 //
@@ -31,7 +33,6 @@
 //   det.stop()     // tears down observers and timer
 
 import Foundation
-import ScreenCaptureKit
 import AppKit
 
 @MainActor
@@ -54,15 +55,6 @@ final class CallAppDetector {
         "desktop.WhatsApp": "WhatsApp",
         "net.whatsapp.WhatsApp": "WhatsApp",
         "ru.keepcoder.Telegram": "Telegram"
-    ]
-
-    /// Bundle IDs considered browsers (SCShareableContent check only runs for these).
-    private static let knownBrowsers: Set<String> = [
-        "com.google.Chrome",
-        "com.apple.Safari",
-        "org.mozilla.firefox",
-        "com.microsoft.edgemac",
-        "company.thebrowser.Browser"  // Arc
     ]
 
     // MARK: - State
@@ -180,10 +172,11 @@ final class CallAppDetector {
     // MARK: - Evaluation
 
     /// Main evaluation entry-point. `triggeredBy` is the bundle ID of the app
-    /// that caused this evaluation (used to skip the SC query for non-browsers).
+    /// that caused this evaluation (kept for call-site compatibility / logging).
     private func tick(triggeredBy triggerBundle: String?) async {
         // 1. Determine which known call-app bundles are actually running right now.
-        //    Use NSRunningApplication — zero cost, no WindowServer query.
+        //    Use NSRunningApplication — zero cost, no WindowServer query, and no
+        //    ScreenCaptureKit (which would light the screen-recording indicator).
         let runningBundles: Set<String> = Set(
             NSWorkspace.shared.runningApplications
                 .compactMap { $0.bundleIdentifier }
@@ -193,40 +186,15 @@ final class CallAppDetector {
         // 2. Frontmost bundle.
         let frontmostBundle = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
 
-        // 3. SCShareableContent check — ONLY when the frontmost app is a browser.
-        //    This lets us detect browser-based meeting tabs (e.g. Google Meet in
-        //    Chrome) while skipping the expensive WindowServer query for all other
-        //    app switches.
-        var scBundles: Set<String> = []
-        if let fb = frontmostBundle, Self.knownBrowsers.contains(fb) {
-            do {
-                let content = try await SCShareableContent.excludingDesktopWindows(
-                    false, onScreenWindowsOnly: false)
-                scBundles = Set(
-                    content.applications
-                        .map { $0.bundleIdentifier }
-                        .filter { Self.knownCallApps.keys.contains($0) }
-                )
-            } catch {
-                // Transient SC failure — skip this evaluation.
-                return
-            }
-        }
-
-        // 4. Mic-in-use flag.
+        // 3. Mic-in-use flag.
         let micInUse = MicActivityProbe.isDefaultInputInUse()
 
-        // 5. Update per-bundle streak counters.
+        // 4. Update per-bundle streak counters.
+        //    "Running" is determined purely from NSRunningApplication — we never
+        //    query ScreenCaptureKit, so browser-tab calls (Google Meet in a tab)
+        //    are intentionally not detected here. Native desktop call apps are.
         for bundle in Self.knownCallApps.keys {
-            // "Running" for native apps is enough; for browsers we need the SC check.
-            let appRunning: Bool
-            if let fb = frontmostBundle, Self.knownBrowsers.contains(fb) {
-                // Frontmost app is a browser — use SC bundle list.
-                appRunning = scBundles.contains(bundle)
-            } else {
-                // Not a browser context — NSRunningApplication check is sufficient.
-                appRunning = runningBundles.contains(bundle)
-            }
+            let appRunning = runningBundles.contains(bundle)
 
             let candidate = appRunning
                 && micInUse
@@ -241,7 +209,7 @@ final class CallAppDetector {
             }
         }
 
-        // 6. Decide transitions.
+        // 5. Decide transitions.
         if let active = currentActiveBundle {
             let negCount = negativeStreak[active] ?? 0
             if negCount >= stopGraceTicks {

@@ -156,14 +156,27 @@ final class FnKeyTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
                 print("[VOICE-HK] CGEventTap re-enabled after \(type == .tapDisabledByTimeout ? "timeout" : "user input")")
             }
-            // RECOVERY: while the tap was disabled, the physical fn-up may have
-            // been dropped. If we still think fn is held, we'd be stuck holding a
-            // recording forever. Reconcile by firing the release now — a slightly
-            // early commit is far better than a permanently stuck recording.
+            // RECOVERY: a tap-disable is the OS pausing the tap (slow callback
+            // under load) — NOT the user lifting fn. Earlier we blindly
+            // synthesized fnKeyUp here, which fired mid-HOLD and silently
+            // discarded push-to-talk recordings (the "hold doesn't work, only
+            // double-tap" bug). Instead, reconcile against the ACTUAL physical
+            // fn state: only commit a release if fn is genuinely no longer held
+            // (its real key-up was dropped while the tap was paused). If fn is
+            // still physically down, keep the recording alive — the real fn-up
+            // flagsChanged will arrive now that the tap is re-enabled and drive
+            // the commit. A genuinely-stuck recording is still bounded by the
+            // max-duration watchdog, so we lose no safety.
             if fnDown {
-                fnDown = false
-                print("[VOICE-HK] tap re-enable while fnDown — synthesizing fnKeyUp to avoid stuck recording")
-                dispatchMain { [weak self] in self?.delegate?.fnKeyUp() }
+                let fnStillHeld = CGEventSource.flagsState(.combinedSessionState)
+                    .contains(.maskSecondaryFn)
+                if !fnStillHeld {
+                    fnDown = false
+                    print("[VOICE-HK] tap re-enable: fn genuinely released during pause — committing fnKeyUp")
+                    dispatchMain { [weak self] in self?.delegate?.fnKeyUp() }
+                } else {
+                    print("[VOICE-HK] tap re-enable while fn still physically held — keeping recording; real fn-up will commit")
+                }
             }
             return Unmanaged.passUnretained(event)
         }

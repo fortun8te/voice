@@ -2577,12 +2577,49 @@ enum CombinedDictionary {
     }
 
     /// Build a FluidAudio `CustomVocabularyContext` from the merged list.
-    /// Used by the streaming (SlidingWindowAsrManager) path. Each term is
-    /// weighted equally — no weights persisted in this v1 data model.
+    /// Used by the streaming (SlidingWindowAsrManager) path.
+    ///
+    /// Weighting / ordering policy:
+    ///   • User-learned + manually-added proper nouns
+    ///     (`ProperNounVocabulary.customTerms()`) are placed FIRST and given
+    ///     a STRONG weight so the user's own vocabulary out-competes the
+    ///     3000+ generic starter terms during CTC rescoring.
+    ///   • Explicit user dictionary entries (`UserDictionary`) come next at a
+    ///     boosted weight (their casing still wins downstream dedupe).
+    ///   • The static starter dictionary fills the tail at the baseline weight.
+    /// Earlier entries also win ties under the keyword spotter, so ordering
+    /// reinforces the weighting.
     static func vocabularyContext() -> CustomVocabularyContext {
-        let entries = terms().map {
-            CustomVocabularyTerm(text: $0, weight: 10.0)
+        // STRONG boost for user-learned / custom proper nouns.
+        let learnedWeight: Float = 30.0
+        // Elevated boost for explicit user-dictionary entries.
+        let userWeight: Float = 18.0
+        // Baseline boost for the static starter dictionary.
+        let starterWeight: Float = 10.0
+
+        // Track which terms are already covered (case-insensitively) so the
+        // same word isn't emitted twice with conflicting weights — the first
+        // (highest-priority) occurrence wins.
+        var seenLower = Set<String>()
+        var entries: [CustomVocabularyTerm] = []
+
+        func append(_ list: [String], weight: Float) {
+            for term in list {
+                let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                let lower = trimmed.lowercased()
+                guard seenLower.insert(lower).inserted else { continue }
+                entries.append(CustomVocabularyTerm(text: trimmed, weight: weight))
+            }
         }
+
+        // 1) User-learned / manually-added proper nouns — highest priority.
+        append(ProperNounVocabulary.customTerms(), weight: learnedWeight)
+        // 2) Explicit user-dictionary entries.
+        append(UserDictionary.terms(), weight: userWeight)
+        // 3) Static starter dictionary — baseline.
+        append(StarterDictionary.terms, weight: starterWeight)
+
         return CustomVocabularyContext(terms: entries)
     }
 }

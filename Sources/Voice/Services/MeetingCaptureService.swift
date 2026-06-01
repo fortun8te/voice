@@ -308,6 +308,13 @@ final class MeetingCaptureService: NSObject {
 
     /// Returns true if the app has (or just gained) Screen Recording permission.
     /// Internally calls SCShareableContent to trigger the TCC prompt if needed.
+    ///
+    /// LAZY BY CONTRACT: this is the only place (besides `startCapture`) that
+    /// touches ScreenCaptureKit, and it must ONLY be invoked from the explicit,
+    /// user-initiated meeting-capture start path (VoiceApp.startMeetingCapture).
+    /// Never call it eagerly at launch, from idle timers, or from auto-detection
+    /// — doing so lights the macOS screen-recording indicator with no recording
+    /// in progress.
     static func requestPermission() async -> Bool {
         do {
             // This call prompts the user for Screen Recording permission if not

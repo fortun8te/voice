@@ -195,6 +195,45 @@ class AudioCaptureService {
     private let silenceFloorRMS: Float = 0.0008  // ~-62 dBFS — below this is true silence
     private let silenceTimeoutSeconds: Double = 300.0  // Auto-stop after 5 min silence (hands-free max)
 
+    // ============================================================
+    // SPEECH-PRESENCE GATE (VAD) — anti-hallucination
+    // ============================================================
+    // Whisper/Parakeet-family models emit phantom phrases ("Thank you.",
+    // "Thanks for watching.", "you", etc.) when fed silence or non-speech
+    // room noise. To guarantee "no speech in → no text out", we measure an
+    // AUDIO-based speech-presence signal during capture (it can't be fooled
+    // by the text the model invents) and expose it to the finalize path,
+    // which drops the transcript to empty when the clip was effectively silent.
+    //
+    // The signal is the total VOICED DURATION: the wall-clock duration of
+    // post-DSP buffers whose RMS exceeded `speechFloorRMS`. We accumulate it
+    // per recording starting at startMicrophoneCapture and read a snapshot at
+    // stop/claim time.
+    //
+    // TWEAK: speechFloorRMS — a frame counts as "voiced" only above this.
+    // It sits ~6x above the absolute silence floor (0.0008). RMS is measured
+    // POST-DSP (adaptive gain applied), so quiet whispers get boosted toward
+    // ~targetRMS (0.08) before this check — a real whisper clears 0.005 easily.
+    // Room noise / breathing / HVAC after a 120Hz HPF sits well below it.
+    private let speechFloorRMS: Float = 0.005   // ~-46 dBFS post-DSP — above this a frame is "voiced"
+    /// Accumulated voiced duration (seconds) for the current recording —
+    /// sum of buffer durations whose post-DSP RMS exceeded speechFloorRMS.
+    /// Read via `voicedDurationSeconds`; reset on each capture start.
+    private var voicedDurationSec: Double = 0
+    /// Peak post-DSP RMS observed across the whole current recording. A second,
+    /// cheaper signal: if the loudest frame never cleared the speech floor the
+    /// clip is certainly non-speech. Reset on each capture start.
+    private var recordingPeakRMS: Float = 0
+
+    /// Snapshot of the current recording's speech-presence signal. Read by the
+    /// finalize path (RecordingCoordinator) to decide whether to keep the
+    /// transcript. `voicedSeconds` is the total time spent above speechFloorRMS;
+    /// `peakRMS` is the loudest post-DSP frame seen. Safe to read after
+    /// stopCapture() — these are plain values updated on the audio thread and
+    /// only read once capture has been torn down.
+    var voicedDurationSeconds: Double { voicedDurationSec }
+    var recordingPeakRMSValue: Float { recordingPeakRMS }
+
     // State
     var isCapturing = false
     var audioLevels: [Float] = Array(repeating: 0, count: 32)
@@ -250,6 +289,24 @@ class AudioCaptureService {
 
     // Internal
     private var audioEngine: AVAudioEngine?
+    /// True while the input tap is installed and we're actively delivering
+    /// buffers. Distinct from `audioEngine != nil` (the engine may be alive
+    /// but idle, with no tap) and from `isCapturing` (which also implies a
+    /// live recording session). Used so the tap closure can early-out if a
+    /// stale buffer arrives during teardown.
+    private var tapInstalled = false
+    /// Idle grace timer. When a recording stops we remove the tap immediately
+    /// (so the OS mic-in-use / orange indicator clears) but keep the
+    /// AVAudioEngine instance ALIVE for a short grace window. If another
+    /// recording starts within the window we reuse the same engine — no
+    /// engine.start()/stop() hardware cycle. See `idleGraceSeconds` and the
+    /// media-resume rationale on `stopCapture()`.
+    private var idleEngineTimer: Timer?
+    /// How long to keep the engine running with no active recording before we
+    /// physically stop + release it. Long enough that back-to-back dictations
+    /// reuse one engine (no HW cycling → no media-remote "resume"), short
+    /// enough that the mic-in-use indicator clears soon after the user stops.
+    private let idleGraceSeconds: TimeInterval = 25.0
     private var onSamples: (([Float]) -> Void)?    // Callback for each tap buffer
     /// Secondary callback that receives the resampled 16kHz mono PCM buffer
     /// (same buffer written to disk). Used by the live-partials sliding window.
@@ -336,11 +393,47 @@ class AudioCaptureService {
     /// transcription engine handles its own internal buffering.
     func startMicrophoneCapture(onSamples: @escaping ([Float]) -> Void) throws {
         // Idempotency guard: a prior capture may still be active if startRecording
-        // was called twice in quick succession. Tear it down first so we don't leak
-        // a dangling tap + orphaned watchdog + orphaned engine.
-        stopCapture()
+        // was called twice in quick succession. Remove its tap + watchdog so we
+        // don't leak a dangling tap. We DO NOT tear down the engine here — see
+        // below; reusing a live engine across dictations is what stops macOS
+        // from resuming the user's music on every recording.
+        endActiveCapture(stopEngineNow: false)
+        // Cancel any pending idle-grace teardown — we're recording again, so the
+        // engine must stay up.
+        idleEngineTimer?.invalidate()
+        idleEngineTimer = nil
         self.onSamples = onSamples
-        audioEngine = AVAudioEngine()
+
+        // ENGINE LIFECYCLE / MEDIA-RESUME FIX (May 2026)
+        // -------------------------------------------------
+        // The capture graph is strictly INPUT-ONLY: we install a tap on
+        // inputNode bus 0 and never touch mainMixerNode / outputNode / any
+        // output connection, and VPIO stays OFF for every device class. So the
+        // engine never engages the output bus. That is NOT what was resuming
+        // the user's music.
+        //
+        // The real trigger was the per-dictation engine.start()/engine.stop()
+        // hardware cycle. On macOS, *stopping* an input audio I/O unit nudges
+        // the system now-playing / media-remote transport, which resumes a
+        // media app (Apple Music / Spotify) that had been paused. Every
+        // dictation did start→stop, so every dictation resumed music.
+        //
+        // Fix: keep the AVAudioEngine LONG-LIVED. Start it once and reuse it
+        // across dictations; gate capture by installing/removing the input tap
+        // rather than cycling the engine. We only physically engine.stop() after
+        // an idle grace window (idleGraceSeconds) so the mic-in-use indicator
+        // still clears when the user is done, while back-to-back dictations
+        // never cycle the HW (and so never resume media).
+        let reusedEngine: Bool
+        if let existing = audioEngine, existing.isRunning {
+            reusedEngine = true
+        } else {
+            // No live engine (cold start, or the idle grace already tore it
+            // down). Build a fresh one.
+            audioEngine?.stop()
+            audioEngine = AVAudioEngine()
+            reusedEngine = false
+        }
 
         guard let engine = audioEngine else { return }
 
@@ -403,6 +496,9 @@ class AudioCaptureService {
         self.buffersSinceDSPLog = 0
         self.buffersSinceRecordStart = 0
         self.loggedPostDSPVisualizer = false
+        // Reset the speech-presence (VAD) accumulators for a fresh recording.
+        self.voicedDurationSec = 0
+        self.recordingPeakRMS = 0
 
         // Opt into (or out of) AVAudioEngine voice processing per-device.
         // When enabled: gives us system-level AEC + AGC + NS — big quality
@@ -500,25 +596,68 @@ class AudioCaptureService {
         //   6. start the engine again
         // Without all 6, the moment a user plugs in AirPods mid-recording,
         // capture goes silent for the rest of the session.
-        configChangeToken = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self = self, self.isCapturing else { return }
-            self.handleConfigurationChange()
+        // Register the route-change observer once per engine instance. On a
+        // reused engine the token from the previous recording is still valid
+        // (it survives endActiveCapture(stopEngineNow:false)), so we only add
+        // it when we actually built a fresh engine.
+        if !reusedEngine {
+            if let token = configChangeToken {
+                NotificationCenter.default.removeObserver(token)
+                configChangeToken = nil
+            }
+            configChangeToken = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: engine,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self = self, self.isCapturing else { return }
+                self.handleConfigurationChange()
+            }
         }
 
-        do {
-            try engine.start()
-            vlog("[VOICE-AC] AVAudioEngine started at \(Date()) (running=\(engine.isRunning))")
-        } catch {
-            vlog("[VOICE-AC] AVAudioEngine.start THREW: \(error.localizedDescription)")
-            throw error
+        if reusedEngine {
+            // No HW cycle — the engine was already running from a prior
+            // dictation within the idle grace window. This is the path that
+            // avoids the media-remote "resume" on the user's music.
+            vlog("[VOICE-AC] AVAudioEngine REUSED (already running) — no HW start/stop cycle")
+            Telemetry.log("audio.engine_lifecycle", properties: ["action": "reused"])
+        } else {
+            do {
+                try engine.start()
+                vlog("[VOICE-AC] AVAudioEngine STARTED at \(Date()) (running=\(engine.isRunning))")
+                Telemetry.log("audio.engine_lifecycle", properties: ["action": "started"])
+            } catch {
+                vlog("[VOICE-AC] AVAudioEngine.start THREW: \(error.localizedDescription)")
+                Telemetry.log("audio.capture_start_failed", properties: [
+                    "error": "\(error.localizedDescription)"
+                ])
+                throw error
+            }
         }
+        tapInstalled = true
         isCapturing = true
-        engineStartedAt = Date()
+        engineStartedAt = engineStartedAt ?? Date()
         engineLongRunningWarningEmitted = false
+
+        // Observability — capture lifecycle + media-safety markers.
+        // voice_processing is logged because a voice-processing (VPIO) input
+        // unit on macOS behaves like a playAndRecord session and its teardown
+        // can emit a media-remote "play" that resumes the user's music. We keep
+        // VPIO OFF across all device classes (see DSPTuning), so capture is a
+        // pure record-only unit that does not register with the now-playing /
+        // media-remote transport. Logging it makes that invariant auditable
+        // from events.jsonl if the music-autoplay bug ever resurfaces.
+        Telemetry.log("audio.capture_start", properties: [
+            // Engine identifier so events.jsonl can attribute any media-autoplay
+            // event to the right audio engine (this dictation-capture engine vs
+            // the wake-word engine vs the SoundEffects output engine).
+            "engine": "dictation_capture",
+            "device": currentInputDeviceName(),
+            "device_class": self.inputClass.rawValue,
+            "voice_processing": inputNode.isVoiceProcessingEnabled,
+            "input_sr": preFormat.sampleRate,
+            "input_ch": Int(preFormat.channelCount)
+        ])
 
         // Watchdog: if no audio arrives for 3s while we should be capturing,
         // assume the mic died (permission revoked, device disconnected, HAL
@@ -544,6 +683,13 @@ class AudioCaptureService {
     /// Start capturing system audio (all apps or specific app).
     /// Requires Screen Recording permission on macOS.
     func startSystemAudioCapture(onSamples: @escaping ([Float]) -> Void) async throws {
+        // Idempotency: tear down any in-flight mic capture first so we don't
+        // leak the AVAudioEngine + tap + watchdog when switching capture modes.
+        // Fully release the mic engine here (stopEngineNow:true) — we're
+        // switching to the ScreenCaptureKit output-tap path and won't reuse the
+        // input engine, so there's no benefit to keeping it warm and we don't
+        // want a stray idle-grace timer stopping it mid system-audio session.
+        endActiveCapture(stopEngineNow: true)
         self.onSamples = onSamples
 
         // TWEAK: To capture a specific app (e.g., Chrome for Google Meet),
@@ -574,6 +720,9 @@ class AudioCaptureService {
         try await stream.startCapture()
 
         isCapturing = true
+        // System-audio capture is pure output-tapping via ScreenCaptureKit; it
+        // never opens an input/voice-processing unit, so it can't nudge media.
+        Telemetry.log("audio.capture_start", properties: ["source": "system_audio"])
     }
 
     /// Begin writing every resampled 16 kHz mono Float32 buffer to a `.caf`
@@ -683,16 +832,79 @@ class AudioCaptureService {
     }
 
     /// Stop all audio capture.
+    ///
+    /// IDEMPOTENT: safe to call any number of times; a no-op once capture is
+    /// already stopped (beyond re-arming the idle-grace timer, which is cheap).
+    ///
+    /// MEDIA-RESUME FIX: this does NOT call `engine.stop()`. Stopping the input
+    /// audio unit is what nudged macOS's media-remote transport into resuming
+    /// the user's paused music on every dictation. Instead we remove the input
+    /// tap immediately (which clears the OS mic-in-use / orange indicator) and
+    /// leave the AVAudioEngine *running* for a short idle grace window. If a new
+    /// recording starts within that window we reuse the same engine (no HW
+    /// cycle → no media resume). Only after `idleGraceSeconds` of no recording
+    /// do we physically stop + release the engine — see `releaseEngine()`.
+    ///
+    /// This path issues no media-remote command of any kind: removing a tap and
+    /// (later) stopping a record-only, VPIO-off input unit is the only audio API
+    /// it touches. There is no MPRemoteCommandCenter / now-playing call anywhere
+    /// in this service.
     func stopCapture() {
-        if let token = configChangeToken {
-            NotificationCenter.default.removeObserver(token)
-            configChangeToken = nil
+        // Snapshot the VAD signals into the telemetry BEFORE we tear down — the
+        // accumulators themselves are left intact so the finalize path
+        // (RecordingCoordinator) can still read voicedDurationSeconds /
+        // recordingPeakRMSValue after this returns, exactly as before.
+        let wasCapturing = isCapturing
+        endActiveCapture(stopEngineNow: false)
+
+        if wasCapturing {
+            // Logical capture_stop marker. NOTE: with the long-lived engine this
+            // is no longer a hardware teardown — the engine keeps running until
+            // the idle grace elapses. Kept for the existing audit trail; the new
+            // `audio.engine_lifecycle` events distinguish real start/stop.
+            Telemetry.log("audio.capture_stop", properties: [
+                "engine": "dictation_capture",
+                "voiced_seconds": voicedDurationSec,
+                "peak_rms": recordingPeakRMS
+            ])
         }
-        if let engine = audioEngine {
+
+        // Arm (or re-arm) the idle-grace teardown. If no new recording starts
+        // within idleGraceSeconds we physically stop + release the engine so the
+        // mic-in-use indicator clears. Back-to-back dictations cancel this timer
+        // in startMicrophoneCapture and reuse the engine.
+        if audioEngine != nil {
+            idleEngineTimer?.invalidate()
+            idleEngineTimer = Timer.scheduledTimer(withTimeInterval: idleGraceSeconds,
+                                                   repeats: false) { [weak self] _ in
+                guard let self = self, !self.isCapturing else { return }
+                self.releaseEngine(reason: "idle_grace")
+            }
+        }
+
+        // Note: stopWritingToFile() is intentionally NOT called here. The
+        // owner (MeetingRecorder) controls the file lifecycle separately so
+        // it can finalize the file deterministically after stopCapture()
+        // returns, and so a momentary engine restart on
+        // AVAudioEngineConfigurationChange doesn't truncate the file.
+    }
+
+    /// Tear down the *active capture* (tap + watchdog + UI level state) without
+    /// necessarily stopping the engine. The single place that removes the input
+    /// tap, so both stopCapture() and a re-entrant startMicrophoneCapture() go
+    /// through it. Idempotent.
+    ///
+    /// - Parameter stopEngineNow: when true, also physically stops + releases
+    ///   the engine immediately (used by `releaseEngine`); when false, the
+    ///   engine is left running for the idle-grace window.
+    private func endActiveCapture(stopEngineNow: Bool) {
+        if tapInstalled, let engine = audioEngine {
+            // Remove the tap BEFORE any (deferred) engine stop. Removing the tap
+            // alone does not touch the now-playing / media-remote transport;
+            // only stopping the unit does, which is why we defer that.
             engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
+            tapInstalled = false
         }
-        audioEngine = nil
         isCapturing = false
         audioLevels = Array(repeating: 0, count: fftBinCount)
         visualizerPriorBins = Array(repeating: 0, count: fftBinCount)
@@ -700,17 +912,42 @@ class AudioCaptureService {
         currentRMS = 0
         currentPeak = 0
         silenceTimer?.invalidate()
+        silenceTimer = nil
         silenceWatchdog?.invalidate()
         silenceWatchdog = nil
         onSamples = nil
         onPCMBuffer = nil
+
+        if stopEngineNow {
+            releaseEngine(reason: "explicit")
+        }
+    }
+
+    /// Physically stop and release the AVAudioEngine. This is the ONLY place
+    /// that calls `engine.stop()` for the mic path. Stopping the input unit can
+    /// nudge macOS into resuming paused media, so we do it as rarely as
+    /// possible — only after the idle grace window, or on an explicit teardown
+    /// (e.g. switching to system-audio capture). Idempotent.
+    private func releaseEngine(reason: String) {
+        idleEngineTimer?.invalidate()
+        idleEngineTimer = nil
+        if let token = configChangeToken {
+            NotificationCenter.default.removeObserver(token)
+            configChangeToken = nil
+        }
+        if let engine = audioEngine {
+            // Belt-and-suspenders: make sure no tap survives the stop.
+            if tapInstalled {
+                engine.inputNode.removeTap(onBus: 0)
+                tapInstalled = false
+            }
+            engine.stop()
+            vlog("[VOICE-AC] AVAudioEngine STOPPED + released (reason=\(reason))")
+            Telemetry.log("audio.engine_lifecycle", properties: ["action": "stopped", "reason": reason])
+        }
+        audioEngine = nil
         engineStartedAt = nil
         engineLongRunningWarningEmitted = false
-        // Note: stopWritingToFile() is intentionally NOT called here. The
-        // owner (MeetingRecorder) controls the file lifecycle separately so
-        // it can finalize the file deterministically after stopCapture()
-        // returns, and so a momentary engine restart on
-        // AVAudioEngineConfigurationChange doesn't truncate the file.
     }
 
     // MARK: - Internal Processing
@@ -775,12 +1012,18 @@ class AudioCaptureService {
             bufferSize: bufferSize,
             format: inputFormat  // Use native format — required by AVAudioEngine
         ) { [weak self] buffer, _ in
+            guard let self = self else { return }
+            // Drop any buffer that arrives while we're not actively capturing.
+            // With the long-lived engine the tap is removed on stopCapture()
+            // but a buffer may already be in flight; ignoring it keeps a stale
+            // frame from polluting the next recording's VAD accumulators.
+            guard self.isCapturing else { return }
             // Update the watchdog timestamp in-place — CFAbsoluteTime is a
             // single 8-byte aligned Double, naturally atomic on arm64. No
             // main-queue hop, no Date allocation, no closure capture cost per
             // buffer (this fires every ~85ms during recording).
-            self?.lastAudioReceivedAtCF = CFAbsoluteTimeGetCurrent()
-            self?.processAudioBuffer(buffer)
+            self.lastAudioReceivedAtCF = CFAbsoluteTimeGetCurrent()
+            self.processAudioBuffer(buffer)
         }
     }
 
@@ -807,6 +1050,15 @@ class AudioCaptureService {
         self.inputClass = newClass
         let newTuning = DSPTuning.forDevice(newClass)
         vlog("[VOICE-AC] device class transition: \(oldClass.rawValue) → \(newClass.rawValue) — voiceProcessing=\(newTuning.voiceProcessingEnabled)")
+        // Observability — a route change restarts the engine (stop→start). With
+        // VPIO off this is media-safe, but log it so we can correlate any future
+        // media-autoplay report with a device switch.
+        Telemetry.log("audio.device", properties: [
+            "device": currentInputDeviceName(),
+            "from_class": oldClass.rawValue,
+            "to_class": newClass.rawValue,
+            "voice_processing": newTuning.voiceProcessingEnabled
+        ])
 
         let inputNode = engine.inputNode
         do {
@@ -842,6 +1094,15 @@ class AudioCaptureService {
             try installInputTap(on: inputNode)
         } catch {
             vlog("[VOICE-AC] route-change tap install failed: \(error.localizedDescription)")
+            // The engine is stopped and we couldn't reinstall the tap. Mark
+            // capture as no longer active so downstream state is consistent and
+            // the silence watchdog doesn't fire a second, redundant error.
+            isCapturing = false
+            silenceWatchdog?.invalidate()
+            silenceWatchdog = nil
+            Telemetry.log("audio.capture_stop", properties: [
+                "reason": "route_change_reconfig_failed"
+            ])
             NotificationCenter.default.post(
                 name: .voiceError,
                 object: nil,
@@ -905,6 +1166,16 @@ class AudioCaptureService {
         vDSP_rmsqv(samples, 1, &rms, vDSP_Length(frameCount))
         var peak: Float = 0
         vDSP_maxmgv(samples, 1, &peak, vDSP_Length(frameCount))
+
+        // Speech-presence (VAD) accumulation. This is the AUDIO-based signal
+        // the finalize path uses to suppress Whisper-family hallucinations on
+        // silent/non-speech captures. A buffer counts as "voiced" when its
+        // post-DSP RMS clears speechFloorRMS; we add that buffer's wall-clock
+        // duration to the running total. Tracked on the audio thread only.
+        if rms > recordingPeakRMS { recordingPeakRMS = rms }
+        if rms >= speechFloorRMS {
+            voicedDurationSec += Double(frameCount) / sampleRate
+        }
 
         // Per-second peak diagnostic — surfaces silent-capture failures
         // (mic muted, wrong device, kernel HAL wedged) within 1s.

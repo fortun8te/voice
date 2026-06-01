@@ -226,19 +226,75 @@ public enum Sanitizer {
                 return nil
             }
         } else {
-            // Relaxed: only block COMPLETELY-DEGENERATE drift —
-            // empty output or output that's <10% of input length on
-            // a non-trivial input. Anything in between is the cloud
-            // legitimately rewriting.
+            let isHighPre = (cleanupLevel?.lowercased() == "high")
+
+            // LIGHT-TOUCH WORD FIDELITY. For none/light/medium the brief is
+            // voice-PRESERVING: the model must not substitute one word for a
+            // different word. The proper-noun / number / email / URL guards
+            // above tolerate a couple of losses (typo collapse) and only catch
+            // ≥4-char Capitalized words. That's too loose for the light path:
+            // the failure the user reports is the model "helpfully" changing a
+            // distinctive token ("Diatype" → "Diatribe", "veCRV" → "recurve",
+            // "GPT-4" → "GPT four") into a different word. So on the light path
+            // we additionally require every DISTINCTIVE input token to survive
+            // verbatim:
+            //   - any Capitalized token (e.g. "Diatype", "Slack", names)
+            //   - any token with internal capitals or digits (e.g. "veCRV",
+            //     "GPT-4", "S3", "iOS", "k8s")
+            //   - any user-vocabulary term present in the input
+            // If such a token is in the input but its exact form is absent from
+            // the polish, that's word drift → reject to the safer near-verbatim
+            // fallback. Skipped entirely on "high" (aggressive rewrite is
+            // allowed to recase/restructure these).
+            if !isHighPre,
+               let drifted = driftedDistinctiveToken(
+                   polish: cleaned,
+                   original: original,
+                   userVocabulary: userVocabulary
+               ) {
+                logReject(rule: "light-word-drift:\(drifted)", input: original, polish: polish)
+                return nil
+            }
+
+            // Relaxed: block degenerate drift. The bounds TIGHTEN for the
+            // light-touch path (none/light/medium) because, post-
+            // rearchitecture, those levels run a voice-PRESERVING brief —
+            // the output is expected to stay close to the input length.
+            // Only "high" (the explicit aggressive-rewrite brief) keeps the
+            // old generous 10%-to-4x window for legitimate restructuring.
+            //
+            // NOTE: any conversational lead-in ("Here's a cleaner version:")
+            // and wrapping quotes are stripped UPSTREAM in
+            // PolishPostprocessor.validateAndProcess BEFORE this runs, so
+            // `cleaned` here is already the real content. That means:
+            //   - the shrink floor compares against the true polish (a stripped
+            //     preamble can't drag the count under the floor — it only moves
+            //     the polish CLOSER to the original length), and
+            //   - the expansion ceiling won't false-trip on a preamble that
+            //     would otherwise have inflated the char count.
+            // The light-touch floor (origCount/2) leaves ample headroom for the
+            // handful of chars a preamble strip removes.
             let origCount = original.count
-            if origCount > 40, cleaned.count < max(8, origCount / 10) {
+            let isHigh = isHighPre
+
+            // Shrink floor: high allows down to 10% of input; light-touch
+            // levels should not lose more than ~half the characters (filler
+            // strip + punctuation is the most that legitimately shrinks).
+            let shrinkFloor = isHigh ? (origCount / 10) : (origCount / 2)
+            if origCount > 40, cleaned.count < max(8, shrinkFloor) {
                 logReject(rule: "relaxed:catastrophic-shrink", input: original, polish: polish)
                 return nil
             }
-            // Symmetric guard for runaway expansion (model in a loop).
-            // Cap at 4x the input — generous, covers email/letter
-            // reformatting + signature + 4 bullets without false-positive.
-            if origCount > 0, cleaned.count > max(80, origCount * 4) {
+            // Expansion ceiling: high allows up to 4x (email reformat +
+            // signature + bullets); light-touch should stay within ~1.8x
+            // (punctuation, list bullets, salutation newlines add chars but
+            // not whole new content).
+            let expandMultiplier = isHigh ? 4 : 2
+            let expandFloor = isHigh ? 80 : 60
+            let expandCeil = isHigh
+                ? origCount * expandMultiplier
+                : (origCount * 9 / 5) // 1.8x
+            if origCount > 0, cleaned.count > max(expandFloor, expandCeil) {
                 logReject(rule: "relaxed:runaway-expansion", input: original, polish: polish)
                 return nil
             }
@@ -393,6 +449,117 @@ public enum Sanitizer {
             let url = ns.substring(with: m.range)
             if !polLower.contains(url.lowercased()) { return url }
         }
+        return nil
+    }
+
+    // MARK: - Light-path distinctive-token preservation
+    //
+    // The light-touch brief (none/light/medium) must not substitute one word
+    // for another. This guard enforces it deterministically: every DISTINCTIVE
+    // token in the input must reappear verbatim (case-insensitively for the
+    // body, but the EXACT spelling must be present) in the polish. A token is
+    // "distinctive" when losing or altering it would change the speaker's
+    // actual words:
+    //
+    //   - Capitalized tokens (≥2 chars, first letter uppercase) — names,
+    //     brands, products ("Diatype", "Slack").
+    //   - Internal-caps / digit-bearing tokens ("veCRV", "GPT-4", "iOS", "S3",
+    //     "k8s", "H100") — never ordinary prose, always a deliberate identifier.
+    //   - User-vocabulary terms present in the input.
+    //
+    // Conservatism (so normal cleanup is never false-rejected):
+    //   - We compare TOKENS the SPEAKER actually produced, against the polish's
+    //     token set. Capitalization changes alone do NOT count as drift (the
+    //     brief is allowed to capitalize), so the match is case-insensitive on
+    //     the surrounding text but requires the distinctive token's character
+    //     sequence to be present.
+    //   - Pure all-lowercase, all-alpha words are NOT checked here (sentence-
+    //     start capitalization, filler removal, and punctuation are legitimate
+    //     and must not trip this). Only distinctive tokens are guarded.
+    //   - Sentence-start words that the speaker happened to capitalize are
+    //     filtered out: a token is only treated as a "name-shaped" capitalized
+    //     token when it does NOT also appear lowercased elsewhere and is not the
+    //     leading token of the whole input (where caps are ambiguous). This
+    //     avoids rejecting "Hello" → "hello" style legitimate recasing.
+    //   - We allow ONE distinctive token to vanish (rare ASR/​self-correction
+    //     overlap) and only reject when a distinctive token is altered/dropped
+    //     AND it was not obviously a self-corrected duplicate.
+    static func driftedDistinctiveToken(
+        polish: String,
+        original: String,
+        userVocabulary: [String]?
+    ) -> String? {
+        // Tokenize on whitespace; strip surrounding punctuation but keep
+        // internal punctuation/digits (so "GPT-4" and "veCRV." → "veCRV").
+        func tokenize(_ s: String) -> [String] {
+            s.split(whereSeparator: { $0.isWhitespace }).map {
+                String($0).trimmingCharacters(in: .punctuationCharacters)
+            }.filter { !$0.isEmpty }
+        }
+
+        let origTokens = tokenize(original)
+        guard !origTokens.isEmpty else { return nil }
+        let polishTokens = tokenize(polish)
+        // Exact-spelling presence set (verbatim) + lowercased presence set.
+        let polishExact = Set(polishTokens)
+        let polishLower = Set(polishTokens.map { $0.lowercased() })
+
+        // Words the speaker used lowercased somewhere (so a Capitalized
+        // occurrence is just sentence-start, not a name).
+        let origLowercaseUsage = Set(
+            origTokens.filter { $0 == $0.lowercased() }.map { $0.lowercased() }
+        )
+
+        let vocabLower = Set((userVocabulary ?? []).map { $0.lowercased() })
+
+        func hasInternalCapOrDigit(_ t: String) -> Bool {
+            guard t.count >= 2 else { return false }
+            let body = t.dropFirst()
+            let hasDigit = t.contains(where: { $0.isNumber })
+            let hasInternalUpper = body.contains(where: { $0.isUppercase })
+            return hasDigit || hasInternalUpper
+        }
+
+        func isCapitalizedName(_ t: String, index: Int) -> Bool {
+            guard let first = t.first, first.isUppercase, t.count >= 2 else { return false }
+            // All-caps short tokens are acronyms — handled by internal-caps
+            // branch when they contain digits; pure acronyms ("USA") are
+            // proper-noun-ish and worth protecting, but we leave them to the
+            // existing proper-noun guard to avoid double-counting.
+            // Skip the very first token of the input (leading caps ambiguous).
+            if index == 0 { return false }
+            // If the same word appears lowercased elsewhere in the input, the
+            // capital is positional (sentence start), not a name.
+            if origLowercaseUsage.contains(t.lowercased()) { return false }
+            // Must contain a lowercase letter (so "I" / "A" / all-caps are
+            // excluded here; those are handled elsewhere).
+            return t.dropFirst().contains(where: { $0.isLowercase })
+        }
+
+        var lost: [String] = []
+        for (i, tok) in origTokens.enumerated() {
+            let lower = tok.lowercased()
+            let distinctive =
+                hasInternalCapOrDigit(tok) ||
+                isCapitalizedName(tok, index: i) ||
+                vocabLower.contains(lower)
+            guard distinctive else { continue }
+
+            // Survival test. Internal-caps/digit tokens must survive with their
+            // EXACT character sequence (case-sensitive) — "GPT-4" → "gpt 4"
+            // is drift. Capitalized names / vocab terms may be recased, so a
+            // case-insensitive match counts as survival.
+            if hasInternalCapOrDigit(tok) {
+                if polishExact.contains(tok) { continue }
+            } else {
+                if polishLower.contains(lower) { continue }
+            }
+            lost.append(tok)
+        }
+
+        // Tolerate exactly one vanished distinctive token (self-correction /
+        // duplicate overlap). Reject on the second — that's real word drift.
+        if lost.count > 1 { return lost.first }
         return nil
     }
 

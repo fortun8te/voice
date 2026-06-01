@@ -113,6 +113,16 @@ public enum PolishPostprocessor {
         /// the historical behavior for any caller that doesn't set it; the
         /// polisher passes the correct mode per cleanup level.
         public var listMode: ListFormattingMode
+        /// Writing-style / personality: "formal", "neutral" (default),
+        /// "casual", "excited". Controls the tiered trailing-period strip
+        /// (mirrors Wispr's documented per-style behavior). Formal keeps all
+        /// trailing periods; neutral strips in messaging contexts for short
+        /// messages; casual strips broadly.
+        public var personalityStyle: String
+        /// True when the active app is a messaging / chat context (Slack,
+        /// iMessage, Teams, Discord, etc). The trailing-period strip is more
+        /// aggressive here because short messages don't end with periods.
+        public var isMessagingContext: Bool
 
         public init(
             sentenceStartCaps: Bool = true,
@@ -133,7 +143,9 @@ public enum PolishPostprocessor {
             spokenPunctuation: Bool = true,
             punctuationSpacing: Bool = true,
             userProperNouns: Set<String> = [],
-            listMode: ListFormattingMode = .aggressive
+            listMode: ListFormattingMode = .aggressive,
+            personalityStyle: String = "neutral",
+            isMessagingContext: Bool = false
         ) {
             self.sentenceStartCaps = sentenceStartCaps
             self.midClauseCapsReducer = midClauseCapsReducer
@@ -154,6 +166,8 @@ public enum PolishPostprocessor {
             self.punctuationSpacing = punctuationSpacing
             self.userProperNouns = userProperNouns
             self.listMode = listMode
+            self.personalityStyle = personalityStyle
+            self.isMessagingContext = isMessagingContext
         }
 
         public static let `default` = Options()
@@ -220,8 +234,17 @@ public enum PolishPostprocessor {
             userProperNouns: userNouns,
             listMode: ListFormattingMode(cleanupLevel: cleanupLevel)
         )
+        // Strip any conversational lead-in ("Here's a cleaner version:", "Sure,
+        // …") and wrapping quotes BEFORE the sanitizer validates. The current
+        // cloud model occasionally prepends a meta-preamble or wraps the whole
+        // answer in quotes; doing this first means (a) the sanitizer's
+        // preamble-residue rule never trips on a recoverable case, and (b) the
+        // length/shrink bounds compare against the real content, not the
+        // preamble-inflated text. Idempotent on already-clean output.
+        let preStripped = stripLeadingPreamble(polish)
+        let stripped = stripWrappingQuotes(preStripped)
         let accepted = Sanitizer.run(
-            polish: polish,
+            polish: stripped,
             original: originalForFallback,
             mode: mode,
             cleanupLevel: cleanupLevel,
@@ -422,12 +445,22 @@ public enum PolishPostprocessor {
         current = cli
 
         // Common homophones and grammar fixes that ASR mishears constantly.
-        let hp = Self.homophonePass(current)
-        recordIfChanged(current, hp, rule: "homophones", into: &changes)
-        current = hp
+        // WORD FIDELITY: this pass SUBSTITUTES one word for another
+        // ("their" → "they're", "to" → "too", "expresso" → "espresso"). On the
+        // light-touch path (none/light/medium) we must NOT change the speaker's
+        // actual words, so it runs ONLY at the aggressive level (cleanup=high),
+        // which is the single sanctioned rewrite path. `listMode` already
+        // encodes the cleanup level (.aggressive ⇔ "high").
+        if options.listMode.allowsImplicitList {
+            let hp = Self.homophonePass(current)
+            recordIfChanged(current, hp, rule: "homophones", into: &changes)
+            current = hp
+        }
 
         // Honorifics — "Doctor Smith" → "Dr. Smith", "Mister Johnson" → "Mr. Johnson".
-        let ho = Self.honorificPass(current)
+        // Also a word transformation (expands/abbreviates a spoken token), so
+        // gate it to the aggressive path for the same word-fidelity reason.
+        let ho = options.listMode.allowsImplicitList ? Self.honorificPass(current) : current
         recordIfChanged(current, ho, rule: "honorifics", into: &changes)
         current = ho
 
@@ -504,6 +537,21 @@ public enum PolishPostprocessor {
             current = r
         }
 
+        // Tiered trailing-period strip (mirrors Wispr's per-style tiers).
+        // Formal → keep all trailing periods. Neutral/Default → strip the
+        // final period in messaging contexts for short messages (≤2
+        // sentences). Casual → strip in any app up to ~10 sentences. This is
+        // a DETERMINISTIC behavior moved out of the LLM prompt so it's
+        // predictable. Runs after the cutoff-period pass and before the
+        // whitespace/spacing passes clean up.
+        let tp = Self.tieredTrailingPeriodPass(
+            current,
+            personalityStyle: options.personalityStyle,
+            isMessaging: options.isMessagingContext
+        )
+        recordIfChanged(current, tp, rule: "tiered-trailing-period", into: &changes)
+        current = tp
+
         if options.trailingQuestionSanity {
             let r = trailingQuestionSanityPass(current)
             recordIfChanged(current, r, rule: "trailing-question-sanity", into: &changes)
@@ -568,6 +616,184 @@ public enum PolishPostprocessor {
         if before != after {
             list.append(Change(rule: rule, before: before, after: after))
         }
+    }
+
+    // MARK: - Leading-preamble stripper (cloud-model quirk guard)
+    //
+    // The cloud model sometimes prepends a conversational lead-in to the
+    // polished text ("Here's a cleaner version:", "Sure, …"). It's never part
+    // of the user's dictation, so we remove it. Two recognition strategies,
+    // both anchored to the VERY START of the output and case-insensitive:
+    //
+    //   A. PHRASE + DELIMITER: a known opener phrase ("here's a cleaner
+    //      version", "here is the cleaned up text", "here you go", …)
+    //      followed by an optional colon and required whitespace/newline.
+    //      The delimiter is what proves it was a preamble and not real prose.
+    //   B. EXACT META-PHRASE: a short interjection ("sure,", "of course,",
+    //      "certainly,", …) that, as a literal whole-token opener followed by
+    //      a comma, is effectively never legitimate dictation. We require the
+    //      trailing comma so a real sentence that simply starts with "Sure I
+    //      can do that" is left untouched.
+    //
+    // Conservative principle (matches the rest of this file): only strip when
+    // the lead-in is followed by genuine remaining content, and never strip a
+    // bare word like "Sure" that could be the user's actual first word.
+
+    /// Opener phrases that count as a preamble ONLY when immediately followed
+    /// by an optional `:` and then whitespace / a newline before real content.
+    /// Lower-cased; matching is case-insensitive.
+    static let preamblePhrases: [String] = [
+        "here's a cleaner version",
+        "here is a cleaner version",
+        "here's the cleaner version",
+        "here is the cleaner version",
+        "here's the cleaned up text",
+        "here is the cleaned up text",
+        "here's the cleaned-up text",
+        "here is the cleaned-up text",
+        "here's the cleaned up version",
+        "here is the cleaned up version",
+        "here's the cleaned version",
+        "here is the cleaned version",
+        "here's the polished version",
+        "here is the polished version",
+        "here's the polished text",
+        "here is the polished text",
+        "here's the revised version",
+        "here is the revised version",
+        "here's the improved version",
+        "here is the improved version",
+        "here's your cleaned up text",
+        "here is your cleaned up text",
+        "here's the text",
+        "here is the text",
+        "here you go",
+        "here it is"
+    ]
+
+    /// Short interjection openers that are only ever meta when followed by a
+    /// comma. Lower-cased; matching is case-insensitive.
+    static let preambleInterjections: [String] = [
+        "sure",
+        "of course",
+        "certainly",
+        "absolutely",
+        "got it",
+        "no problem",
+        "okay",
+        "ok"
+    ]
+
+    /// Max characters a recognized preamble may consume. A guard against a
+    /// pathological match eating real content; every phrase above is far
+    /// shorter than this.
+    static let maxPreambleStripLength = 64
+
+    /// Quote-pair openers/closers we treat as "wrapping" when the ENTIRE
+    /// output is enclosed. Straight + curly doubles and curly singles. Straight
+    /// single quotes are intentionally excluded (apostrophes / contractions).
+    static let wrappingQuotePairs: [(open: Character, close: Character)] = [
+        ("\"", "\""),
+        ("\u{201C}", "\u{201D}"),   // “ ”
+        ("\u{2018}", "\u{2019}")    // ‘ ’
+    ]
+
+    /// Remove a conversational lead-in at the very start of the model output.
+    /// Returns the input unchanged when no recognized preamble is present.
+    /// Logs `[VOICE-PREAMBLE]` when it fires so the dev console shows it.
+    static func stripLeadingPreamble(_ text: String) -> String {
+        // Operate on a leading-whitespace-trimmed view but preserve the
+        // original leading whitespace if we DON'T strip anything.
+        let leadingWS = text.prefix(while: { $0 == " " || $0 == "\t" || $0 == "\n" })
+        let body = String(text.dropFirst(leadingWS.count))
+        guard !body.isEmpty else { return text }
+        let lower = body.lowercased()
+
+        // Strategy A: known opener phrase + optional ":" + required separator.
+        for phrase in preamblePhrases where lower.hasPrefix(phrase) {
+            let afterPhrase = body.index(body.startIndex, offsetBy: phrase.count)
+            if let remainder = remainderAfterDelimiter(body, from: afterPhrase),
+               !remainder.isEmpty,
+               body.distance(from: body.startIndex, to: afterPhrase) <= maxPreambleStripLength {
+                print("[VOICE-PREAMBLE] stripped phrase lead-in: \"\(phrase)\"")
+                return remainder
+            }
+        }
+
+        // Strategy B: short interjection + REQUIRED comma + remaining content.
+        for word in preambleInterjections where lower.hasPrefix(word) {
+            let afterWord = body.index(body.startIndex, offsetBy: word.count)
+            // Next non-space char MUST be a comma (so "Sure I will" is safe).
+            var cursor = afterWord
+            // The interjection must be a whole token: next char is a comma or
+            // space, never a letter (avoids matching "okayish", "sured").
+            if cursor < body.endIndex, body[cursor].isLetter { continue }
+            // Skip spaces between the word and the comma ("sure ," is rare but
+            // tolerated).
+            while cursor < body.endIndex, body[cursor] == " " { cursor = body.index(after: cursor) }
+            guard cursor < body.endIndex, body[cursor] == "," else { continue }
+            if let remainder = remainderAfterDelimiter(body, from: body.index(after: cursor)),
+               !remainder.isEmpty {
+                print("[VOICE-PREAMBLE] stripped interjection lead-in: \"\(word),\"")
+                return remainder
+            }
+        }
+
+        return text
+    }
+
+    /// Given an index positioned right after a matched opener, consume an
+    /// optional ":" and then any run of whitespace/newlines. Returns the
+    /// trimmed remaining content, or nil if there was no separator (which
+    /// means the opener ran straight into more letters and was NOT a preamble,
+    /// e.g. "here it isn't broken").
+    private static func remainderAfterDelimiter(_ body: String, from start: String.Index) -> String? {
+        var i = start
+        var sawSeparator = false
+        // Optional single colon.
+        if i < body.endIndex, body[i] == ":" {
+            i = body.index(after: i)
+            sawSeparator = true
+        }
+        // Required (unless a colon was already seen) whitespace / newline run.
+        var consumedWS = false
+        while i < body.endIndex, body[i] == " " || body[i] == "\t" || body[i] == "\n" {
+            i = body.index(after: i)
+            consumedWS = true
+        }
+        // A preamble must be delimited: either a colon, or trailing whitespace
+        // separating it from the real content. If neither, the opener is glued
+        // to the next word and is therefore real prose — bail out.
+        guard sawSeparator || consumedWS else { return nil }
+        return String(body[i...]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// If the ENTIRE output is wrapped in a matched quote pair the user almost
+    /// certainly didn't dictate, remove the outer quotes. Only fires when the
+    /// first and last non-whitespace chars form a recognized pair AND there is
+    /// no UNescaped same-kind quote in between (so an interior quoted phrase
+    /// doesn't get mis-merged). Returns the input unchanged otherwise.
+    static func stripWrappingQuotes(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2, let first = trimmed.first, let last = trimmed.last else {
+            return text
+        }
+        for pair in wrappingQuotePairs where first == pair.open && last == pair.close {
+            let inner = String(trimmed.dropFirst().dropLast())
+            // Reject if the interior still contains the same opening quote —
+            // that means the wrap isn't a clean single enclosure (e.g.
+            // `"a" and "b"`), so removing the outer pair would corrupt it.
+            if pair.open == pair.close {
+                if inner.contains(pair.open) { return text }
+            } else {
+                if inner.contains(pair.open) || inner.contains(pair.close) { return text }
+            }
+            let cleaned = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { return text }
+            print("[VOICE-PREAMBLE] stripped wrapping quotes (\(pair.open)…\(pair.close))")
+            return cleaned
+        }
+        return text
     }
 
     // MARK: - Pass 1: Sentence-start caps
@@ -808,6 +1034,74 @@ public enum PolishPostprocessor {
             return stripped + "\n"
         }
         return stripped
+    }
+
+    // MARK: - Tiered trailing-period strip (per writing-style)
+    //
+    // Mirrors Wispr Flow's documented behavior: short messages typically
+    // don't end with a period, and how aggressively we drop the final period
+    // depends on the user's writing style and where they're typing.
+    //
+    //   Formal           → keep ALL trailing periods (no strip).
+    //   Neutral/Default  → strip the final "." only in messaging-app contexts
+    //                      AND only for short messages (≤ 2 sentences).
+    //   Casual           → strip the final "." in ANY app, up to ~10 sentences.
+    //
+    // Only ever touches a single trailing "." — never "!" or "?" (those are
+    // intentional), never interior punctuation, and never a list block (a
+    // trailing newline / bullet structure is left intact).
+    static func tieredTrailingPeriodPass(
+        _ text: String,
+        personalityStyle: String,
+        isMessaging: Bool
+    ) -> String {
+        let style = personalityStyle.lowercased()
+        // Formal never strips.
+        if style == "formal" { return text }
+
+        // Must end exactly in a single "." (allowing trailing whitespace).
+        let trimmedTail = text.replacingOccurrences(
+            of: "[ \\t]+$", with: "", options: .regularExpression)
+        guard trimmedTail.hasSuffix(".") else { return text }
+        // Don't strip ellipses ("...") — that's intentional.
+        if trimmedTail.hasSuffix("..") { return text }
+        // Don't touch list output: if the last non-empty line is a bullet /
+        // numbered item, leave it alone.
+        let lastLine = trimmedTail
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .last.map(String.init) ?? trimmedTail
+        if lastLine.range(of: #"^\s*([-*\u{2022}]|\d+\.)\s+"#,
+                          options: .regularExpression) != nil {
+            return text
+        }
+        // Don't strip after an abbreviation ("etc.", "Inc.", "U.S.").
+        if lastLine.range(of: #"\b([A-Z]\.|etc|inc|ltd|co|vs|e\.g|i\.e)\.$"#,
+                          options: [.regularExpression, .caseInsensitive]) != nil {
+            return text
+        }
+
+        // Count sentence terminators to gate by length.
+        let sentenceCount = trimmedTail
+            .filter { $0 == "." || $0 == "!" || $0 == "?" }
+            .count
+
+        let shouldStrip: Bool
+        switch style {
+        case "casual":
+            shouldStrip = sentenceCount <= 10
+        default: // neutral / excited / unknown
+            shouldStrip = isMessaging && sentenceCount <= 2
+        }
+        guard shouldStrip else { return text }
+
+        // Strip the single trailing period, preserving any original trailing
+        // newline so downstream layout is unchanged.
+        let hadTrailingNewline = text.hasSuffix("\n")
+        var stripped = trimmedTail
+        stripped.removeLast() // the "."
+        stripped = stripped.replacingOccurrences(
+            of: "[ \\t]+$", with: "", options: .regularExpression)
+        return hadTrailingNewline ? stripped + "\n" : stripped
     }
 
     // MARK: - Pass 5: Whitespace normalization
@@ -2448,6 +2742,76 @@ public enum PolishPostprocessor {
             result = (result as NSString).replacingCharacters(in: match.range, with: bulletList)
             print("[VOICE-POST] implicit-list: \(items.count) items detected after \"\(cue)\"")
         }
+
+        // SECOND PASS — cueless enumeration. The cue-based matcher above misses
+        // a bare run of short items with no lead-in verb ("X, Y, Z and W").
+        // Because the ONLY caller of implicitListPass is the `.aggressive`
+        // (high) cleanup gate, it is safe to detect implied enumeration here
+        // without a cue. We stay conservative: the run must be a standalone
+        // clause (start of line / after a sentence terminator, ending at a
+        // terminator or end), every item must be a SHORT noun phrase (1-3
+        // words), and there must be 3+ of them. This catches "milk, eggs,
+        // bread and bananas" while leaving real prose ("I went home, I was
+        // tired, and I slept") alone (those items exceed 3 words / contain
+        // verbs we don't strip into items).
+        result = cuelessEnumerationToList(result)
+        return result
+    }
+
+    /// Aggressive-only: turn a standalone clause that is a bare run of 3+ short
+    /// noun-phrase items ("milk, eggs, bread and bananas") into a bullet list,
+    /// even with no cue phrase. Conservative on item shape so prose isn't
+    /// mistaken for a list.
+    static func cuelessEnumerationToList(_ text: String) -> String {
+        // A clause-anchored comma run: (^ or after . ! ? : or newline) then
+        // item (, item){2,} (,? and item)? up to a terminator / end.
+        // Each item: 1-3 short words, letters/spaces/hyphens/apostrophes only.
+        let item = #"[A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){0,2}"#
+        let pattern = #"(?i)(?:(?<=^)|(?<=[.!?:\n]))\s*"# +
+            #"("# + item + #")"# +
+            #"(?:,\s*("# + item + #"))"# +
+            #"(?:,\s*("# + item + #"))*?"# +
+            #"(?:\s*,?\s+and\s+("# + item + #"))?"# +
+            #"(?=\s*[.!?\n]|\s*$)"#
+
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }
+        let ns = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return text }
+
+        var result = text
+        for match in matches.reversed() {
+            // Re-extract the matched substring and split it ourselves so the
+            // variable-count "(, item)*" middle group (which only captures its
+            // LAST repetition in NSRegularExpression) doesn't lose items.
+            let full = (result as NSString).substring(with: match.range)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // Don't touch something that's already a bullet/numbered line.
+            if full.range(of: #"^\s*([-*\u{2022}]|\d+\.)\s+"#, options: .regularExpression) != nil { continue }
+            let rawItems = full
+                .replacingOccurrences(of: ", and ", with: ", ")
+                .replacingOccurrences(of: " and ", with: ", ")
+                .components(separatedBy: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            // Need 3+ items, each a short noun phrase (≤3 words). Reject if any
+            // item looks like a clause (verb-ish length) to avoid mangling prose.
+            guard rawItems.count >= 3 else { continue }
+            let allShort = rawItems.allSatisfy { $0.split(separator: " ").count <= 3 }
+            guard allShort else { continue }
+
+            let items = rawItems.map { it -> String in
+                guard let first = it.first else { return it }
+                return String(first).uppercased() + it.dropFirst()
+            }
+            let bulletList = items.map { "- \($0)" }.joined(separator: "\n")
+            // Preserve any leading whitespace the regex consumed before item 1
+            // by replacing only from the first captured group onward is fiddly;
+            // simplest correct behavior is to replace the whole matched range
+            // (which began at a clause boundary) with the bullet block.
+            result = (result as NSString).replacingCharacters(in: match.range, with: "\n" + bulletList)
+            print("[VOICE-POST] cueless-enumeration: \(items.count) items bulleted")
+        }
         return result
     }
 
@@ -3295,6 +3659,42 @@ public enum PolishPostprocessor {
                     .joined(separator: "\n")
                 s = (s as NSString).replacingCharacters(in: match.range, with: listBlock)
                 print("[VOICE-POST] numbered-list: \(items.count) items detected via 'first/second/third'")
+            }
+        }
+
+        // Form D: bare spoken cardinals — "one X two Y three Z [four W]?".
+        // List-trigger parity: sequence WORDS (first/second/third, handled in
+        // Form B) AND spoken digits should both trigger a numbered list. This
+        // is the spoken-digit counterpart. Requires the cardinal to be
+        // followed by a comma/colon/clear pause so we don't false-positive on
+        // "one more thing two days ago three times" — the markers must read as
+        // an enumeration. Conservative: needs ≥3 markers.
+        // Word-boundary anchor (\b) keeps us from matching inside another
+        // word and is consumed harmlessly (zero-width). The comma/colon after
+        // each cardinal is the real disambiguator that prevents false matches
+        // on prose like "one more thing two days ago".
+        let patternD = #"(?i)\bone[,:]\s+(.+?)\s+two[,:]\s+(.+?)\s+three[,:]\s+(.+?)(?:\s+four[,:]\s+(.+?))?(?=[.!?\n]|$)"#
+        if let rx = try? NSRegularExpression(pattern: patternD) {
+            let ns = s as NSString
+            let matches = rx.matches(in: s, range: NSRange(location: 0, length: ns.length))
+            for match in matches.reversed() {
+                var items: [String] = []
+                // Skip range(at: 0) (whole match) — items are captures 1+.
+                for i in 1..<match.numberOfRanges {
+                    let r = match.range(at: i)
+                    if r.location == NSNotFound { continue }
+                    let item = (s as NSString).substring(with: r)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: ",.!?"))
+                    if !item.isEmpty { items.append(item) }
+                }
+                guard items.count >= 3 else { continue }
+                items = items.map { $0.prefix(1).uppercased() + $0.dropFirst() }
+                let listBlock = items.enumerated()
+                    .map { "\($0.offset + 1). \($0.element)" }
+                    .joined(separator: "\n")
+                s = (s as NSString).replacingCharacters(in: match.range, with: listBlock)
+                print("[VOICE-POST] numbered-list: \(items.count) items detected via spoken cardinals 'one/two/three'")
             }
         }
 

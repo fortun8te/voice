@@ -175,6 +175,12 @@ final class WakeWordService: NSObject {
     private var task: SFSpeechRecognitionTask?
     private var isPausedForRecording = false
     private var isRunning = false
+    /// True once the AVAudioEngine + input tap are live. We keep the engine
+    /// RUNNING across recognizer restarts (see restartIfStillEnabled) and only
+    /// recreate the SFSpeechRecognitionRequest/task — see the media-playback
+    /// note in `start()`. `isRunning` tracks the *recognition session*;
+    /// `isEngineLive` tracks the *audio hardware*.
+    private var isEngineLive = false
     /// Wall-clock time we last fired the wake callback. Used to debounce
     /// duplicate detections — the recognizer keeps emitting partial results
     /// containing the phrase for ~1s after it lands.
@@ -203,8 +209,23 @@ final class WakeWordService: NSObject {
     }
 
     /// Stop the recognizer and release the mic tap.
+    ///
+    /// IDEMPOTENT / INERT-WHEN-OFF: the `UserDefaults.didChangeNotification`
+    /// observer in VoiceApp calls this on EVERY defaults write while the mode
+    /// is "off". If the service was never running there is nothing to tear
+    /// down — we must not touch audio HW and must not emit a `wakeword.stop`
+    /// event. Doing so was the source of the `wakeword.stop internal_pause:false`
+    /// bursts in events.jsonl and, on macOS, repeatedly poking the input-unit
+    /// teardown path is exactly what can nudge media-remote into resuming the
+    /// user's music. So: if we have no live engine and no live recognition
+    /// session and no window timer, this is a pure no-op.
     func disable() {
+        let hadWindow = windowTimer != nil
         cancelWindowTimer()
+        guard isRunning || isEngineLive || hadWindow else {
+            // Nothing was ever armed — stay completely inert. No HW poke, no log.
+            return
+        }
         stop()
     }
 
@@ -264,27 +285,203 @@ final class WakeWordService: NSObject {
 
     /// Caller invokes this when the dictation engine takes over the mic.
     /// We tear down the wake-word tap so AVAudioEngine inputs don't fight.
+    ///
+    /// INERT-WHEN-OFF: this fires on EVERY hotkey press / dictation start. When
+    /// wake word is disabled (mode "off" or the legacy toggle off) the service
+    /// is not running and there is no engine to pause — we early-return and
+    /// touch NOTHING. No audio-unit start/stop, no telemetry. This guarantees
+    /// the per-dictation pause/resume cycle is a complete no-op while wake word
+    /// is off, so it can never participate in the media-resume-on-teardown path.
     func pauseWhileRecording() {
-        guard isRunning else { return }
+        guard isEnabled else { return }
+        guard isRunning || isEngineLive else { return }
         isPausedForRecording = true
         stop(internalPause: true)
     }
 
     /// Resume after dictation finishes.
+    ///
+    /// INERT-WHEN-OFF: fired ~2s after every release. Only does anything if we
+    /// actually paused an active session AND we're still enabled. While wake
+    /// word is off, `isPausedForRecording` is never set, so this is a no-op —
+    /// it never starts an engine or installs a tap.
     func resume() {
         guard isPausedForRecording else { return }
         isPausedForRecording = false
-        if isEnabled { start() }
+        guard isEnabled else { return }
+        start()
     }
 
     // MARK: - Internals
 
-    private func start() {
-        guard !isRunning else { return }
+    /// Bring up the AVAudioEngine + input tap ONCE and leave it running for the
+    /// whole listen window. Idempotent — a no-op if the engine is already live.
+    ///
+    /// ============================================================
+    /// MEDIA-PLAYBACK REGRESSION FIX (May 2026) — DO NOT cycle the engine.
+    /// ============================================================
+    /// Symptom: the user's Apple Music / Spotify would spontaneously start
+    /// playing (observed overnight). Root cause: this wake-word path stops and
+    /// fully restarts the AVAudioEngine roughly once a minute (SFSpeechRecognizer
+    /// caps a session at ~1 min, then errors → restartIfStillEnabled()). On
+    /// macOS, every start()/stop() of an input audio unit churns the HAL I/O
+    /// graph; if the unit is configured as voice-processing (playAndRecord-like)
+    /// it registers with the now-playing / media-remote system, and the teardown
+    /// on stop() emits a media-remote "play" command that resumes the default
+    /// music app.
+    ///
+    /// The permanent fix has two parts:
+    ///   1. Force voice processing OFF on the input node so this is a pure
+    ///      INPUT/record-only unit. A record-only unit does not participate in
+    ///      the now-playing/media-remote transport, so its lifecycle can never
+    ///      emit a "play". (We don't need AEC for keyword spotting anyway.)
+    ///   2. Keep this engine RUNNING across recognizer restarts. The per-minute
+    ///      SFSpeechRecognizer recycle now only recreates the request/task
+    ///      (see startRecognitionSession / restartIfStillEnabled) — the audio
+    ///      hardware is never stopped, so nothing nudges media-remote.
+    /// Together these guarantee that arming wake word can NEVER trigger system
+    /// media playback. If you ever need to stop the engine, do it only from
+    /// stop()/disable() (a deliberate teardown), never on the restart path.
+    private func startEngineIfNeeded() {
+        guard !isEngineLive else { return }
+
+        // DEFENSE IN DEPTH: never bring up the audio HW if the service is not
+        // currently enabled. start() already gates on isRunning, but this makes
+        // it impossible for any future caller to spin the input unit (and risk
+        // the media-resume-on-teardown nudge) while wake word is off.
+        guard isEnabled else {
+            print("[WAKE] startEngineIfNeeded() refused — not enabled")
+            Telemetry.log("wakeword.engine_start_refused", properties: [
+                "reason": "not_enabled",
+                "mode": WakeWordMode.current().rawValue
+            ])
+            return
+        }
+
+        let inputNode = audioEngine.inputNode
+
+        // (1) Disable voice processing → pure input/record-only unit. Must be
+        // set before reading the format / installing the tap. Failures are
+        // non-fatal (older HW), but on the typical Mac this is what keeps the
+        // unit out of the media-remote transport.
+        do {
+            if inputNode.isVoiceProcessingEnabled {
+                try inputNode.setVoiceProcessingEnabled(false)
+            }
+            Telemetry.log("wakeword.voice_processing", properties: [
+                "enabled": inputNode.isVoiceProcessingEnabled
+            ])
+        } catch {
+            print("[WAKE] could not disable voice processing: \(error.localizedDescription)")
+            Telemetry.log("wakeword.voice_processing_error", properties: [
+                "error": "\(error.localizedDescription)"
+            ])
+        }
+
+        let format = inputNode.outputFormat(forBus: 0)
+
+        // Whisper support: amplify the mic signal before feeding it to the
+        // recognizer. SFSpeechRecognizer's acoustic model expects ~normal
+        // speech volume; whispered phrases land below its detection floor
+        // unless we boost. 4× lift with hard clip preserves the wake phrase
+        // even when the user breathes the words. Boost is applied in-place
+        // on the buffer's float channel data right before forwarding to the
+        // recognition request.
+        let micGain: Float = 4.0
+
+        // Install the tap ONCE. It forwards to whatever `request` is current,
+        // so recreating the request across restarts needs no tap churn.
+        // Guard against an invalid (0ch / 0Hz) format — happens when mic
+        // permission was revoked or the device vanished.
+        guard format.channelCount > 0, format.sampleRate > 0 else {
+            print("[WAKE] invalid input format — mic permission revoked or device missing")
+            Telemetry.log("wakeword.start_failed", properties: ["reason": "invalid_format"])
+            return
+        }
+
+        // Buffer size 1024 = ~21ms at 48kHz — small enough for fast detection.
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            guard let self else { return }
+            // Pre-amplify so whispers cross the recognizer's detection floor.
+            // We mutate the buffer in place — safe because the tap closure
+            // owns this buffer for the duration of the call.
+            if let channelData = buffer.floatChannelData {
+                let frameCount = Int(buffer.frameLength)
+                let channels = Int(buffer.format.channelCount)
+                for c in 0..<channels {
+                    let ptr = channelData[c]
+                    for i in 0..<frameCount {
+                        let amplified = ptr[i] * micGain
+                        ptr[i] = max(-1.0, min(1.0, amplified))
+                    }
+                }
+            }
+            self.request?.append(buffer)
+        }
+
+        do {
+            audioEngine.prepare()
+            try audioEngine.start()
+            isEngineLive = true
+            // Focused media-safety telemetry: which engine + why. If music
+            // autoplay ever recurs, events.jsonl pinpoints whether the
+            // wake-word input unit was the trigger (engine "wakeword",
+            // mode, VPIO state) vs the dictation capture engine.
+            Telemetry.log("wakeword.engine_start", properties: [
+                "engine": "wakeword",
+                "reason": WakeWordMode.current() == .activatedWindow ? "window_armed" : "enabled",
+                "mode": WakeWordMode.current().rawValue,
+                "input_sr": format.sampleRate,
+                "input_ch": Int(format.channelCount),
+                "voice_processing": inputNode.isVoiceProcessingEnabled
+            ])
+        } catch {
+            print("[WAKE] couldn't start audio engine: \(error.localizedDescription)")
+            inputNode.removeTap(onBus: 0)
+            Telemetry.log("wakeword.start_failed", properties: [
+                "reason": "engine_start_threw",
+                "error": "\(error.localizedDescription)"
+            ])
+        }
+    }
+
+    /// Tear down the AVAudioEngine + tap. This is the ONLY place (besides
+    /// pauseWhileRecording / disable) that stops the audio hardware. Per the
+    /// media-playback note in startEngineIfNeeded, we deliberately keep this
+    /// off the recognizer-restart path.
+    private func stopEngine(reason: String = "unspecified") {
+        guard isEngineLive else { return }
+        // Focused media-safety telemetry: the input-unit teardown is the only
+        // wake-word operation that can theoretically nudge media-remote. Log
+        // every real teardown (engine + why) so it is pinpointable from
+        // events.jsonl. Note: a record-only unit (VPIO off — set in
+        // startEngineIfNeeded) should not resume media; this log lets us prove
+        // it if the bug ever recurs.
+        Telemetry.log("wakeword.engine_stop", properties: [
+            "engine": "wakeword",
+            "reason": reason
+        ])
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.inputNode.removeTap(onBus: 0)
+        isEngineLive = false
+    }
+
+    /// Create (or recreate) the SFSpeechRecognitionRequest + task. Does NOT
+    /// touch the AVAudioEngine — the long-lived tap just starts feeding the
+    /// new request. Safe to call repeatedly; cancels any prior task first.
+    private func startRecognitionSession() {
         guard let recognizer, recognizer.isAvailable else {
             print("[WAKE] recognizer unavailable — bailing")
             return
         }
+
+        // Cancel any prior request/task so we don't leak or double-append.
+        request?.endAudio()
+        task?.cancel()
+        task = nil
+        request = nil
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
@@ -308,48 +505,6 @@ final class WakeWordService: NSObject {
             "Figma", "Tailwind", "React", "Vite", "Next.js",
         ]
 
-        let inputNode = audioEngine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-
-        // Whisper support: amplify the mic signal before feeding it to the
-        // recognizer. SFSpeechRecognizer's acoustic model expects ~normal
-        // speech volume; whispered phrases land below its detection floor
-        // unless we boost. 4× lift with hard clip preserves the wake phrase
-        // even when the user breathes the words. Boost is applied in-place
-        // on the buffer's float channel data right before forwarding to the
-        // recognition request.
-        let micGain: Float = 4.0
-
-        // Install the tap. Buffer size 1024 = ~21ms at 48kHz — small enough
-        // for fast detection without overwhelming the recognizer.
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            guard let self else { return }
-            // Pre-amplify so whispers cross the recognizer's detection floor.
-            // We mutate the buffer in place — safe because the tap closure
-            // owns this buffer for the duration of the call.
-            if let channelData = buffer.floatChannelData {
-                let frameCount = Int(buffer.frameLength)
-                let channels = Int(buffer.format.channelCount)
-                for c in 0..<channels {
-                    let ptr = channelData[c]
-                    for i in 0..<frameCount {
-                        let amplified = ptr[i] * micGain
-                        ptr[i] = max(-1.0, min(1.0, amplified))
-                    }
-                }
-            }
-            self.request?.append(buffer)
-        }
-
-        do {
-            audioEngine.prepare()
-            try audioEngine.start()
-        } catch {
-            print("[WAKE] couldn't start audio engine: \(error.localizedDescription)")
-            inputNode.removeTap(onBus: 0)
-            return
-        }
-
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self else { return }
             if let result {
@@ -367,35 +522,88 @@ final class WakeWordService: NSObject {
         }
 
         request = req
+    }
+
+    private func start() {
+        guard !isRunning else { return }
+        // Bring up the audio HW (idempotent) then attach a recognition session.
+        startEngineIfNeeded()
+        guard isEngineLive else {
+            // Engine failed to start — don't claim we're running.
+            return
+        }
+        startRecognitionSession()
+        guard task != nil else {
+            // Recognition couldn't start; tear the engine back down so we don't
+            // hold the mic with no consumer.
+            stopEngine()
+            return
+        }
         isRunning = true
+        Telemetry.log("wakeword.start", properties: [
+            "phrase": wakePhrase,
+            "mode": WakeWordMode.current().rawValue
+        ])
         print("[WAKE] started — listening for \"\(wakePhrase)\"")
     }
 
+    /// Full teardown — stops the recognition session AND the audio hardware.
+    /// This is a deliberate stop (disable / pause-for-dictation / window
+    /// expiry), so cycling the engine here is fine: it is not the per-minute
+    /// recognizer recycle that nudged media-remote (see startEngineIfNeeded).
     private func stop(internalPause: Bool = false) {
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
+        // IDEMPOTENT: if there is no live recognition session AND no live audio
+        // engine, there is genuinely nothing to stop. Return WITHOUT emitting a
+        // telemetry event or touching audio HW. This kills the `wakeword.stop`
+        // spam (repeated disable() calls from the defaults observer) and ensures
+        // we never poke the input-unit teardown path while wake word is off.
+        guard isRunning || isEngineLive || request != nil || task != nil else {
+            return
         }
         request?.endAudio()
         task?.cancel()
         task = nil
         request = nil
+        stopEngine(reason: internalPause ? "pause_for_recording" : "deliberate_stop")
         isRunning = false
+        Telemetry.log("wakeword.stop", properties: ["internal_pause": internalPause])
         if !internalPause {
             print("[WAKE] stopped")
         }
     }
 
     /// SFSpeechRecognizer caps each session at ~1 minute of audio. When it
-    /// errors out we restart cleanly so the service stays hot indefinitely.
+    /// errors out we recycle ONLY the recognition request/task — the
+    /// AVAudioEngine + input tap stay running the whole time. This is the
+    /// crux of the media-playback fix: previously this path called stop()
+    /// (full engine teardown) then start() (full engine restart) ~once a
+    /// minute, and that audio-unit stop is what emitted a media-remote "play".
+    /// Now the hardware never cycles, so wake word can't resume the user's music.
     private func restartIfStillEnabled() {
-        stop(internalPause: true)
-        guard isEnabled, !isPausedForRecording else { return }
+        // Drop the dead recognition session immediately, but leave the engine up.
+        request?.endAudio()
+        task?.cancel()
+        task = nil
+        request = nil
+
+        guard isEnabled, !isPausedForRecording, isEngineLive else {
+            // We're no longer supposed to be listening (or the engine went
+            // away) — make sure we're fully torn down and bail.
+            if !isEnabled || isPausedForRecording {
+                stop(internalPause: true)
+            }
+            return
+        }
+        Telemetry.log("wakeword.restart", properties: ["engine_kept_alive": true])
         // Small delay so we don't hot-loop on persistent failures (e.g. mic
-        // permission revoked mid-session).
+        // permission revoked mid-session), then re-attach a fresh recognition
+        // session to the still-running engine.
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 500_000_000)
-            self.start()
+            // Re-check guards after the await — state may have changed.
+            guard self.isEnabled, !self.isPausedForRecording, self.isEngineLive else { return }
+            self.startRecognitionSession()
+            self.isRunning = (self.task != nil)
         }
     }
 
@@ -409,10 +617,12 @@ final class WakeWordService: NSObject {
         lastFireAt = now
 
         print("[WAKE] phrase detected in: \"\(text)\" — firing")
+        Telemetry.log("wakeword.detected", properties: ["phrase": wakePhrase])
         onWakeWordDetected?()
 
-        // After firing, restart the session so the buffer doesn't keep
-        // partial-matching the same phrase. The dictation engine will pause
+        // After firing, recycle ONLY the recognition session so the buffer
+        // doesn't keep partial-matching the same phrase. The engine stays
+        // running (no media-remote nudge). The dictation engine will pause
         // us via pauseWhileRecording() in the next tick anyway.
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 100_000_000)

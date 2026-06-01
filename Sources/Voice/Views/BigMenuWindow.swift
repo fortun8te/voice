@@ -36,7 +36,7 @@ enum Sp {
 
 // MARK: - Card surface tokens
 
-private enum CardShape {
+enum CardShape {
     /// Same corner radius across stat cards, cleanup cards, personality
     /// cards, and hotkey-role cards. Keeping them identical reads as "one
     /// rounded-rectangle family" instead of "a few different cards".
@@ -425,11 +425,23 @@ struct BigMenuWindow: View {
                 switch selectedTab {
                 case .dictations:
                     if recents.isEmpty {
-                        emptyState
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        ScrollView(.vertical, showsIndicators: true) {
+                            VStack(alignment: .leading, spacing: 0) {
+                                LearnedWordsCard()
+                                    .padding(.horizontal, Sp.lg)
+                                    .padding(.top, Sp.md)
+                                emptyState
+                                    .frame(maxWidth: .infinity, minHeight: 200)
+                            }
+                        }
+                        .background(DictationListBackground())
                     } else {
                         ScrollView(.vertical, showsIndicators: true) {
                             LazyVStack(alignment: .leading, spacing: 0, pinnedViews: []) {
+                                LearnedWordsCard()
+                                    .padding(.horizontal, Sp.lg)
+                                    .padding(.top, Sp.md)
+                                    .padding(.bottom, Sp.sm)
                                 ForEach(Array(grouped.enumerated()), id: \.element.day) { _, group in
                                     dateHeader(group.day)
                                     ForEach(Array(group.items.enumerated()), id: \.element.id) { idx, item in
@@ -541,6 +553,11 @@ struct BigMenuWindow: View {
                         }
                         .background(DictationListBackground())
                     }
+
+                case .video:
+                    VideoTranscriptionView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(DictationListBackground())
                 }
 
                 Divider()
@@ -1095,6 +1112,7 @@ private struct MeetingSkeletonRow: View {
 enum BigMenuTab: String, CaseIterable, Identifiable {
     case dictations
     case meetings
+    case video
 
     var id: String { rawValue }
 
@@ -1102,6 +1120,7 @@ enum BigMenuTab: String, CaseIterable, Identifiable {
         switch self {
         case .dictations: return "Dictations"
         case .meetings:   return "Meetings"
+        case .video:      return "Videos"
         }
     }
 }
@@ -1220,6 +1239,141 @@ private struct StatCard: View {
             RoundedRectangle(cornerRadius: CardShape.corner)
                 .strokeBorder(Color.primary.opacity(0.06), lineWidth: CardShape.borderUnselected)
         )
+    }
+}
+
+// MARK: - Learned words card
+//
+// Wispr-style learn-from-correction words live in ProperNounVocabulary. This
+// card surfaces them in the main Dictations tab (moved out of Settings) as a
+// collapsible disclosure: count + scrollable word list with per-row remove,
+// plus an add field. Self-contained — owns its own mirror of the store and
+// re-reads customTerms() after every add/remove so the list stays in sync.
+private struct LearnedWordsCard: View {
+    @Environment(\.colorScheme) private var scheme
+
+    @State private var terms: [String] = []
+    @State private var draft: String = ""
+    @State private var expanded: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Sp.md) {
+            // Header — tap anywhere to expand/collapse.
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: Sp.sm) {
+                    Image(systemName: "character.book.closed")
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: Sp.xxs) {
+                        Text("Learned words")
+                            .font(.bodyMedium)
+                            .foregroundStyle(.primary)
+                        Text("Words VOICE learned from your corrections. Add your own names and jargon here.")
+                            .font(.bodySmall)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .multilineTextAlignment(.leading)
+                    }
+                    Spacer(minLength: Sp.sm)
+                    Text("\(terms.count)")
+                        .font(.bodySmall)
+                        .foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                if terms.isEmpty {
+                    Text("No learned words yet. Correct a misheard word in any app and it'll show up here.")
+                        .font(.bodyBase)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    ScrollView(.vertical, showsIndicators: true) {
+                        VStack(alignment: .leading, spacing: Sp.xxs) {
+                            ForEach(terms, id: \.self) { term in
+                                HStack(spacing: Sp.xs) {
+                                    Text(term)
+                                        .font(.bodyBase)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    Spacer()
+                                    Button {
+                                        removeTerm(term)
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .font(.bodySmall)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Remove \(term)")
+                                }
+                                .padding(.vertical, Sp.xxs)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    // Cap the visible height so a very long list scrolls
+                    // instead of growing the card indefinitely.
+                    .frame(maxHeight: 220)
+                }
+
+                HStack(spacing: Sp.xs) {
+                    TextField("Add a name or word", text: $draft)
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                        .onSubmit { addTerm() }
+                    Button("Add") { addTerm() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .padding(Sp.lg)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // Matches the StatCard surface — solid tinted fill + hairline border —
+        // so it reads as part of the same card family as the rest of the menu.
+        .background(
+            RoundedRectangle(cornerRadius: CardShape.corner)
+                .fill(scheme == .dark
+                    ? Color.white.opacity(0.04)
+                    : Color.black.opacity(0.025))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: CardShape.corner)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: CardShape.borderUnselected)
+        )
+        .onAppear { reload() }
+    }
+
+    private func reload() {
+        terms = ProperNounVocabulary.customTerms()
+    }
+
+    private func addTerm() {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // Ignore dupes (case-insensitive) so we don't add a word already learned.
+        if terms.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            draft = ""
+            return
+        }
+        ProperNounVocabulary.add(trimmed)
+        draft = ""
+        reload()
+    }
+
+    private func removeTerm(_ term: String) {
+        ProperNounVocabulary.remove(term)
+        reload()
     }
 }
 
@@ -2180,16 +2334,72 @@ private struct SettingsSheet: View {
     /// and Groq in the chain: when Cerebras is rate-limited we try Hyperbolic
     /// (same gpt-oss-120b model) before demoting to Groq's smaller 8B.
     @AppStorage("voice.hyperbolicAPIKey") private var hyperbolicAPIKey: String = ""
-    /// Experimental slim cloud-polish system prompt. When ON, sends the
-    /// Optional undo affordance after auto-paste. Off by default — the toast
-    /// firing after every paste was annoying, and Cmd-Z still works without it.
-    @AppStorage("voice.showUndoPasteToast") private var showUndoPasteToast: Bool = false
+    /// Collapses the secondary (Cerebras / Hyperbolic) cloud-key fields behind
+    /// a disclosure so Settings leads with just the NVIDIA primary key.
+    @State private var showFallbackProviders = false
+    /// Collapses all power-user / debug / rarely-touched controls behind a
+    /// single disclosure at the bottom so the main settings list stays short.
+    @State private var showAdvanced = false
+    /// When a key is already set we render it LOCKED (read-only, masked) so a
+    /// stray click can't corrupt it — the user must explicitly tap "Change"
+    /// to edit. These flags track which key field is currently unlocked.
+    @State private var editingCerebrasKey = false
+    @State private var editingNvidiaKey = false
+    @State private var editingHyperbolicKey = false
+
+    /// Masks a stored API key for the locked display: prefix + dots.
+    private static func maskKey(_ k: String) -> String {
+        guard k.count > 10 else { return String(repeating: "•", count: max(4, k.count)) }
+        return String(k.prefix(8)) + "…" + String(repeating: "•", count: 4)
+    }
+
+    /// A cloud-key field that is LOCKED (masked, read-only) once a key is set,
+    /// with a "Change" button to unlock editing — prevents accidental edits
+    /// from a misclick. Shows the editable SecureField when empty or unlocked.
+    @ViewBuilder
+    private func lockableKeyRow(label: String, key: Binding<String>, editing: Binding<Bool>, getKeyURL: String) -> some View {
+        if !key.wrappedValue.isEmpty && !editing.wrappedValue {
+            HStack(spacing: Sp.xs) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.bodySmall)
+                    .foregroundStyle(.green)
+                Text("\(label) set · \(Self.maskKey(key.wrappedValue))")
+                    .font(.bodySmall)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Change") { editing.wrappedValue = true }
+                    .buttonStyle(.plain)
+                    .font(.bodySmall)
+                    .foregroundStyle(.blue)
+            }
+        } else {
+            HStack(spacing: Sp.xs) {
+                Image(systemName: "key.fill")
+                    .font(.bodySmall)
+                    .foregroundStyle(.secondary)
+                SecureField("\(label) API key", text: key)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.bodySmall)
+                if !key.wrappedValue.isEmpty {
+                    Button("Done") { editing.wrappedValue = false }
+                        .buttonStyle(.plain)
+                        .font(.bodySmall)
+                        .foregroundStyle(.blue)
+                } else {
+                    Link("Get key", destination: URL(string: getKeyURL)!)
+                        .font(.bodySmall)
+                }
+            }
+        }
+    }
     /// Hands-free wake phrase ("Hey Voice"). Off by default — costs battery.
     @AppStorage("voice.wakeWordEnabled") private var wakeWordEnabled: Bool = false
     /// Editable wake phrase. Default "hey voice". Lowercased on use.
     @AppStorage("voice.wakeWord") private var wakeWordPhrase: String = "hey voice"
-    /// Wake word mode — off / alwaysOn / activatedWindow. Lets the user pick
-    /// always-listening vs. timed activation window to reduce CPU drain.
+    /// Wake word mode — "off" or "activatedWindow". The always-listening
+    /// ("alwaysOn") mode was removed because the continuous mic recognizer
+    /// caused spurious system triggers; a stored "alwaysOn" is migrated to
+    /// "off" on appear. "activatedWindow" is a safe, time-boxed listen window.
     @AppStorage("voice.wakeWordMode") private var wakeWordMode: String = "off"
     /// Window duration in minutes for the "activatedWindow" wake mode.
     @AppStorage("voice.wakeWordWindowMinutes") private var wakeWordWindowMinutes: Int = 5
@@ -2197,9 +2407,11 @@ private struct SettingsSheet: View {
     /// end of a locked recording to commit it. On by default. Only active in
     /// hands-free (locked) mode; PTT stops on key release.
     @AppStorage("voice.stopWordEnabled") private var stopWordEnabled: Bool = true
-    /// Editable stop word. Default "finito" — a single distinctive word a user
-    /// would not naturally dictate, so false positives are near zero.
-    @AppStorage("voice.stopWord") private var stopWord: String = "finito"
+    /// Editable stop phrase. Default "over and out" — a radio sign-off made of
+    /// common words (ASR transcribes it reliably) that nobody naturally ends a
+    /// dictation with, so false positives are near zero AND it's recognized
+    /// dependably (unlike "finito", which ASR mangled).
+    @AppStorage("voice.stopWord") private var stopWord: String = "halt"
     /// Master kill switch — disable the meeting auto-detection heuristic so
     /// VOICE never opens a recording on its own.
     @AppStorage("voice.disableMeetingDetection") private var disableMeetingDetection: Bool = false
@@ -2234,8 +2446,6 @@ private struct SettingsSheet: View {
     // hotkey UI lives directly inside Settings instead of a nested sheet.
     @State private var pttBindings:    [CapturedHotkey] = HotkeyRole.pushToTalk.loadBindings()
     @State private var lockBindings:   [CapturedHotkey] = HotkeyRole.handsFree.loadBindings()
-    @State private var polishBindings: [CapturedHotkey] = HotkeyRole.polish.loadBindings()
-    @State private var polishPreset:   PolishPreset     = PolishPreset.current
 
     /// True when the stored UserDefaults key looks valid (csk- prefix,
     /// ≥20 chars). When false, CerebrasPolisher silently falls back to
@@ -2302,14 +2512,14 @@ private struct SettingsSheet: View {
                     // sees this first. The two EngineCards ARE the cards for
                     // this section, so we don't double-wrap; the section just
                     // gets a serif group header above the row.
-                    cardRowSection("Engine", subtitle: "Where polishing runs. Cloud is default for best quality on long inputs.") {
+                    cardRowSection("Engine", subtitle: "Where polishing runs.") {
                         VStack(alignment: .leading, spacing: Sp.md) {
                             HStack(spacing: Sp.md) {
                                 EngineCard(
                                     icon: "cloud",
                                     title: "Cloud",
-                                    tagline: "NVIDIA NIM primary, Cerebras + Hyperbolic + Groq fallback. ~500 TPS.",
-                                    example: "Polished with frontier quality on NVIDIA's free 40 RPM tier. Long rants, bullet lists, complex structure, all handled. Cerebras + Hyperbolic + Groq pick up when NVIDIA is rate-limited.",
+                                    tagline: "Fast, frontier quality.",
+                                    example: "Cerebras gpt-oss-120b, ~0.3s. Long rants, lists, and structure handled cleanly. Falls back automatically if busy.",
                                     isSelected: cerebrasEnabled,
                                     onTap: { cerebrasEnabled = true }
                                 )
@@ -2317,7 +2527,7 @@ private struct SettingsSheet: View {
                                     icon: "laptopcomputer",
                                     title: "Local",
                                     tagline: "On-device, private, works offline.",
-                                    example: "Qwen3 1.7B on-device via MLX. Fast for short polish, never leaves the Mac. Long or complex input still routes to cloud when available.",
+                                    example: "Qwen3 via MLX. Never leaves your Mac. Long input still routes to cloud when available.",
                                     isSelected: !cerebrasEnabled,
                                     onTap: { cerebrasEnabled = false }
                                 )
@@ -2326,75 +2536,42 @@ private struct SettingsSheet: View {
                                 // API key + cloud-tuning toggles get their own
                                 // canonical card so they don't read as a bare
                                 // strip below the engine cards.
-                                canonicalCard(title: "Cloud API key", subtitle: "Free at cloud.cerebras.ai. Falls back to local automatically if unreachable.") {
+                                canonicalCard(title: "Cloud API key", subtitle: "Works out of the box. Paste your own key for higher limits.") {
                                     VStack(alignment: .leading, spacing: Sp.sm) {
-                                        // NVIDIA NIM — primary cloud provider. Placed ABOVE Cerebras
-                                        // because it's tried first in the routing chain. Free 40 RPM
-                                        // account-level at build.nvidia.com, no credit card.
+                                        // Cerebras — the primary. gpt-oss-120b at ~0.3s,
+                                        // no clog. A working key ships bundled so cloud
+                                        // works immediately; a pasted key raises limits.
                                         VStack(alignment: .leading, spacing: Sp.xxs) {
-                                            HStack(spacing: Sp.xs) {
-                                                Image(systemName: "key.fill")
+                                            lockableKeyRow(label: "Cerebras", key: $cerebrasAPIKey, editing: $editingCerebrasKey, getKeyURL: "https://cloud.cerebras.ai")
+                                            Text("Primary cloud. Free at cloud.cerebras.ai — paste your own key for higher rate limits.")
+                                                .font(.bodySmall)
+                                                .foregroundStyle(.secondary)
+                                        }
+
+                                        // Secondary providers collapsed by default — they
+                                        // only kick in if Cerebras is unavailable.
+                                        DisclosureGroup(isExpanded: $showFallbackProviders) {
+                                            VStack(alignment: .leading, spacing: Sp.sm) {
+                                                lockableKeyRow(label: "NVIDIA", key: $nvidiaAPIKey, editing: $editingNvidiaKey, getKeyURL: "https://build.nvidia.com/openai/gpt-oss-120b")
+                                                lockableKeyRow(label: "Hyperbolic", key: $hyperbolicAPIKey, editing: $editingHyperbolicKey, getKeyURL: "https://hyperbolic.xyz")
+                                                Text("Optional fallbacks. Used only if Cerebras is unavailable.")
                                                     .font(.bodySmall)
                                                     .foregroundStyle(.secondary)
-                                                SecureField("NVIDIA API key (primary cloud)", text: $nvidiaAPIKey)
-                                                    .textFieldStyle(.roundedBorder)
-                                                    .font(.bodySmall)
-                                                Link("Get key", destination: URL(string: "https://build.nvidia.com")!)
-                                                    .font(.bodySmall)
                                             }
-                                            Text("Primary cloud. Free at build.nvidia.com — no credit card. Falls back to Cerebras if rate-limited.")
+                                            .padding(.top, Sp.xs)
+                                        } label: {
+                                            Text("Advanced · fallback providers")
                                                 .font(.bodySmall)
                                                 .foregroundStyle(.secondary)
                                         }
-                                        HStack(spacing: Sp.xs) {
-                                            Image(systemName: "key.fill")
-                                                .font(.bodySmall)
-                                                .foregroundStyle(.secondary)
-                                            SecureField("Cerebras API key", text: $cerebrasAPIKey)
-                                                .textFieldStyle(.roundedBorder)
-                                                .font(.bodySmall)
-                                            Link("Get key", destination: URL(string: "https://cloud.cerebras.ai")!)
-                                                .font(.bodySmall)
-                                        }
-                                        // Optional second cloud fallback. Same gpt-oss-120b model
-                                        // as Cerebras, separate quota → keeps polish on cloud
-                                        // quality when Cerebras is rate-limited.
-                                        VStack(alignment: .leading, spacing: Sp.xxs) {
-                                            HStack(spacing: Sp.xs) {
-                                                Image(systemName: "key.fill")
-                                                    .font(.bodySmall)
-                                                    .foregroundStyle(.secondary)
-                                                SecureField("Hyperbolic API key (optional cloud fallback)", text: $hyperbolicAPIKey)
-                                                    .textFieldStyle(.roundedBorder)
-                                                    .font(.bodySmall)
-                                                Link("Get key", destination: URL(string: "https://hyperbolic.xyz")!)
-                                                    .font(.bodySmall)
-                                            }
-                                            Text("When Cerebras is rate-limited, polish goes to Hyperbolic. Sign up free at hyperbolic.xyz, no credit card needed.")
-                                                .font(.bodySmall)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        toggle("Show Undo toast after paste", isOn: $showUndoPasteToast)
                                     }
                                 }
                             }
                         }
                     }
 
-                    // 2. Privacy & Background — high-stakes kill switches.
-                    // Two related toggles + caption grouped in one card.
-                    canonicalCard(
-                        title: "Privacy & Background",
-                        subtitle: "Master kill switches for background AI behavior. Active dictation hotkey is unaffected."
-                    ) {
-                        VStack(alignment: .leading, spacing: Sp.sm) {
-                            toggle("Disable meeting auto-detection", isOn: $disableMeetingDetection)
-                            toggle("Privacy mode (disable all background AI)", isOn: $privacyMode)
-                        }
-                    }
-
-                    // 3. Writing personality — protected card row.
-                    cardRowSection("Writing personality", subtitle: "How VOICE finishes your sentences. Tap to choose.") {
+                    // 2. Writing personality — protected card row.
+                    cardRowSection("Writing personality", subtitle: "How VOICE finishes your sentences.") {
                         VStack(alignment: .leading, spacing: Sp.md) {
                             HStack(alignment: .top, spacing: Sp.md) {
                                 ForEach(PersonalityStyle.allCases) { style in
@@ -2409,7 +2586,6 @@ private struct SettingsSheet: View {
                                     )
                                 }
                             }
-                            toggle("Auto-pick personality based on frontmost app", isOn: $autoPersonality)
                         }
                     }
 
@@ -2427,40 +2603,7 @@ private struct SettingsSheet: View {
                         }
                     }
 
-                    // 5. My voice — Style Card setup + spectrum selector.
-                    canonicalCard(
-                        title: "My voice",
-                        subtitle: "Match your own writing style. Extracted once from samples you provide."
-                    ) {
-                        MyStyleSection()
-                    }
-
-                    // 6. Polish — in-place rewrite (cloud-only).
-                    cardRowSection(
-                        "Polish",
-                        subtitle: "Select any text and press your hotkey to rewrite it in place. Always runs on cloud."
-                    ) {
-                        VStack(alignment: .leading, spacing: Sp.md) {
-                            HStack(spacing: Sp.sm) {
-                                ForEach(PolishPreset.allCases) { preset in
-                                    PolishPresetCard(
-                                        preset: preset,
-                                        isSelected: polishPreset == preset
-                                    ) {
-                                        polishPreset = preset
-                                        PolishPreset.current = preset
-                                    }
-                                }
-                            }
-                            HotkeyRoleCard(role: .polish, bindings: $polishBindings)
-                                .frame(maxWidth: .infinity)
-                        }
-                    }
-
-                    // 7. Hotkeys — each HotkeyRoleCard is already a canonical
-                    // card. Section header sits above the stack. Both cards
-                    // stretch to full section width so they align flush with
-                    // the section header and with each other.
+                    // 5. Hotkeys — push-to-talk + hands-free bind here.
                     cardRowSection("Hotkeys", subtitle: "Bind one or more shortcuts per role.") {
                         VStack(alignment: .leading, spacing: Sp.md) {
                             HotkeyRoleCard(role: .pushToTalk, bindings: $pttBindings)
@@ -2470,71 +2613,22 @@ private struct SettingsSheet: View {
                         }
                     }
 
-                    // 8. Wake word — single card grouping enable + mode +
-                    // window + phrase.
+                    // 6. Stop word — the spoken counterpart to lock-exit.
+                    // Kept in the main list because hands-free lock mode is
+                    // reachable via the hotkey triple-tap, not just wake word.
+                    // (Wake word itself now lives under Advanced.)
                     canonicalCard(
-                        title: "Wake word",
-                        subtitle: "Say a phrase to start dictating, hands-free. On-device, costs ~3-5% CPU when active."
+                        title: "Stop word",
+                        subtitle: "Say a word to end a hands-free recording. Push-to-talk stops when you release the key."
                     ) {
-                        VStack(alignment: .leading, spacing: Sp.md) {
-                            toggle("Enable \"\(wakeWordPhrase)\"", isOn: $wakeWordEnabled)
-                                .onChange(of: wakeWordEnabled) { _, isOn in
-                                    // Keep mode coherent with the master toggle so a
-                                    // stale "alwaysOn" can never keep the mic tap alive
-                                    // after the user disables wake word.
-                                    if isOn {
-                                        if wakeWordMode == "off" { wakeWordMode = "alwaysOn" }
-                                    } else {
-                                        wakeWordMode = "off"
-                                    }
-                                }
-
-                            if wakeWordEnabled {
-                                Picker("Wake Word Mode", selection: $wakeWordMode) {
-                                    Text("Off").tag("off")
-                                    Text("Always On").tag("alwaysOn")
-                                    Text("Activate for window").tag("activatedWindow")
-                                }
-                                .pickerStyle(.segmented)
-                                .controlSize(.small)
-                                .labelsHidden()
-
-                                if wakeWordMode == "activatedWindow" {
-                                    Stepper(
-                                        "Window duration: \(wakeWordWindowMinutes) min",
-                                        value: $wakeWordWindowMinutes,
-                                        in: 1...30
-                                    )
-                                    .font(.bodySmall)
-                                    .controlSize(.small)
-                                }
-
-                                HStack(spacing: Sp.xs) {
-                                    Text("Phrase")
-                                        .font(.bodySmall)
-                                        .foregroundStyle(.secondary)
-                                    TextField("hey voice", text: $wakeWordPhrase)
-                                        .textFieldStyle(.roundedBorder)
-                                        .controlSize(.small)
-                                        .frame(maxWidth: 200)
-                                        .onChange(of: wakeWordPhrase) { _, newValue in
-                                            wakeWordPhrase = newValue.lowercased()
-                                        }
-                                }
-                            }
-
-                            // Stop word — the spoken counterpart to lock-exit.
-                            // Always shown: hands-free lock mode is reachable
-                            // via the hotkey triple-tap too, not only the wake
-                            // word, so this isn't gated on wakeWordEnabled.
-                            Divider().opacity(0.4)
-                            toggle("Stop word \"\(stopWord)\" ends hands-free dictation", isOn: $stopWordEnabled)
+                        VStack(alignment: .leading, spacing: Sp.sm) {
+                            toggle("End hands-free dictation when I say \"\(stopWord)\"", isOn: $stopWordEnabled)
                             if stopWordEnabled {
                                 HStack(spacing: Sp.xs) {
                                     Text("Stop word")
                                         .font(.bodySmall)
                                         .foregroundStyle(.secondary)
-                                    TextField("finito", text: $stopWord)
+                                    TextField("halt", text: $stopWord)
                                         .textFieldStyle(.roundedBorder)
                                         .controlSize(.small)
                                         .frame(maxWidth: 200)
@@ -2542,14 +2636,11 @@ private struct SettingsSheet: View {
                                             stopWord = newValue.lowercased()
                                         }
                                 }
-                                Text("Say it at the end of a hands-free recording to finish. Push-to-talk stops when you release the key.")
-                                    .font(.bodySmall)
-                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
 
-                    // 9. Output — paste, copy, sounds, smart corrections.
+                    // 7. Output — paste, copy, sounds.
                     canonicalCard(
                         title: "Output",
                         subtitle: "What happens after VOICE finishes transcribing."
@@ -2558,22 +2649,10 @@ private struct SettingsSheet: View {
                             toggle("Paste automatically", isOn: $autoPaste)
                             toggle("Copy to clipboard", isOn: $autoCopy)
                             toggle("Sound effects", isOn: $soundEffects)
-                            VStack(alignment: .leading, spacing: Sp.xs) {
-                                toggle("Smart corrections", isOn: $llmPolishEnabled)
-                                HStack(spacing: Sp.xs) {
-                                    Circle()
-                                        .fill(polishStatusColor)
-                                        .frame(width: 6, height: 6)
-                                    Text(polishStatusLabel)
-                                        .font(.bodySmall)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .padding(.leading, Sp.xl)
-                            }
                         }
                     }
 
-                    // 10. Pill style — pill skin selector wrapped in canonical card.
+                    // 8. Pill style — pill skin selector wrapped in canonical card.
                     canonicalCard(
                         title: "Pill style",
                         subtitle: "Choose how the recording pill looks on screen."
@@ -2592,65 +2671,124 @@ private struct SettingsSheet: View {
                         }
                     }
 
-                    // 11. Permissions — inline grid mirrors top-of-window banner.
+                    // 8b. Privacy & Background — high-stakes kill switches.
+                    // Rare but important; sits low, just above Advanced.
                     canonicalCard(
-                        title: "Permissions",
-                        subtitle: "VOICE needs these to listen, type, and capture your hotkey."
+                        title: "Privacy & Background",
+                        subtitle: "Master kill switches for background AI behavior. Active dictation hotkey is unaffected."
                     ) {
                         VStack(alignment: .leading, spacing: Sp.sm) {
-                            permissionRow(
-                                "Microphone",
-                                granted: permissions.microphone == .granted
-                            ) {
-                                openPane("Privacy_Microphone")
-                            }
-                            permissionRow(
-                                "Accessibility",
-                                granted: permissions.accessibility == .granted
-                            ) {
-                                openPane("Privacy_Accessibility")
-                            }
-                            permissionRow(
-                                "Input Monitoring",
-                                granted: permissions.inputMonitoring == .granted
-                            ) {
-                                openPane("Privacy_ListenEvent")
-                            }
-
-                            if !permissions.allGranted {
-                                Button {
-                                    showFullPermissionsSheet = true
-                                } label: {
-                                    Text("Open setup")
-                                        .font(.bodyMedium)
-                                        .padding(.horizontal, Sp.md)
-                                        .padding(.vertical, Sp.xs)
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                                .padding(.top, Sp.xs)
-                            }
+                            toggle("Disable meeting auto-detection", isOn: $disableMeetingDetection)
+                            toggle("Privacy mode (disable all background AI)", isOn: $privacyMode)
                         }
                     }
 
-                    // 12. Debug — last, since most users never touch this.
+                    // 9. Advanced — everything power-user / rarely-touched
+                    // collapsed behind one disclosure so the main list stays
+                    // short: smart-correction status, per-app personality,
+                    // My voice style match, permissions detail, debug tools.
                     canonicalCard(
-                        title: "Debug",
-                        subtitle: "Internal tooling for verifying polish quality."
+                        title: "Advanced",
+                        subtitle: "Power-user options. Most people never need these."
                     ) {
-                        Button {
-                            showPolishReplay = true
-                        } label: {
-                            HStack(spacing: Sp.xs) {
-                                Image(systemName: "wand.and.stars")
-                                Text("Polish Replay…")
-                                    .font(.bodyMedium)
+                        DisclosureGroup(isExpanded: $showAdvanced) {
+                            VStack(alignment: .leading, spacing: Sp.lg) {
+                                // Smart corrections + its live engine status.
+                                VStack(alignment: .leading, spacing: Sp.xs) {
+                                    toggle("Smart corrections", isOn: $llmPolishEnabled)
+                                    HStack(spacing: Sp.xs) {
+                                        Circle()
+                                            .fill(polishStatusColor)
+                                            .frame(width: 6, height: 6)
+                                        Text(polishStatusLabel)
+                                            .font(.bodySmall)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.leading, Sp.xl)
+                                }
+
+                                toggle("Auto-pick personality based on frontmost app", isOn: $autoPersonality)
+
+                                // Wake word — power-user, off by default. Lives
+                                // here so it isn't prominent; the dangerous
+                                // always-listening mode has been removed entirely.
+                                VStack(alignment: .leading, spacing: Sp.xs) {
+                                    Text("Wake word")
+                                        .font(.bodyMedium)
+                                    Text("Say a phrase to start dictating, hands-free. On-device; uses ~3-5% CPU only while a window is active. Off by default.")
+                                        .font(.bodySmall)
+                                        .foregroundStyle(.secondary)
+                                    wakeWordControls
+                                }
+
+                                // My voice — style match from samples.
+                                VStack(alignment: .leading, spacing: Sp.xs) {
+                                    Text("My voice")
+                                        .font(.bodyMedium)
+                                    Text("Match your own writing style. Extracted once from samples you provide.")
+                                        .font(.bodySmall)
+                                        .foregroundStyle(.secondary)
+                                    MyStyleSection()
+                                }
+
+                                // Permissions — also mirrored in the top-of-window banner.
+                                VStack(alignment: .leading, spacing: Sp.sm) {
+                                    Text("Permissions")
+                                        .font(.bodyMedium)
+                                    permissionRow(
+                                        "Microphone",
+                                        granted: permissions.microphone == .granted
+                                    ) {
+                                        openPane("Privacy_Microphone")
+                                    }
+                                    permissionRow(
+                                        "Accessibility",
+                                        granted: permissions.accessibility == .granted
+                                    ) {
+                                        openPane("Privacy_Accessibility")
+                                    }
+                                    permissionRow(
+                                        "Input Monitoring",
+                                        granted: permissions.inputMonitoring == .granted
+                                    ) {
+                                        openPane("Privacy_ListenEvent")
+                                    }
+                                    if !permissions.allGranted {
+                                        Button {
+                                            showFullPermissionsSheet = true
+                                        } label: {
+                                            Text("Open setup")
+                                                .font(.bodyMedium)
+                                                .padding(.horizontal, Sp.md)
+                                                .padding(.vertical, Sp.xs)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .padding(.top, Sp.xs)
+                                    }
+                                }
+
+                                // Debug — polish replay harness.
+                                Button {
+                                    showPolishReplay = true
+                                } label: {
+                                    HStack(spacing: Sp.xs) {
+                                        Image(systemName: "wand.and.stars")
+                                        Text("Polish Replay…")
+                                            .font(.bodyMedium)
+                                    }
+                                    .padding(.horizontal, Sp.md)
+                                    .padding(.vertical, Sp.xs)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.regular)
                             }
-                            .padding(.horizontal, Sp.md)
-                            .padding(.vertical, Sp.xs)
+                            .padding(.top, Sp.sm)
+                        } label: {
+                            Text("Show advanced options")
+                                .font(.bodySmall)
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.regular)
                     }
                 }
                 .padding(.horizontal, Sp.xl)
@@ -2689,6 +2827,13 @@ private struct SettingsSheet: View {
                 .frame(minWidth: 1100, minHeight: 700)
         }
         .onAppear {
+            // Migrate away from the removed always-listening wake mode. A stale
+            // "alwaysOn" value would otherwise keep the continuous mic recognizer
+            // alive (the auto-play-music bug). Treat it as "off".
+            if wakeWordMode == "alwaysOn" {
+                wakeWordMode = "off"
+                wakeWordEnabled = false
+            }
             Task { @MainActor in
                 await Task.yield()
                 permissions.refresh()
@@ -2705,7 +2850,6 @@ private struct SettingsSheet: View {
         }
         .onChange(of: pttBindings)    { _, new in HotkeyRole.pushToTalk.saveBindings(new) }
         .onChange(of: lockBindings)   { _, new in HotkeyRole.handsFree.saveBindings(new) }
-        .onChange(of: polishBindings) { _, new in HotkeyRole.polish.saveBindings(new) }
     }
 
     /// Section for protected card rows (Engine, Personality, Cleanup, Polish,
@@ -2778,6 +2922,57 @@ private struct SettingsSheet: View {
                     lineWidth: CardShape.borderUnselected
                 )
         )
+    }
+
+    /// Wake-word enable + mode + window + phrase. The always-listening mode was
+    /// removed: only "Off" and the safe, time-boxed "Activate for window" remain.
+    @ViewBuilder
+    private var wakeWordControls: some View {
+        VStack(alignment: .leading, spacing: Sp.sm) {
+            toggle("Enable \"\(wakeWordPhrase)\"", isOn: $wakeWordEnabled)
+                .onChange(of: wakeWordEnabled) { _, isOn in
+                    // Keep mode coherent with the master toggle. Enabling wake
+                    // word selects the safe, time-boxed window mode.
+                    if isOn {
+                        if wakeWordMode != "activatedWindow" { wakeWordMode = "activatedWindow" }
+                    } else {
+                        wakeWordMode = "off"
+                    }
+                }
+
+            if wakeWordEnabled {
+                Picker("Wake Word Mode", selection: $wakeWordMode) {
+                    Text("Off").tag("off")
+                    Text("Activate for window").tag("activatedWindow")
+                }
+                .pickerStyle(.segmented)
+                .controlSize(.small)
+                .labelsHidden()
+
+                if wakeWordMode == "activatedWindow" {
+                    Stepper(
+                        "Window duration: \(wakeWordWindowMinutes) min",
+                        value: $wakeWordWindowMinutes,
+                        in: 1...30
+                    )
+                    .font(.bodySmall)
+                    .controlSize(.small)
+                }
+
+                HStack(spacing: Sp.xs) {
+                    Text("Phrase")
+                        .font(.bodySmall)
+                        .foregroundStyle(.secondary)
+                    TextField("hey voice", text: $wakeWordPhrase)
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                        .frame(maxWidth: 200)
+                        .onChange(of: wakeWordPhrase) { _, newValue in
+                            wakeWordPhrase = newValue.lowercased()
+                        }
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -3353,104 +3548,6 @@ private struct MyStyleLevelCard: View {
 // One card per HotkeyRole that HotkeyService recognizes:
 //   * Push to talk  — hold to record, release to transcribe
 //   * Hands-free    — tap to start, tap to stop (lock mode toggle)
-//
-// MARK: - PolishPresetCard
-
-private struct PolishPresetCard: View {
-    let preset:     PolishPreset
-    let isSelected: Bool
-    let onSelect:   () -> Void
-
-    var body: some View {
-        Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: Sp.xs) {
-                HStack(spacing: Sp.xs) {
-                    if isSelected {
-                        Circle()
-                            .fill(Color.teal)
-                            .frame(width: 6, height: 6)
-                    }
-                    Text(preset.displayName)
-                        .font(.bodyMedium)
-                        .foregroundStyle(isSelected ? Color.teal : Color.primary)
-                }
-                Text(preset.tagline)
-                    .font(.bodySmall)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                // Before → after examples
-                VStack(alignment: .leading, spacing: Sp.xs) {
-                    VStack(alignment: .leading, spacing: Sp.xxs) {
-                        Text("before")
-                            .font(.badge)
-                            .foregroundStyle(.tertiary)
-                            .tracking(0.8)
-                            .textCase(.uppercase)
-                        Text(preset.example.before)
-                            .font(.sans(11, weight: .regular))
-                            .italic()
-                            .foregroundStyle(.secondary.opacity(0.65))
-                            .fixedSize(horizontal: false, vertical: true)
-                            .lineLimit(2)
-                            .padding(.horizontal, Sp.sm)
-                            .padding(.vertical, Sp.xs)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(Color.primary.opacity(0.04))
-                            )
-                    }
-
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.leading, Sp.sm)
-
-                    VStack(alignment: .leading, spacing: Sp.xxs) {
-                        Text("after")
-                            .font(.badge)
-                            .foregroundStyle(.tertiary)
-                            .tracking(0.8)
-                            .textCase(.uppercase)
-                        Text(preset.example.after)
-                            .font(.sans(11, weight: .regular))
-                            .italic()
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(.horizontal, Sp.sm)
-                            .padding(.vertical, Sp.xs)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(isSelected
-                                        ? Color.teal.opacity(0.08)
-                                        : Color.primary.opacity(0.04))
-                            )
-                    }
-                }
-            }
-            .padding(Sp.md)
-            .frame(maxWidth: .infinity, minHeight: 120, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: CardShape.corner)
-                    .fill(.regularMaterial)
-            )
-            .glassEffect(
-                .regular,
-                in: RoundedRectangle(cornerRadius: CardShape.corner)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: CardShape.corner)
-                    .strokeBorder(
-                        isSelected ? Color.teal.opacity(0.4) : Color.primary.opacity(0.06),
-                        lineWidth: isSelected ? CardShape.borderSelected : CardShape.borderUnselected
-                    )
-            )
-        }
-        .buttonStyle(.plain)
-        .animation(.easeInOut(duration: 0.15), value: isSelected)
-    }
-}
 
 // MARK: - HotkeyRoleCard
 

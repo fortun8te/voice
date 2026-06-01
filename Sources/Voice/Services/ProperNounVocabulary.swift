@@ -251,6 +251,27 @@ public enum ProperNounVocabulary {
         "Mailgun", "Postmark", "Mailchimp", "ConvertKit", "Klaviyo",
     ]
 
+    /// The user-learned / manually-added custom terms only — NOT the
+    /// built-in seed dictionary. This is what the Settings UI manages and
+    /// what gets STRONG priority in ASR vocabulary boosting. Sorted +
+    /// deduped (case-insensitively); persisted in UserDefaults under `key`.
+    public static func customTerms() -> [String] {
+        let stored = UserDefaults.standard.array(forKey: key) as? [String] ?? []
+        // Case-insensitive dedupe, preserving first-seen casing.
+        var seen = Set<String>()
+        var unique: [String] = []
+        for term in stored {
+            let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let lower = trimmed.lowercased()
+            if seen.insert(lower).inserted {
+                unique.append(trimmed)
+            }
+        }
+        unique.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        return unique
+    }
+
     /// Get the current vocabulary (manual + learned + seed).
     public static func current() -> [String] {
         let stored = UserDefaults.standard.array(forKey: key) as? [String] ?? []
@@ -275,11 +296,18 @@ public enum ProperNounVocabulary {
         }
     }
 
-    /// Remove a term.
+    /// Remove a learned/custom term and persist. Case-insensitive so it
+    /// reliably removes whatever `customTerms()` surfaced to the UI.
     public static func remove(_ term: String) {
+        let target = term.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !target.isEmpty else { return }
         var stored = UserDefaults.standard.array(forKey: key) as? [String] ?? []
-        stored.removeAll { $0 == term }
-        UserDefaults.standard.set(stored, forKey: key)
+        let before = stored.count
+        stored.removeAll { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == target }
+        if stored.count != before {
+            UserDefaults.standard.set(stored, forKey: key)
+            print("[VOICE-VOCAB] removed: \(term)")
+        }
     }
 
     /// Learn proper nouns from a polished dictation. Called after each

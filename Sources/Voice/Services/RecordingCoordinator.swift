@@ -211,12 +211,21 @@ class RecordingCoordinator {
             // Run at .background priority so it never competes with the hotkey
             // listener or live transcription. The body still hops to the main
             // actor for storage/transcription calls, but awaits yield freely.
+            // Cancel any prior recovery task before reassigning. `prepare()` is
+            // normally called once, but a re-init (e.g. a future post-wake
+            // re-prepare) would otherwise orphan the previous background task,
+            // leaking it and letting two recovery loops race on the same audio
+            // directory.
+            orphanRecoveryTask?.cancel()
             orphanRecoveryTask = Task(priority: .background) { @MainActor [weak self] in
                 await self?.recoverOrphanRecordings()
             }
         } catch {
             state.modelState = .error(error.localizedDescription)
             vlog("[VOICE] Initialization error: \(error.localizedDescription)")
+            Telemetry.signal("coordinator.prepare_failed", "init", [
+                "error": error.localizedDescription
+            ])
         }
     }
 
@@ -249,6 +258,10 @@ class RecordingCoordinator {
         // previous recording can detect it's been superseded and bail.
         currentRecordingSessionId &+= 1
         vlog("[VOICE-RC] \(sessTag(sessionId)) phase=record-begin counter=\(currentRecordingSessionId)")
+        Telemetry.signal("recording.start", UserDefaults.standard.string(forKey: "audioSource") ?? "microphone", [
+            "session": String(sessionId.uuidString.prefix(8)),
+            "counter": currentRecordingSessionId
+        ])
         // The audio file is named by `sessionId` (a fresh UUID per call),
         // guaranteeing no collision with a still-transcribing prior recording.
         // Even if two `startRecording()` calls overlap conceptually, each gets
@@ -268,7 +281,11 @@ class RecordingCoordinator {
             vlog("[VOICE-RC] \(sessTag(sessionId)) phase=writer-open-FAILED: \(error.localizedDescription)")
         }
 
-        // Start elapsed timer
+        // Start elapsed timer. Invalidate any prior instance first — `levelsTimer`
+        // below already does this, but `elapsedTimer` did not, so a stale timer
+        // from a teardown path that missed invalidation would leak and keep
+        // incrementing elapsedSeconds. Symmetrical cleanup closes that gap.
+        elapsedTimer?.invalidate()
         elapsedTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self, !self.state.isPaused else { return }
@@ -321,6 +338,16 @@ class RecordingCoordinator {
                 vlog("[VOICE-TIMING] AVAudioEngine.start() done at \(Date())")
             } catch {
                 vlog("[VOICE-RC] Microphone capture ERROR: \(error.localizedDescription)")
+                // NO SILENT FAILURE: startMicrophoneCapture posts a .voiceError
+                // for the known invalid-format / permission cases, but a generic
+                // engine.start() throw rethrows with no user-facing signal. Post a
+                // toast here so the user always learns the recording didn't start
+                // (the pill would otherwise just silently flip back to idle).
+                NotificationCenter.default.post(
+                    name: .voiceError,
+                    object: nil,
+                    userInfo: ["message": "Couldn't start recording — check microphone access"]
+                )
                 Task { @MainActor in _ = await self.stopRecording() }
                 return
             }
@@ -335,6 +362,14 @@ class RecordingCoordinator {
                 vlog("[VOICE-RC] transcription.start() OK in task")
             } catch {
                 vlog("[VOICE-RC] transcription.start FAILED: \(error.localizedDescription)")
+                // NO SILENT FAILURE: if the transcription session can't start
+                // (model not loaded yet, etc.) the recording can't produce text.
+                // Surface it instead of silently tearing down.
+                NotificationCenter.default.post(
+                    name: .voiceError,
+                    object: nil,
+                    userInfo: ["message": "Transcription engine not ready — try again in a moment"]
+                )
                 _ = await self.stopRecording()
                 return
             }
@@ -348,6 +383,14 @@ class RecordingCoordinator {
                     try await audioCapture.startSystemAudioCapture { _ in }
                 } catch {
                     vlog("[VOICE-RC] System audio capture ERROR: \(error.localizedDescription)")
+                    // NO SILENT FAILURE: system-audio capture needs Screen
+                    // Recording permission; a throw here means nothing will be
+                    // captured. Tell the user instead of silently stopping.
+                    NotificationCenter.default.post(
+                        name: .voiceError,
+                        object: nil,
+                        userInfo: ["message": "Couldn't capture system audio — check Screen Recording permission"]
+                    )
                     _ = await self.stopRecording()
                 }
             }
@@ -366,6 +409,12 @@ class RecordingCoordinator {
         let sessionId: UUID
         let recordingStartTime: Date?
         let startupTask: Task<Void, Never>?
+        /// Audio-derived speech-presence signal captured BEFORE the engine was
+        /// torn down (the values are zeroed once capture stops). Used by the
+        /// finalize path to suppress Whisper-family hallucinations on silent /
+        /// non-speech captures. See SpeechPresenceGate.
+        let voicedSeconds: Double
+        let peakRMS: Float
     }
 
     /// Synchronously claim the current recording's resources for an upcoming
@@ -402,6 +451,12 @@ class RecordingCoordinator {
         // of the release-to-paste budget is spent tearing the engine down. We
         // keep it synchronous on purpose — the race fix depends on the engine
         // being released before the next startRecording() can run.
+        // Snapshot the audio-derived speech-presence signal BEFORE we tear the
+        // engine down — the finalize path uses it to drop silent/hallucinated
+        // captures (see SpeechPresenceGate). Must read before stopCapture().
+        let claimedVoiced = audioCapture.voicedDurationSeconds
+        let claimedPeakRMS = audioCapture.recordingPeakRMSValue
+
         let tStopCapture = CFAbsoluteTimeGetCurrent()
         audioCapture.stopCapture()
         let stopCaptureMs = (CFAbsoluteTimeGetCurrent() - tStopCapture) * 1000
@@ -428,7 +483,9 @@ class RecordingCoordinator {
             audioURL:           url,
             sessionId:          sid,
             recordingStartTime: startTime,
-            startupTask:        task
+            startupTask:        task,
+            voicedSeconds:      claimedVoiced,
+            peakRMS:            claimedPeakRMS
         )
     }
 
@@ -455,6 +512,12 @@ class RecordingCoordinator {
         var tParakeetDone:  Date? = nil
         let mySessionId = currentRecordingSessionId  // for log parity
 
+        // Audio-derived speech-presence signal for the anti-hallucination gate.
+        // Claimed path: use the snapshot taken before teardown. Normal path:
+        // read live below, before stopCapture() zeroes nothing but the engine.
+        let voicedSeconds: Double
+        let peakRMS: Float
+
         if let ctx = claiming {
             // === Pre-claimed path ===
             // Audio capture was already stopped synchronously by claimRecordingSync().
@@ -462,6 +525,8 @@ class RecordingCoordinator {
             audioURL      = ctx.audioURL
             sessionId     = ctx.sessionId
             tCaptureStart = ctx.recordingStartTime ?? tStopEntry
+            voicedSeconds = ctx.voicedSeconds
+            peakRMS       = ctx.peakRMS
 
             if let task = ctx.startupTask {
                 _ = await task.value
@@ -500,6 +565,10 @@ class RecordingCoordinator {
             elapsedTimer = nil
             levelsTimer?.invalidate()
             levelsTimer = nil
+            // Snapshot the speech-presence signal BEFORE tearing the engine
+            // down (see SpeechPresenceGate / claimRecordingSync).
+            voicedSeconds = audioCapture.voicedDurationSeconds
+            peakRMS       = audioCapture.recordingPeakRMSValue
             // Stop the audio engine.
             vlog("[VOICE-RC] AVAudioEngine.stop at \(Date())")
             audioCapture.stopCapture()
@@ -590,9 +659,34 @@ class RecordingCoordinator {
             vlog("[VOICE-RC] \(tag) phase=transcribe-begin file=\(audioURL.lastPathComponent) bytes=\(fileSize) skipPolish=\(willSkipPolish) active=\(isStillActive())")
             do {
                 let asrStart = Date()
-                let fileSegments = try await transcription.transcribeFile(url: audioURL)
+                var fileSegments = try await transcription.transcribeFile(url: audioURL)
                 tParakeetDone = Date()
                 let parakeetMs = Int(Date().timeIntervalSince(asrStart) * 1000)
+
+                // ANTI-HALLUCINATION GATE (audio-based, can't be fooled by text).
+                // Whisper/Parakeet-family models emit phantom phrases ("Thank
+                // you.", "Thanks for watching.", "you", ".", "♪") on silence /
+                // room noise. If the capture carried essentially no voiced audio,
+                // OR the entire decoded text is a known hallucination phrase on a
+                // low-energy clip, drop it to empty so nothing gets pasted. Real
+                // short utterances ("yes", "ok") have real speech energy and pass.
+                if !fileSegments.isEmpty {
+                    let joined = fileSegments.map { $0.text }
+                        .joined(separator: " ")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let reason = SpeechPresenceGate.dropReason(
+                        joinedText: joined,
+                        voicedSeconds: voicedSeconds,
+                        peakRMS: peakRMS
+                    ) {
+                        vlog("[VOICE-VAD] dropped silent/hallucinated capture — \(reason); text=\"\(joined.prefix(60))\"")
+                        Telemetry.signal("transcribe.dropped", "vad_\(reason)", [
+                            "session": String(sessionId.uuidString.prefix(8)),
+                            "voiced_s": voicedSeconds
+                        ])
+                        fileSegments = []
+                    }
+                }
 
                 // Note: NO staleness gate here. If the user re-pressed the
                 // hotkey while Parakeet was running, the prior transcript
@@ -645,6 +739,11 @@ class RecordingCoordinator {
                 }
             } catch {
                 vlog("[VOICE-RC] transcribeFile FAILED: \(error.localizedDescription)")
+                Telemetry.signal("transcribe.failure", "exception", [
+                    "session": String(sessionId.uuidString.prefix(8)),
+                    "error": error.localizedDescription,
+                    "bytes": fileSize
+                ])
                 // KEEP audio on disk so the user can retry. Size-pruner
                 // will eventually reap it if nothing else does.
                 NotificationCenter.default.post(
@@ -669,6 +768,12 @@ class RecordingCoordinator {
             )
         }
         vlog("[VOICE-RC] \(tag) phase=stopRecording-exit segments=\(segments.count) active=\(isStillActive())")
+        Telemetry.signal("recording.stop", claiming != nil ? "claimed" : "normal", [
+            "session": String(sessionId.uuidString.prefix(8)),
+            "segments": segments.count,
+            "bytes": fileSize,
+            "active": isStillActive()
+        ])
 
         // Replace any partial-derived segments with the engine's final view.
         // Only mirror to shared state when our session is still the active
@@ -1092,7 +1197,7 @@ class RecordingCoordinator {
                         vocabulary: CombinedDictionary.vocabularyContext(),
                         ctcModels: ctcModels
                     )
-                    vlog("[VOICE-LP] vocabulary boosting configured (\(CombinedDictionary.terms().count) terms)")
+                    vlog("[VOICE-LP] vocabulary boosting configured (\(CombinedDictionary.terms().count) terms, \(ProperNounVocabulary.customTerms().count) user-learned with strong boost)")
                 } catch {
                     vlog("[VOICE-LP] vocabulary boosting unavailable: \(error.localizedDescription)")
                 }
@@ -1117,13 +1222,18 @@ class RecordingCoordinator {
                     self.state.livePartialText = parts.joined(separator: " ")
                     self.state.livePartialIsVolatile = !update.isConfirmed
 
-                    // Stop-word detection. Only on the CONFIRMED transcript
-                    // (volatile partials churn and mis-decode), only while
-                    // hands-free (locked) and recording, and only at the
-                    // trailing edge — the phrase must be the last thing said,
-                    // so a mid-utterance mention ("...we should definitively...")
-                    // never triggers. Debounced to a single fire.
-                    if isConfirmed { self.checkStopWord(in: confirmed) }
+                    // Stop-word detection. Check the COMBINED tail
+                    // (confirmed + volatile), NOT just confirmed. The stop word
+                    // is the LAST thing said, and in streaming ASR that final
+                    // word lingers in `volatile` — there's no later audio to
+                    // push it into `confirmed` — so checking only `confirmed`
+                    // almost never sees the trailing stop word. THIS is why
+                    // "finito" never fired. The trailing-edge + word-boundary
+                    // fuzzy match inside checkStopWord still guards against
+                    // mid-utterance mentions, and the 1.5s debounce guards
+                    // against double-fires from volatile churn.
+                    _ = isConfirmed
+                    self.checkStopWord(in: self.state.livePartialText)
                 }
             }
         }
@@ -1166,7 +1276,7 @@ class RecordingCoordinator {
         guard state.isLocked, state.isRecording else { return }
         let enabled = UserDefaults.standard.object(forKey: "voice.stopWordEnabled") as? Bool ?? true
         guard enabled else { return }
-        let stopWord = (UserDefaults.standard.string(forKey: "voice.stopWord") ?? "finito")
+        let stopWord = (UserDefaults.standard.string(forKey: "voice.stopWord") ?? "halt")
             .lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard !stopWord.isEmpty, Self.endsWithStopWord(confirmed, stopWord: stopWord) else { return }
         if let last = lastStopWordFireAt, Date().timeIntervalSince(last) < 1.5 { return }
@@ -1176,30 +1286,159 @@ class RecordingCoordinator {
     }
 
     /// True if `text`, ignoring trailing whitespace/punctuation, ends with
-    /// `stopWord` as a whole word (the char before it is a boundary).
+    /// `stopWord` as a whole word (the char before it is a boundary). Uses
+    /// fuzzy matching on the trailing token(s) so ASR spelling variation of
+    /// the stop word ("Finito", "finita", "fin neato", ...) still triggers.
     static func endsWithStopWord(_ text: String, stopWord: String) -> Bool {
-        let trimmed = text.lowercased()
-            .trimmingCharacters(in: CharacterSet(charactersIn: " \t\n.,!?;:\"'"))
-        guard trimmed.hasSuffix(stopWord), trimmed.count >= stopWord.count else { return false }
-        let idx = trimmed.index(trimmed.endIndex, offsetBy: -stopWord.count)
-        if idx == trimmed.startIndex { return true }
-        let before = trimmed[trimmed.index(before: idx)]
-        return !before.isLetter && !before.isNumber
+        return matchTrailingStopWord(in: text, stopWord: stopWord) != nil
+    }
+
+    /// Characters trimmed from the end of a transcript before stop-word
+    /// evaluation (whitespace + common trailing punctuation).
+    private static let stopWordTrimSet = CharacterSet(charactersIn: " \t\n.,!?;:\"'")
+
+    /// Curated accepted variants for the DEFAULT stop word "finito". Only used
+    /// when the configured stop word is exactly "finito"; custom stop words
+    /// rely on Levenshtein/normalization alone.
+    private static let finitoVariants: Set<String> = [
+        "finito", "finita", "finido", "fineto", "feenito",
+        "finneato", "feeneato", "finhito", "vinito",
+    ]
+
+    /// Lowercase + strip every non-letter character (spaces, punctuation,
+    /// digits) so "Fin neato!" → "finneato".
+    private static func normalizeToken(_ s: String) -> String {
+        s.lowercased().unicodeScalars.filter { CharacterSet.letters.contains($0) }
+            .map(Character.init).reduce(into: "") { $0.append($1) }
+    }
+
+    /// True if a normalized ASR candidate should be accepted as `stopWord`.
+    private static func fuzzyTokenMatches(_ candidate: String, stopWord: String) -> Bool {
+        guard !candidate.isEmpty else { return false }
+        let target = normalizeToken(stopWord)
+        guard !target.isEmpty else { return false }
+        if candidate == target { return true }
+        // Curated variant set only applies to the default stop word.
+        if stopWord == "finito",
+           finitoVariants.contains(candidate) || finitoVariants.contains(normalizeToken(candidate)) {
+            return true
+        }
+        // Length-scaled tolerance: short words allow 1 edit, mid 2, long
+        // multi-word phrases (normalized, e.g. "overandout") allow 3.
+        let tolerance = target.count <= 5 ? 1 : (target.count <= 11 ? 2 : 3)
+        return levenshtein(candidate, target) <= tolerance
+    }
+
+    /// Locate the trailing stop-word span (in `text`'s own indices) when the
+    /// text ends with a fuzzy-matched stop word/PHRASE at a word boundary.
+    /// Supports multi-word stop phrases ("over and out") by walking back a
+    /// window of N tokens, where N is the phrase's word count, and also trying
+    /// N±1 windows to absorb ASR split/merge of the phrase. The matched window
+    /// is normalized (spaces/punctuation stripped) and compared to the stop
+    /// phrase with length-scaled fuzzy tolerance. Returns the range covering
+    /// the matched word(s), or nil when there's no trailing match.
+    private static func matchTrailingStopWord(in text: String, stopWord: String) -> Range<String.Index>? {
+        let stop = stopWord.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stop.isEmpty else { return nil }
+
+        // Trim trailing whitespace/punctuation, tracking where the meaningful
+        // text ends in the original string.
+        var end = text.endIndex
+        while end > text.startIndex {
+            let prev = text.index(before: end)
+            if String(text[prev]).rangeOfCharacter(from: stopWordTrimSet) != nil {
+                end = prev
+            } else { break }
+        }
+        guard end > text.startIndex else { return nil }
+
+        func boundaryBefore(_ idx: String.Index) -> Bool {
+            if idx == text.startIndex { return true }
+            let before = text[text.index(before: idx)]
+            return !before.isLetter && !before.isNumber
+        }
+
+        // Walk back exactly `count` word tokens from `end`. Returns the start
+        // index of that window, or nil if the text has fewer than `count`
+        // word tokens before `end`.
+        func windowStart(tokenCount count: Int) -> String.Index? {
+            var idx = end
+            var tokens = 0
+            while tokens < count {
+                // Skip trailing separators (whitespace/punctuation).
+                while idx > text.startIndex {
+                    let prev = text.index(before: idx)
+                    if text[prev].isLetter || text[prev].isNumber { break }
+                    idx = prev
+                }
+                if idx == text.startIndex { return nil } // not enough tokens
+                // Consume one whole word token.
+                while idx > text.startIndex {
+                    let prev = text.index(before: idx)
+                    if text[prev].isLetter || text[prev].isNumber { idx = prev } else { break }
+                }
+                tokens += 1
+            }
+            return idx
+        }
+
+        let stopTokenCount = stop.split(separator: " ").count
+        // Try the exact window first, then ±1 (ASR may merge "over and" or
+        // split a word). Dedup + descending so the longest plausible match wins.
+        let windows = Array(Set([stopTokenCount, stopTokenCount + 1, max(1, stopTokenCount - 1)]))
+            .sorted(by: >)
+        for w in windows {
+            guard let start = windowStart(tokenCount: w), start < end, boundaryBefore(start) else { continue }
+            let cand = normalizeToken(String(text[start..<end]))
+            if fuzzyTokenMatches(cand, stopWord: stop) {
+                return start..<end
+            }
+        }
+        return nil
     }
 
     /// Remove a trailing stop-word command token (and any dangling
     /// punctuation/whitespace before it) from a FINAL transcript. Trailing
-    /// only — a legitimately-dictated earlier mention is preserved. Returns
-    /// the text unchanged when the stop word is disabled or absent at the end.
+    /// only — a legitimately-dictated earlier mention is preserved. Removes
+    /// whatever trailing token(s) matched, even ASR variants. Returns the
+    /// text unchanged when the stop word is disabled or absent at the end.
     static func strippingTrailingStopWord(from text: String) -> String {
         let enabled = UserDefaults.standard.object(forKey: "voice.stopWordEnabled") as? Bool ?? true
         guard enabled else { return text }
-        let stopWord = (UserDefaults.standard.string(forKey: "voice.stopWord") ?? "finito")
+        let stopWord = (UserDefaults.standard.string(forKey: "voice.stopWord") ?? "halt")
             .lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !stopWord.isEmpty, endsWithStopWord(text, stopWord: stopWord),
-              let range = text.range(of: stopWord, options: [.caseInsensitive, .backwards])
-        else { return text }
-        let head = String(text[..<range.lowerBound])
-        return head.trimmingCharacters(in: CharacterSet(charactersIn: " \t\n.,!?;:"))
+        guard !stopWord.isEmpty else { return text }
+        // Strip ALL trailing stop-word tokens, not just one. A clearly-spoken
+        // "finito" is frequently transcribed doubled ("finito finito") or with
+        // trailing punctuation/whitespace between repeats; we want NONE of them
+        // left in the pasted message. Capped to avoid a pathological loop.
+        var result = text
+        var iterations = 0
+        while iterations < 8, let range = matchTrailingStopWord(in: result, stopWord: stopWord) {
+            result = String(result[..<range.lowerBound])
+                .trimmingCharacters(in: CharacterSet(charactersIn: " \t\n.,!?;:"))
+            iterations += 1
+            if result.isEmpty { break }
+        }
+        return result
+    }
+
+    /// Iterative Levenshtein edit distance (rolling two-row DP).
+    private static func levenshtein(_ a: String, _ b: String) -> Int {
+        let s = Array(a)
+        let t = Array(b)
+        if s.isEmpty { return t.count }
+        if t.isEmpty { return s.count }
+        var prev = Array(0...t.count)
+        var curr = Array(repeating: 0, count: t.count + 1)
+        for i in 1...s.count {
+            curr[0] = i
+            for j in 1...t.count {
+                let cost = s[i - 1] == t[j - 1] ? 0 : 1
+                curr[j] = Swift.min(Swift.min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost)
+            }
+            swap(&prev, &curr)
+        }
+        return prev[t.count]
     }
 }

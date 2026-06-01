@@ -1437,7 +1437,8 @@ final class Qwen3Polisher {
         // the floor of "polish always does SOMETHING useful".
         if cleanupLevel == "none" {
             print("[VOICE-POLISH] decision: cleanupLevel=none → rules-only (spoken-cmd + spacing still apply)")
-            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary)
+            Telemetry.log("polish.skipped_model", properties: ["reason": "cleanup-level-none", "words": polishInWordCount])
+            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
         }
 
         guard Self.isEnabled else {
@@ -1445,16 +1446,22 @@ final class Qwen3Polisher {
             // commands + fix spacing deterministically (this matches Wispr's
             // behavior where formatting works regardless of the AI rewrite).
             print("[VOICE-POLISH] decision: disabled by user → rules-only")
-            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary)
+            Telemetry.log("polish.skipped_model", properties: ["reason": "polish-disabled", "words": polishInWordCount])
+            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
         }
         guard Self.isAvailable else {
             print("[VOICE-POLISH] decision: MLX not linked → rules-only")
-            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary)
+            Telemetry.log("polish.skipped_model", properties: ["reason": "mlx-not-linked", "words": polishInWordCount])
+            return Self.applyMinimalPostprocessor(LLMPolisher.stripFillers(text), userVocabulary: userVocabulary, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
         }
-        guard text.count >= 4 else { return text }
+        guard text.count >= 4 else {
+            Telemetry.log("polish.skipped_model", properties: ["reason": "too-short(<4 chars)", "chars": text.count])
+            return text
+        }
         // Code: skip polish entirely — model rewrites break syntax/identifiers
         if context == .code {
             print("[VOICE-POLISH] decision: code context → passthrough (no rewrite)")
+            Telemetry.log("polish.skipped_model", properties: ["reason": "code-context", "words": polishInWordCount])
             return text
         }
 
@@ -1527,7 +1534,36 @@ final class Qwen3Polisher {
         // when the user expected verbatim output.
         if Self.isNonEnglish(stripped) {
             print("[VOICE-POLISH] decision: non-English detected → rules-only (no LLM rewrite)")
-            return Self.applyMinimalPostprocessor(stripped, userVocabulary: userVocabulary)
+            Telemetry.log("polish.skipped_model", properties: ["reason": "non-english", "words": polishInWordCount])
+            return Self.applyMinimalPostprocessor(stripped, userVocabulary: userVocabulary, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
+        }
+
+        // Step 2.5: Short-utterance / already-clean FAST PATH.
+        //
+        // Wispr Flow doesn't fire its model on trivial input — short phrases
+        // and already-clean text get deterministic formatting and return
+        // immediately. We do the same on EVERY routing target (cloud OR
+        // local). This is the single biggest latency + voice-preservation
+        // win: there is no point spending a 120B round-trip (and risking the
+        // model changing the speaker's voice) on "ok sounds good" or on text
+        // that already has caps, punctuation, and no fillers.
+        //
+        // Guarded so it never swallows commands that NEED the model:
+        //   - "high" cleanup always goes to the model (user asked for a
+        //     restructure regardless of length).
+        //   - Inputs with spoken-command / list / code signals are NOT short-
+        //     circuited even when short ("github slash repo slash readme"
+        //     needs the model/postprocessor to turn "slash" into "/").
+        let fastWordCount = stripped.split(separator: " ").count
+        let fastLevelIsHigh = (cleanupLevel.lowercased() == "high")
+        if !fastLevelIsHigh,
+           Self.qualifiesForFastPath(stripped, wordCount: fastWordCount) {
+            print("[VOICE-POLISH] decision: fast-path (words=\(fastWordCount), short-or-clean) → deterministic only, no LLM")
+            // Explain WHY the fast path fired so events.jsonl distinguishes a
+            // short-utterance skip from an already-clean skip.
+            let fastReason = fastWordCount <= 8 ? "fast-path:short(<=8 words)" : "fast-path:already-clean"
+            Telemetry.log("polish.skipped_model", properties: ["reason": fastReason, "words": fastWordCount])
+            return Self.applyMinimalPostprocessor(stripped, userVocabulary: userVocabulary, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
         }
 
         #if canImport(MLXLLM) && canImport(MLXLMCommon)
@@ -1543,7 +1579,8 @@ final class Qwen3Polisher {
         // commands / spacing work immediately, even before the model is ready.
         if !availabilityStatus.isReady && !goingToCloud {
             print("[VOICE-POLISH] decision: local model NOT ready (status=\(availabilityStatus.displayLabel)) and no cloud → rules-only fail-open")
-            return Self.applyMinimalPostprocessor(stripped, userVocabulary: userVocabulary)
+            Telemetry.log("polish.skipped_model", properties: ["reason": "local-not-ready-no-cloud", "status": availabilityStatus.displayLabel, "words": polishInWordCount])
+            return Self.applyMinimalPostprocessor(stripped, userVocabulary: userVocabulary, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
         }
         print("[VOICE-POLISH] decision: \(goingToCloud ? "cloud" : "local-model") ready → LLM polish START (input chars=\(stripped.count))")
 
@@ -1744,7 +1781,11 @@ final class Qwen3Polisher {
             //   - `not-configured` → no nvapi- key set, fall through silently
             //   - `auth` → bad key, fall through (don't keep retrying)
             //   - everything else → fall through to Cerebras
-            let nvidiaAvailable = await MainActor.run { NVIDIAPolisher.isAvailable }
+            // Cerebras-first: NVIDIA's gpt-oss-120b clogs mid-stream in real
+            // use. Cerebras (bundled key + browser UA) runs gpt-oss-120b at
+            // ~0.3s with no clog, so lead with it. NVIDIA is skipped here;
+            // Cerebras → Hyperbolic → Groq → local is the chain.
+            let nvidiaAvailable = false
             var nvidiaResult: String? = nil
             var nvidiaReason: String? = nil
             if nvidiaAvailable {
@@ -1824,6 +1865,13 @@ final class Qwen3Polisher {
                         maxTokens: callMax
                     )
                     hyperbolicReason = await HyperbolicPolisher.shared.lastFailureReason
+                    Telemetry.log("polish.provider_attempt", properties: [
+                        "provider": "hyperbolic",
+                        "success": hyperbolicResult != nil,
+                        "reason": hyperbolicReason ?? "ok",
+                        "latency_ms": HyperbolicPolisher.shared.lastLatencyMs,
+                        "upstream": "cerebras:\(cerebrasReason ?? "failed")"
+                    ])
                 }
 
                 if let hyperbolicOut = hyperbolicResult {
@@ -1859,6 +1907,13 @@ final class Qwen3Polisher {
                             systemPrompt: callPrompt,
                             maxTokens: callMax
                         )
+                        Telemetry.log("polish.provider_attempt", properties: [
+                            "provider": "groq",
+                            "success": groqOut != nil,
+                            "reason": (await GroqPolisher.shared.lastFailureReason) ?? "ok",
+                            "latency_ms": GroqPolisher.shared.lastLatencyMs,
+                            "upstream": "cerebras:\(cerebrasReason ?? "failed"),hyperbolic:\(hyperbolicReason ?? "n/a")"
+                        ])
                         if let groqOut = groqOut {
                             print("[VOICE-ROUTE] Groq fallback succeeded in \(GroqPolisher.shared.lastLatencyMs)ms")
                             result = .groqOK(groqOut)
@@ -1949,9 +2004,9 @@ final class Qwen3Polisher {
                         return "Cerebras (\(cerebrasReason))"
                     }
                 }()
-                print("[VOICE-ROUTE-DEBUG] setting lastEngine=cloud:groq-llama3.1-8b because \(upstreamCause) failed and Groq recovered in \(groqMs)ms")
+                print("[VOICE-ROUTE-DEBUG] setting lastEngine=cloud:groq-llama3.3-70b because \(upstreamCause) failed and Groq recovered in \(groqMs)ms")
                 await MainActor.run {
-                    PolishStatus.shared.lastEngine = "cloud:groq-llama3.1-8b"
+                    PolishStatus.shared.lastEngine = "cloud:groq-llama3.3-70b"
                     PolishStatus.shared.lastReason = "\(upstreamCause) → Groq succeeded in \(groqMs)ms"
                 }
             case .localOK(let s):
@@ -1992,6 +2047,45 @@ final class Qwen3Polisher {
                 Telemetry.log("cerebras.failure", properties: ["reason": cerebrasReason, "recovered": "local"])
                 await MainActor.run { Self.maybePostCloudFallbackToast(reason: cerebrasReason) }
             }
+
+            // Per-provider latency breakdown so the chain's slow links are
+            // visible at a glance. A dash means the provider wasn't attempted.
+            // `lastLatencyMs` reflects this call's attempt for each provider.
+            let nvAttempted = await MainActor.run { NVIDIAPolisher.isAvailable }
+            let hyAttempted = await MainActor.run { HyperbolicPolisher.isAvailable }
+            let gqAttempted = await MainActor.run { GroqPolisher.isAvailable }
+            func ms(_ attempted: Bool, _ v: Int) -> String { attempted ? "\(v)ms" : "-" }
+            let nvT = ms(nvAttempted, NVIDIAPolisher.shared.lastLatencyMs)
+            let ceT = "\(CerebrasPolisher.shared.lastLatencyMs)ms"
+            let hyT = ms(hyAttempted, HyperbolicPolisher.shared.lastLatencyMs)
+            let gqT = ms(gqAttempted, GroqPolisher.shared.lastLatencyMs)
+            print("[VOICE-POLISH-TIMING] nvidia=\(nvT) cerebras=\(ceT) hyperbolic=\(hyT) groq=\(gqT)")
+
+            // Single authoritative OUTCOME event for the whole cloud chain so
+            // events.jsonl explains every polish at a glance: which provider
+            // actually won (or that we demoted to local), and the per-provider
+            // attempt+latency breakdown. Complements polish.cloud_call_result
+            // (Cerebras-only) and polish.local_demote (demote-only).
+            let outcomeWinner: String = {
+                switch result {
+                case .nvidiaOK:     return "cloud:nvidia"
+                case .cerebrasOK:   return "cloud:cerebras"
+                case .hyperbolicOK: return "cloud:hyperbolic"
+                case .groqOK:       return "cloud:groq"
+                case .localOK:      return "local-demote"
+                }
+            }()
+            let cloudDidWin = outcomeWinner.hasPrefix("cloud:")
+            Telemetry.log("polish.outcome", properties: [
+                "winner": outcomeWinner,
+                "cloud_succeeded": cloudDidWin,
+                "input_words": wordCount,
+                "cleanup_level": cleanupLevel,
+                "cerebras_ms": CerebrasPolisher.shared.lastLatencyMs,
+                "hyperbolic_ms": hyAttempted ? HyperbolicPolisher.shared.lastLatencyMs : -1,
+                "groq_ms": gqAttempted ? GroqPolisher.shared.lastLatencyMs : -1,
+                "nvidia_ms": nvAttempted ? NVIDIAPolisher.shared.lastLatencyMs : -1
+            ])
         } else {
             // Cloud NOT configured / key missing → straight to local. The
             // `if polishedFrozen == nil` block below handles the local call.
@@ -2056,20 +2150,52 @@ final class Qwen3Polisher {
         // the word/length/contraction budgets, so legitimate cloud
         // restructuring is never rejected. On reject we fall back to the raw
         // (unfrozen) input rather than paste a semantically-corrupted polish
-        // into the user's document. (Previously this validator was dead code —
-        // `validateAndProcess` had no callers, leaving the cloud path with no
-        // semantic-flip protection at all.)
+        // into the user's document.
+        //
+        // CRITICAL: strip the model's conversational lead-in ("Sure,", "Here's
+        // a cleaner version:") and any wrapping quotes BEFORE the sanitizer
+        // runs. gpt-oss occasionally emits a preamble despite the anti-preamble
+        // rule in the brief; the Sanitizer's `preamble:`/`prompt-residue` rules
+        // would otherwise REJECT an otherwise-perfect polish and ship the raw
+        // transcript instead (the "voice quality bad" experience). The
+        // postprocessor exposes the exact strippers `validateAndProcess` uses;
+        // call them here so the cloud path matches that documented contract
+        // (the brief and PolishPipeline header both promise upstream stripping).
+        // Idempotent on already-clean output.
+        let preStripped = PolishPostprocessor.stripWrappingQuotes(
+            PolishPostprocessor.stripLeadingPreamble(polishedUnfrozen)
+        )
+        if preStripped != polishedUnfrozen {
+            print("[VOICE-GUARD] pre-sanitize strip: lead-in/quotes removed (\(polishedUnfrozen.count)→\(preStripped.count) chars)")
+        }
         let polished: String
         if let accepted = Sanitizer.run(
-            polish: polishedUnfrozen,
+            polish: preStripped,
             original: originalUnfrozen,
             mode: .relaxed,
             cleanupLevel: cleanupLevel,
             userVocabulary: userVocabulary
         ) {
             polished = accepted
+            Telemetry.log("polish.sanitizer_result", properties: [
+                "accepted": true,
+                "mode": "relaxed",
+                "preamble_stripped": preStripped != polishedUnfrozen,
+                "orig_chars": originalUnfrozen.count,
+                "polish_chars": accepted.count
+            ])
         } else {
             print("[VOICE-GUARD] relaxed sanitizer rejected polish — falling back to raw input")
+            // A reject means we ship the RAW transcript — the single biggest
+            // "polish did nothing" signal. Make it loud in events.jsonl so a
+            // false-positive sanitizer rule is diagnosable without the console.
+            Telemetry.log("polish.sanitizer_result", properties: [
+                "accepted": false,
+                "mode": "relaxed",
+                "preamble_stripped": preStripped != polishedUnfrozen,
+                "orig_chars": originalUnfrozen.count,
+                "rejected_polish_chars": preStripped.count
+            ])
             polished = originalUnfrozen
         }
 
@@ -2078,14 +2204,14 @@ final class Qwen3Polisher {
         // even on fail-open paths to keep the output consistent. The cleanup
         // level gates the list passes (light/none never list; high detects
         // implied enumeration).
-        let polishOut = Self.applyPostprocessor(polished, userVocabulary: userVocabulary, cleanupLevel: cleanupLevel)
+        let polishOut = Self.applyPostprocessor(polished, userVocabulary: userVocabulary, cleanupLevel: cleanupLevel, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
         let polishOutMs = Int(Date().timeIntervalSince(polishInStartedAt) * 1000)
         let polishOutEngine = await MainActor.run { PolishStatus.shared.lastEngine ?? "unknown" }
         let polishOutSanitized = (polishOut != polished)
         print("[VOICE-POLISH-OUT] engine=\(polishOutEngine) latency=\(polishOutMs)ms sanitized=\(polishOutSanitized)")
         return polishOut
         #else
-        let polishOutNoMLX = Self.applyPostprocessor(stripped, userVocabulary: userVocabulary, cleanupLevel: cleanupLevel)
+        let polishOutNoMLX = Self.applyPostprocessor(stripped, userVocabulary: userVocabulary, cleanupLevel: cleanupLevel, personalityStyle: personalityStyle, appContextLabel: appContextLabel)
         let polishOutMsNoMLX = Int(Date().timeIntervalSince(polishInStartedAt) * 1000)
         print("[VOICE-POLISH-OUT] engine=rules-only latency=\(polishOutMsNoMLX)ms sanitized=false")
         return polishOutNoMLX
@@ -2095,7 +2221,7 @@ final class Qwen3Polisher {
     /// Apply the deterministic post-processor with the current user
     /// vocabulary as proper-noun safelist. Centralizes the call so every
     /// return path goes through the same cleanup.
-    nonisolated static func applyPostprocessor(_ text: String, userVocabulary: [String]?, cleanupLevel: String = "medium") -> String {
+    nonisolated static func applyPostprocessor(_ text: String, userVocabulary: [String]?, cleanupLevel: String = "medium", personalityStyle: String = "neutral", appContextLabel: String? = nil) -> String {
         let userNouns: Set<String> = Set((userVocabulary ?? []).map { $0.lowercased() })
         // Gate the list passes by the active cleanup level: lighter levels must
         // not impose list structure on prose. Mapping: none→never list,
@@ -2103,7 +2229,9 @@ final class Qwen3Polisher {
         // high→aggressive (detect implied enumeration in a rant).
         let options = PolishPostprocessor.Options(
             userProperNouns: userNouns,
-            listMode: PolishPostprocessor.ListFormattingMode(cleanupLevel: cleanupLevel)
+            listMode: PolishPostprocessor.ListFormattingMode(cleanupLevel: cleanupLevel),
+            personalityStyle: personalityStyle,
+            isMessagingContext: Self.isMessagingContext(appContextLabel)
         )
         let result = PolishPostprocessor.process(text, options: options)
         if !result.changes.isEmpty {
@@ -2111,6 +2239,85 @@ final class Qwen3Polisher {
             print("[VOICE-POST] post-processor applied: \(ruleNames)")
         }
         return result.cleaned
+    }
+
+    /// Decide whether an input can skip the LLM entirely and be handled by
+    /// deterministic post-processing only (the short-utterance / already-clean
+    /// fast path). Mirrors Wispr's behavior of not firing the model on trivial
+    /// dictations.
+    ///
+    /// Returns true when EITHER:
+    ///   • the input is very short (≤ 8 words), OR
+    ///   • the input already looks clean (starts capitalized, ends with
+    ///     terminal punctuation, has no dictation fillers).
+    /// In BOTH cases it must be free of signals that genuinely need the model
+    /// or the full postprocessor list passes: spoken commands ("slash",
+    /// "new line", "period"…), URL/path/code/email spans, or explicit list
+    /// enumeration. When any of those are present we fall through to the
+    /// normal path so they're handled correctly.
+    nonisolated static func qualifiesForFastPath(_ text: String, wordCount: Int) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+
+        // Bail to the model/postprocessor if the input carries any signal that
+        // needs real handling. These are cheap substring/word checks.
+        // 1. Spoken commands / formatting words the postprocessor list-passes
+        //    (or the model) must convert. "slash" → "/", "new line" → break.
+        let commandCues = ["slash", "backslash", "new line", "newline",
+                            "new paragraph", "open paren", "close paren",
+                            "open bracket", "close bracket", "hashtag",
+                            "ampersand", "asterisk", "underscore", "dot com",
+                            "at sign", "colon", "semicolon", "quote", "bullet"]
+        for cue in commandCues where Self.containsWordPhrase(cue, in: lower) {
+            return false
+        }
+        // 2. Structural / fragile spans: URLs, emails, code, paths.
+        if trimmed.contains("@") || trimmed.contains("`")
+            || trimmed.contains("://") || trimmed.contains("/")
+            || trimmed.contains("\\") {
+            return false
+        }
+        // 3. Explicit list enumeration — let the list passes / model run.
+        let enumCues = ["first", "second", "third", "number one", "number two"]
+        for cue in enumCues where Self.containsWordPhrase(cue, in: lower) {
+            return false
+        }
+
+        // Path A: very short utterance (≤ 8 words). The model can't reliably
+        // improve this and is more likely to change the speaker's voice.
+        if wordCount <= 8 {
+            return true
+        }
+
+        // Path B: already-clean input — no point sending it to the model.
+        // "Clean" = starts with a capital, ends in terminal punctuation, and
+        // contains no dictation fillers/disfluencies.
+        let startsCapital = trimmed.first?.isUppercase ?? false
+        let endsTerminal = [".", "!", "?"].contains(String(trimmed.suffix(1)))
+        let fillerCues = [" um ", " uh ", " er ", " i mean ", " you know ",
+                          " sort of ", " kind of ", " like "]
+        let padded = " " + lower + " "
+        let hasFiller = fillerCues.contains { padded.contains($0) }
+            || lower.hasPrefix("um ") || lower.hasPrefix("uh ")
+            || lower.hasPrefix("so ") || lower.hasPrefix("like ")
+        // Stutter signal ("I I", "the the") — needs collapse, not fast-path.
+        let hasStutter = trimmed.range(
+            of: #"\b(\w+)\s+\1\b"#,
+            options: [.regularExpression, .caseInsensitive]) != nil
+        if startsCapital && endsTerminal && !hasFiller && !hasStutter {
+            return true
+        }
+
+        return false
+    }
+
+    /// Whole-word/phrase containment in an already-lowercased haystack.
+    /// Word-boundary anchored so "first" doesn't match "thirst" and "colon"
+    /// doesn't match "colonial".
+    nonisolated static func containsWordPhrase(_ phrase: String, in lowerHaystack: String) -> Bool {
+        let pattern = "\\b\(NSRegularExpression.escapedPattern(for: phrase))\\b"
+        return lowerHaystack.range(of: pattern, options: .regularExpression) != nil
     }
 
     /// Minimal deterministic finish for the rules-only fallback paths
@@ -2132,7 +2339,7 @@ final class Qwen3Polisher {
     /// fail-open callers (polish disabled, MLX unlinked, model not ready,
     /// non-English) didn't run the model, so there is no model-formatted list
     /// to honor and we stay near-verbatim.
-    nonisolated static func applyMinimalPostprocessor(_ text: String, userVocabulary: [String]?) -> String {
+    nonisolated static func applyMinimalPostprocessor(_ text: String, userVocabulary: [String]?, personalityStyle: String = "neutral", appContextLabel: String? = nil) -> String {
         let userNouns: Set<String> = Set((userVocabulary ?? []).map { $0.lowercased() })
         let options = PolishPostprocessor.Options(
             sentenceStartCaps: true,
@@ -2153,7 +2360,9 @@ final class Qwen3Polisher {
             spokenPunctuation: true,
             punctuationSpacing: true,
             userProperNouns: userNouns,
-            listMode: .none
+            listMode: .none,
+            personalityStyle: personalityStyle,
+            isMessagingContext: Self.isMessagingContext(appContextLabel)
         )
         let result = PolishPostprocessor.process(text, options: options)
         if !result.changes.isEmpty {
@@ -2198,6 +2407,18 @@ final class Qwen3Polisher {
     /// Maps frontmost app bundle IDs to short context labels injected into the
     /// cloud system prompt. The model uses this to adjust register and format —
     /// e.g. keep Slack messages brief and casual, expand email into full prose.
+    /// True when the app-context label denotes a messaging / chat surface
+    /// (Slack, iMessage, Teams, Discord, Telegram, Signal). Used to gate the
+    /// tiered trailing-period strip — short chat messages don't end in a
+    /// period, whereas emails and documents keep theirs. Matches the labels
+    /// emitted by `appContextLabel(forBundleID:)` above.
+    nonisolated static func isMessagingContext(_ label: String?) -> Bool {
+        guard let l = label?.lowercased() else { return false }
+        // "Slack message", "chat message", "Teams message" all contain
+        // "message"; "email" / "document" / "code editor" do not.
+        return l.contains("message") || l.contains("chat")
+    }
+
     nonisolated static func appContextLabel(forBundleID id: String?) -> String? {
         guard let id else { return nil }
         switch id {
@@ -2275,14 +2496,17 @@ final class Qwen3Polisher {
         appContextLabel: String? = nil,
         wordCount: Int = 0
     ) -> String {
-        _ = cleanupLevel
         _ = personalityStyle
         _ = userVocabulary
         _ = suspectWords
         _ = fieldContext
         _ = appContextLabel
         _ = wordCount
-        var prompt = cloudSystemBrief
+        // Pick the brief by cleanup level: none/light/medium → light-touch
+        // (voice-preserving), high → full rewrite. This is the core of the
+        // two-layer architecture: the heavy 2KB rewrite brief no longer runs
+        // on every dictation, only on explicit "high" cleanup.
+        var prompt = briefForCleanupLevel(cleanupLevel)
         if let card = styleCardBlock, !card.isEmpty {
             prompt += "\n\n" + card
         }
@@ -3697,7 +3921,7 @@ final class Qwen3Polisher {
             return "Style: CASUAL. Conversational, lowercase-leaning. Keep contractions. Keep 'yeah', 'yo', 'gonna' if the speaker used them. Short punchy clauses. No em-dashes. No emojis." + antiAI + absoluteTail
 
         case "excited":
-            return "Style: EXCITED. Energetic. Exclamation marks where the audio energy actually supports it. Never fabricated. Keep the speaker's natural enthusiasm. No em-dashes. No emojis. Never invent excitement that wasn't there." + antiAI + absoluteTail
+            return "Style: EXCITED, but ONLY as much as the speaker actually was. Match their real energy, never exceed it. Use an exclamation mark or upbeat phrasing ONLY where the WORDS themselves carry excitement: 'this is huge', 'can't believe it', 'so good', 'let's go', 'amazing', 'I'm thrilled'. If the words are neutral, flat, or matter-of-fact, KEEP them measured. Plain statements get plain periods. Do NOT add exclamation marks, intensifiers, or peppy phrasing to content that wasn't excited. Never fabricate enthusiasm, never sound peppier than the speaker. When unsure whether a line is excited, treat it as neutral. No em-dashes. No emojis." + antiAI + absoluteTail
 
         default:
             return "Style: NEUTRAL. Match the speaker's register exactly. Fix grammar and filler words only. No transformation of style, tone, or vocabulary. No em-dashes. No emojis." + antiAI + absoluteTail
@@ -3920,10 +4144,101 @@ final class Qwen3Polisher {
     // raw ASR + a short brief to a cloud model and trusts the model to
     // think. We do the same.
 
-    nonisolated private static let cloudSystemBrief: String = """
+    // ---------------------------------------------------------------------
+    // TWO-LAYER BRIEF ARCHITECTURE (rearchitected May 2026)
+    //
+    // Wispr Flow — the gold standard — does NOT heavily rewrite by default.
+    // Its fine-tuned model does LIGHT-TOUCH formatting only (strip fillers,
+    // auto-capitalize, punctuate, structure obvious lists, adjust tone per
+    // app) and targets ~700ms latency. Heavy rewriting is a SEPARATE opt-in
+    // feature (highlight text + "make this concise"), not the default.
+    //
+    // We mirror that. There are now TWO briefs:
+    //   • `cloudLightBrief`  — DEFAULT. Used for cleanup levels none/light/
+    //     medium. Short (~300 words), voice-preserving: clean, punctuate,
+    //     format obvious lists, match register. Explicitly forbids
+    //     rephrasing/reordering that isn't necessary.
+    //   • `cloudHeavyBrief`  — ONLY for cleanupLevel == "high". The full
+    //     editorial rewrite brief (formerly `cloudSystemBrief`). The model
+    //     is allowed to restructure aggressively here.
+    //
+    // `briefForCleanupLevel(_:)` picks between them. Default/light/medium
+    // get the light brief; high gets the heavy one.
+    // ---------------------------------------------------------------------
+
+    /// Pick the system brief for the active cleanup level. Default, light,
+    /// and medium use the voice-preserving light-touch brief; only "high"
+    /// gets the full rewrite brief. An empty/nil level is treated as the
+    /// medium default → light brief.
+    nonisolated static func briefForCleanupLevel(_ level: String?) -> String {
+        if level?.lowercased() == "high" {
+            return cloudHeavyBrief
+        }
+        return cloudLightBrief
+    }
+
+    // MARK: - Light-touch brief (DEFAULT: none / light / medium)
+    //
+    // Target: under ~350 words. Preserves the speaker's voice and word
+    // choices. Cleanup only — NOT a rewrite. This is what runs on the vast
+    // majority of dictations.
+    nonisolated static let cloudLightBrief: String = """
+    You are cleaning up a transcript of someone speaking into a voice dictation app on their Mac. Your job is LIGHT-TOUCH cleanup, not rewriting. Produce what they said, cleaned up so it reads like they typed it. Keep their voice, their wording, their sentence structure.
+
+    Do exactly this and nothing more:
+    - Remove fillers and disfluencies: "um", "uh", "er", "like" (when filler), "you know", "I mean" (when filler), false starts, and stutters ("I I I think" becomes "I think").
+    - SELF-CORRECTIONS (this is frequently done WRONG, get it right): when the speaker corrects themselves, DROP the abandoned content entirely and keep ONLY the final version. Removing retracted content is disfluency removal, so it OVERRIDES word fidelity for those words. Trigger phrases (themselves also dropped): "no wait", "wait no", "scratch that", "actually", "I mean", "no sorry", "or rather", "make that", "let's just". Resolve EVERY correction until only the speaker's final intent remains. Examples:
+       - "coffee at 2 actually 3 no wait scratch that let's just do lunch at noon" becomes "Let's just do lunch at noon." (drop coffee, 2, 3, and "scratch that")
+       - "book the flight for the 14th no sorry the 15th and make it the morning one not the evening" becomes "Book the flight for the 15th, the morning one."
+       - "move it to Tuesday I mean Wednesday" becomes "Move it to Wednesday."
+    - Add natural punctuation and capitalization. The transcript has none. Periods at sentence ends, commas where natural, question marks on questions. Capitalize sentence starts, the word "I", and proper nouns.
+    - Insert a paragraph break (a blank line) when the speaker clearly shifts topic. Voice cues for a shift: "anyway", "also", "oh and", "another thing", "by the way", "moving on", "so yeah". Do not break inside one continuous thought.
+    - Format a list ONLY when the speaker clearly enumerates with ordinals ("first... second... third...") or counts ("one... two... three..."). Use 1. 2. 3. numbering, one item per line. Do not invent list structure out of ordinary prose.
+    - Match the register to the app shown in the CONTEXT block. Email apps (Gmail, Outlook, Mail): full sentences, and if they open with a salutation format it as "Hi <Name>," on its own line followed by a blank line. Messaging and chat apps (Slack, iMessage, Teams, Discord): keep it casual, keep contractions, keep it short.
+
+    WORD FIDELITY (the single most important rule, overrides everything except removing disfluencies):
+    - Preserve the speaker's EXACT words and EXACT spellings. The cleaned text must contain the same words the speaker said, in the same order. You are punctuating and capitalizing, not editing word choice.
+    - Do NOT swap any word for a synonym, a "more correct" word, or a "better" word. If they said "big" do not write "large". If they said "get" do not write "obtain". Keep their word.
+    - Do NOT "fix" or "correct" what sounds like a misspoken word. Names, brands, product names, company names, technical terms, jargon, and acronyms must come through UNCHANGED. Do not turn an unfamiliar word into a familiar one.
+    - NEVER change a capitalized token or a token with internal capitals/digits (for example "Diatype", "veCRV", "GPT-4", "S3", "k8s"). These are deliberate. Reproduce them character-for-character. The only capitalization you add is sentence-start, the word "I", and a genuine proper noun the speaker clearly named.
+    - ONE allowed word-level fix: you MAY correct everyday grammatical homophones and contractions to the grammatically correct form when the sentence grammar makes it clear. This set ONLY: its/it's, your/you're, there/their/they're, to/too, were/we're, whose/who's, then/than. Example: "its too late to change there minds and your gonna wait for you're turn" becomes "it's too late to change their minds and you're gonna wait for your turn". This is the ONLY word substitution you may make.
+    - Do NOT change ANY other word. Never "correct" a name, brand, product, company, technical term, acronym, or an ambiguous-sounding word into a different word ("Diatype" stays "Diatype", never "diatribe"; "veCRV" stays "veCRV", never "recurve"). If a token could be a name or a term, keep it EXACTLY. Outside the grammatical-homophone set above, when two readings are possible, keep the exact token the transcript already has.
+    - If you are unsure whether a token is a real word, a name, or a typo: keep the original token exactly as written. Never delete a content word.
+
+    Do NOT do any of this:
+    - Do NOT rephrase, reword, or reorder anything unless it is strictly necessary to remove a disfluency. Every meaningful word the speaker said survives.
+    - Do NOT make it more "professional", more concise, or more elaborate. Do NOT expand contractions unless the personality is "formal".
+    - Do NOT add content the speaker did not say. No invented facts, no sign-offs they didn't dictate, no "I hope this helps", no closing summary.
+
+    Hard rules (absolute, no exceptions):
+    1. Output ONLY the cleaned text. Nothing else. Do NOT prepend a preamble, lead-in, or acknowledgement of ANY kind. Forbidden openers include but are not limited to: "Here's", "Here is", "Sure,", "Certainly,", "Okay,", "Got it,", "Cleaned up:", "Here is the cleaned version", "Here's a cleaner version". Do NOT wrap the output in quotation marks or code fences. Do NOT add trailing meta-commentary or notes. The very first character of your response is the first character of the cleaned text, and the last character is the last character of the cleaned text.
+    2. Never use em-dashes or en-dashes. Use periods, commas, or semicolons.
+    3. Never use emojis or decorative symbols.
+    4. Never add content the speaker didn't say.
+
+    When in doubt, keep the original. The output should sound like the same person said it, just cleaned up.
+    """
+
+    // MARK: - Heavy rewrite brief (ONLY cleanupLevel == "high")
+    //
+    // Formerly `cloudSystemBrief`, used on every dictation. Now gated to the
+    // explicit "high" cleanup level only. This is the aggressive editorial
+    // rewrite path.
+    nonisolated private static let cloudHeavyBrief: String = """
     You are reading a transcript of someone speaking into a voice dictation app on their Mac. They were dictating to send a message, write an email, take a note, write code, or jot down a thought.
 
     Your job: produce the message they would have typed if they had typed instead of spoken. Read carefully. Understand what they meant. Write what they would have written.
+
+    This is the AGGRESSIVE cleanup level. You are not just tidying punctuation. You RESTRUCTURE: collapse rambles into clear sentences, split run-ons, drop dead weight, and most importantly impose the RIGHT FORMAT on the content even when the speaker never named it.
+
+    # Infer the structure (do this FIRST, before you format anything)
+    The speaker almost never says "this is a list" or "make this an email". You must INFER the format from the content itself. Read the whole transcript, decide what kind of thing it is, then format it that way:
+    - A SEQUENCE OF ITEMS (groceries, packing, names, features, anything enumerable) becomes a bulleted list, even when delivered as a flat run: "milk eggs bread and uh some bananas" is a list of four items, so render it as bullets, not a sentence. A run of short noun phrases joined by commas, "and", "plus", "also", or "oh and" is a list.
+    - A SEQUENCE OF ACTIONS OR STEPS (do this, then that, then the other) becomes a numbered list, even without the words "first/second/third". If the order matters, number it.
+    - AN EMAIL (opens with a greeting, or is clearly addressed to a person, or ends with a sign-off) gets email shape: salutation on its own line, blank line, body in paragraphs, sign-off on its own line if dictated.
+    - A LONG RAMBLE on one or more topics becomes tight, reorganized paragraphs: one idea per paragraph, blank line between topics, run-ons split, repetition removed.
+    - A SHORT MESSAGE or single thought stays a clean sentence or two. Do not force list or email structure onto something that is just a remark.
+    Pick exactly ONE format that fits the content. When the content is genuinely a list of things, default to formatting it as a list rather than leaving it as a comma-spliced sentence.
 
     # How to read the transcript
     - They were speaking, so it has fillers ("um", "uh", "like"), false starts, and self-corrections. Treat them as a person, not a stream of tokens.
@@ -3945,6 +4260,14 @@ final class Qwen3Polisher {
 
     REGISTER. The CONTEXT block tells you which app the user is in. Gmail/Outlook/Mail → formal prose, full sentences. Slack/Discord/iMessage → casual, contractions preserved, shorter clauses.
     LIST FORMATTING.
+
+    DETECT LISTS THAT WEREN'T LABELED. The speaker rarely says "here is a list." A flat run of distinct short items IS a list and should be bulleted even with no header and no commas: "milk eggs bread and uh some bananas" -> a four-item bullet list. Items joined by "and", "plus", "also", "oh and", "and then", or bare adjacency (spoken nouns in a row) are list items. Strip the filler ("uh some") and bullet each real item.
+    Input: "i gotta grab milk eggs bread and uh some bananas"
+    Output:
+    - Milk
+    - Eggs
+    - Bread
+    - Bananas
 
     INLINE vs BULLETS. Short lists (\u{2264}3 items) or lists embedded in prose stay inline with Oxford commas: "Pick up milk, eggs, and bread." Long lists (\u{2265}4 items) or lists with a clear header become bulleted:
 

@@ -227,16 +227,25 @@ public final class CerebrasPolisher {
                 return polished
 
             case .transientFailure(let reason):
-                // Rate-limit / queue-exceeded: don't retry. Cerebras free
-                // tier shares one queue globally; if we got rejected, the
-                // queue is congested and waiting 11s only to fall to local
-                // anyway is user-hostile. Fall to local immediately so
-                // total polish time stays under ~2s. Network/timeout still
-                // retry with the short backoff.
-                if reason == "rate-limit" {
+                // 429 rate-limit: RETRY with short backoff. The free tier's
+                // shared queue clears in well under a second (measured ~0.5s),
+                // so a 200ms→500ms retry (≤0.7s total) almost always lands
+                // cloud. The alternative — falling straight to the local model
+                // — costs ~60s. An earlier version skipped the retry on the
+                // assumption the backoff was ~11s; it's actually ≤0.7s, so
+                // retrying is strictly better than a 60s local demote.
+                //
+                // Still skip retry for genuinely slow/deterministic failures:
+                // first-token/total timeouts (already burned the full budget)
+                // and empty-response (a reasoning model that spent its budget
+                // thinking will do the same again).
+                let noRetry = reason == "timeout-firsttoken"
+                    || reason == "timeout-total"
+                    || reason == "empty-response"
+                if noRetry {
                     recordFailure(reason)
                     lastFailureReason = reason
-                    print("[CEREBRAS] rate-limit — falling through immediately (no retry, queue is congested)")
+                    print("[CEREBRAS] \(reason) — falling through immediately (no retry)")
                     return nil
                 }
                 if attempt < maxRetries {
@@ -294,6 +303,13 @@ public final class CerebrasPolisher {
             ],
             "temperature": 0.2,
             "max_tokens": maxTokens,
+            // gpt-oss-120b is a REASONING model: at default effort it spends
+            // the whole max_tokens budget "thinking" before emitting the
+            // answer, so on larger inputs `content` came back EMPTY → the app
+            // demoted to the slow local 4B (the "it's using local / it's slow"
+            // bug). Light-touch polish needs zero reasoning — "low" makes it
+            // emit the cleaned text immediately. Cerebras accepts this field.
+            "reasoning_effort": "low",
             "stream": true,
             "stream_options": ["include_usage": true],
         ]
@@ -305,6 +321,12 @@ public final class CerebrasPolisher {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        // Cerebras sits behind Cloudflare, which 1010-blocks requests with a
+        // non-browser fingerprint (URLSession's default CFNetwork UA gets
+        // banned). A browser-style User-Agent is required or every call fails
+        // with HTTP 403 "error code: 1010". This was the silent cause of cloud
+        // never working in-app.
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         do {
             req.httpBody = try JSONSerialization.data(withJSONObject: payload)
         } catch {
@@ -334,6 +356,12 @@ public final class CerebrasPolisher {
             // Parse SSE lines: `data: {...}` chunks; `data: [DONE]` terminates.
             // The final chunk (before [DONE]) carries usage when stream_options.include_usage=true.
             var accumulated = ""
+            // Fallback buffer: some models (notably gpt-oss on some hosts)
+            // stream the final answer in `delta.reasoning` /
+            // `delta.reasoning_content` with `delta.content` null. We keep this
+            // separate and only use it if `content` ends up empty (see below)
+            // so we never splice chain-of-thought into normal output.
+            var accumulatedReasoning = ""
             var inputTokens = 0; var outputTokens = 0; var cachedTokens = 0
             var firstTokenSeen = false
 
@@ -360,9 +388,19 @@ public final class CerebrasPolisher {
                             guard let jsonData = jsonStr.data(using: .utf8),
                                   let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
                             if let choices = parsed["choices"] as? [[String: Any]],
-                               let delta = choices.first?["delta"] as? [String: Any],
-                               let chunk = delta["content"] as? String {
-                                accumulated += chunk
+                               let delta = choices.first?["delta"] as? [String: Any] {
+                                if let chunk = delta["content"] as? String {
+                                    accumulated += chunk
+                                }
+                                // Capture reasoning-channel text as a fallback
+                                // only. gpt-oss on some hosts emits the answer
+                                // here with content null. We never merge it into
+                                // `accumulated` directly.
+                                if let r = delta["reasoning"] as? String {
+                                    accumulatedReasoning += r
+                                } else if let r = delta["reasoning_content"] as? String {
+                                    accumulatedReasoning += r
+                                }
                             }
                             if let usage = parsed["usage"] as? [String: Any] {
                                 inputTokens  = usage["prompt_tokens"]     as? Int ?? 0
@@ -411,7 +449,18 @@ public final class CerebrasPolisher {
             }
 
             let dt = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
-            let result = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            var result = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Robust extraction: if `content` was empty/null but the model
+            // streamed its answer on the reasoning channel, recover it. Guard
+            // with a heuristic so we don't surface visible chain-of-thought:
+            // skip text that opens with obvious thinking markers.
+            if result.isEmpty {
+                let reasoning = accumulatedReasoning.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !reasoning.isEmpty, !Self.looksLikeChainOfThought(reasoning) {
+                    print("[CEREBRAS] content empty — recovered answer from reasoning field (\(reasoning.count) chars)")
+                    result = reasoning
+                }
+            }
             guard !result.isEmpty else {
                 print("[CEREBRAS] empty streamed response")
                 return .transientFailure("empty-response")
@@ -477,5 +526,27 @@ public final class CerebrasPolisher {
     /// Increment the per-reason failure tally.
     private func recordFailure(_ reason: String) {
         failureCounts[reason, default: 0] += 1
+    }
+
+    /// Heuristic guard for the reasoning-channel fallback. Returns true when
+    /// the text reads like exposed chain-of-thought rather than a final
+    /// answer, so we can refuse to surface it. Conservative on purpose: we'd
+    /// rather drop a borderline case than splice "Let me think..." into the
+    /// user's polished output.
+    ///
+    /// NOTE: This only runs when `content` was empty AND a reasoning field had
+    /// text — the common gpt-oss-on-some-hosts case where the *entire* answer
+    /// lands in `reasoning`. If a host interleaves true CoT with the answer in
+    /// the same field we can't separate them here; that case returns true and
+    /// the polish fails fast to the next provider rather than leaking CoT.
+    static func looksLikeChainOfThought(_ text: String) -> Bool {
+        let head = text.prefix(80).lowercased()
+        let markers = [
+            "let me think", "let's think", "let me ", "we need to",
+            "first, ", "okay, ", "ok, so", "the user wants",
+            "the user is asking", "i need to", "i should", "analysis:",
+            "<think", "reasoning:",
+        ]
+        return markers.contains { head.hasPrefix($0) || head.contains($0) }
     }
 }

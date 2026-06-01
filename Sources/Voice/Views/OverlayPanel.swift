@@ -681,14 +681,24 @@ class OverlayPanel: NSPanel {
 
     // MARK: - Target frame computation
 
+    /// Invisible padding added to the hosting window AROUND the visible pill so
+    /// floating layers drawn above/beside it — hover tooltips, the engine+ms
+    /// toast, the persistent ms chip — aren't hard-clipped by the window edge.
+    /// The window is transparent, so only the pill and those layers paint. The
+    /// PillHostingView hit-test subtracts these so the slack stays click-through.
+    static let pillSideSlack: CGFloat = 60
+    static let pillTopSlack: CGFloat = 64
+
     private func computeTargetFrame() -> NSRect {
         let screen = resolveActiveScreen()
-        let panelWidth: CGFloat = 180
-        // Base height is 56px (controls row). When live-partial text is present
-        // in lock mode, grow upward by 88px (80px text area + 8px padding/separator).
-        // The bottom edge stays anchored so the pill expands toward the top.
+        // When live-partial text is showing in lock mode, the pill becomes a
+        // proper text CARD — wider and taller so more of the dictation is
+        // readable at once — instead of a cramped narrow capsule. Otherwise
+        // it's the compact control pill. Bottom edge stays anchored, so it
+        // expands upward and outward.
         let hasLiveText = recordingState.isLocked && !recordingState.livePartialText.isEmpty
-        let panelHeight: CGFloat = hasLiveText ? 144 : 56
+        let panelWidth: CGFloat = hasLiveText ? 300 : 180
+        let panelHeight: CGFloat = hasLiveText ? 220 : 56
 
         let dockHidden = screen.visibleFrame.size == screen.frame.size
 
@@ -733,7 +743,19 @@ class OverlayPanel: NSPanel {
             lastDockHiddenLogged = dockHidden
         }
 
-        return NSRect(x: x, y: y, width: panelWidth, height: panelHeight)
+        // Grow the hosting window with invisible slack so tooltips / engine+ms
+        // toast / ms chip drawn ABOVE and beside the pill aren't clipped by the
+        // window edge. Keep the VISIBLE pill anchored exactly where it was:
+        // `y` is the bottom edge and the pill is bottom-pinned, so we keep `y`
+        // fixed and grow UPWARD (height += topSlack); we expand width
+        // symmetrically around the existing center (x -= sideSlack). The slack
+        // is transparent and stays click-through (see PillHostingView.hitTest).
+        let sideSlack = Self.pillSideSlack
+        let topSlack = Self.pillTopSlack
+        return NSRect(x: x - sideSlack,
+                      y: y,
+                      width: panelWidth + sideSlack * 2,
+                      height: panelHeight + topSlack)
     }
 
     /// True when the pill is in the idle phase — mirrors `rawPhase` from OverlayPillView
@@ -1028,11 +1050,24 @@ private final class PillHostingView<Content: View>: NSHostingView<Content> {
         // width of the panel, ≥ visibleBandHeight vertically so the hover bar
         // ABOVE the dot is also hittable (Polish buttons live there).
         let isIdle = (self.window as? OverlayPanel)?.isIdlePhase ?? false
-        let bandW: CGFloat = visibleBandWidth
+        // The window now carries transparent slack around the visible pill
+        // (OverlayPanel.pillSideSlack / .pillTopSlack) so floating layers aren't
+        // clipped. The interactive band must track the VISIBLE pill — i.e. the
+        // window minus that slack — so clicks in the slack pass through to the
+        // app below and the top slack (tooltips/toast/chip) stays click-through.
+        let sideSlack = OverlayPanel.pillSideSlack
+        let topSlack = OverlayPanel.pillTopSlack
         let bandH: CGFloat = visibleBandHeight
+        // Visible pill width = window width minus the horizontal slack. Floor at
+        // the legacy band width so a tiny window never yields a sub-pill band.
+        let bandW: CGFloat = max(visibleBandWidth, bounds.width - sideSlack * 2)
         let bandX = (bounds.width - bandW) / 2
         let bandY: CGFloat = (bounds.height > bandH + 6) ? 4 : 0
-        let bandHeight = isIdle ? bandH : max(bandH, bounds.height - bandY)
+        // Active states cover the visible pill height (window minus top slack),
+        // anchored at the bottom — NOT the full window, so the upper slack
+        // forwards clicks through.
+        let visiblePillHeight = max(bandH, bounds.height - topSlack - bandY)
+        let bandHeight = isIdle ? bandH : visiblePillHeight
         let band = NSRect(x: bandX, y: bandY, width: bandW, height: bandHeight)
         // Quick reject — point is in the dead padding. AppKit will forward the
         // click to whatever window is underneath.
@@ -1121,7 +1156,7 @@ struct OverlayPillView: View {
     /// Power-user setting: when ON, an always-visible chip displays the last
     /// polish engine + latency in the corner of the pill (and never auto-
     /// dismisses). Default OFF — diagnostic affordance only.
-    @AppStorage("voice.showEnginePill") private var showEnginePill: Bool = false
+    @AppStorage("voice.showEnginePill") private var showEnginePill: Bool = true
 
     /// Namespace for Liquid Glass morph between pill phases. Each phase pill
     /// shares the same glassEffectID inside a GlassEffectContainer — when one
@@ -1337,6 +1372,10 @@ struct OverlayPillView: View {
                 if UserDefaults.standard.bool(forKey: "voicePillDebug") {
                     print("[VOICE/dbg] Pill phase: \(lastLoggedPhase) -> \(newValue)")
                 }
+                Telemetry.log("pill.phase", properties: [
+                    "phase": "\(newValue)",
+                    "from": "\(lastLoggedPhase)"
+                ])
                 lastLoggedPhase = newValue
             }
             // Just assign — the GlassEffectContainer has a `.animation(.bouncy,
@@ -1412,7 +1451,8 @@ struct OverlayPillView: View {
             // the panel. Eyeballed bump keeps the dot clear of the partial
             // preview's right edge without overlapping it.
             let base: CGFloat = 72
-            return state.livePartialText.isEmpty ? base : base + 8
+            // With live text the pill is now a 300pt-wide card → half-width 150.
+            return state.livePartialText.isEmpty ? base : 150
         case .transcribing:       return 20   // 40pt fixed frame
         case .polishingSelection: return 50   // ~100pt: ring + "Polishing" text + padding
         case .meetingCapture:     return 50   // legacy dead case
@@ -1457,6 +1497,11 @@ struct OverlayPillView: View {
 private struct GlassCapsuleModifier: ViewModifier {
     var fillOpacity: Double = 0.55
     var glowLevel: CGFloat = 0
+    /// The surface shape. Defaults to a Capsule (the compact pill). Callers
+    /// pass a RoundedRectangle when the pill becomes a text card, so the glass
+    /// material / fill / border all match the card instead of leaving a
+    /// fully-capsule glass layer showing underneath the rounded clip.
+    var shape: AnyShape = AnyShape(Capsule(style: .continuous))
 
     @AppStorage("pillSkin") private var pillSkin: String = "default"
 
@@ -1497,7 +1542,7 @@ private struct GlassCapsuleModifier: ViewModifier {
             content
                 .glassEffect(
                     .regular.tint(Color.black.opacity(0.35)).interactive(),
-                    in: .capsule
+                    in: shape
                 )
                 .shadow(color: .white.opacity(max(glowOpacity, 0.10)), radius: max(glowRadius, 4), y: 0)
         case .black:
@@ -1507,11 +1552,10 @@ private struct GlassCapsuleModifier: ViewModifier {
             // shape used for clipping so the hairline border sits exactly on
             // the visible edge instead of being cut in half by the bounds.
             content
-                .background(Capsule(style: .continuous).fill(Color.black))
-                .clipShape(Capsule(style: .continuous))
+                .background(shape.fill(Color.black))
+                .clipShape(shape)
                 .overlay(
-                    Capsule(style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.6)
+                    shape.stroke(Color.white.opacity(0.18), lineWidth: 0.6)
                 )
                 .shadow(color: .white.opacity(max(glowOpacity, 0.10)), radius: max(glowRadius, 4), y: 0)
         case .aurora(let palette):
@@ -1522,11 +1566,11 @@ private struct GlassCapsuleModifier: ViewModifier {
                 .background(
                     AuroraBackground(palette: palette)
                         .padding(-4)
-                        .clipShape(Capsule(style: .continuous))
+                        .clipShape(shape)
                         .drawingGroup(opaque: false)
                         .allowsHitTesting(false)
                 )
-                .glassEffect(.clear.interactive(), in: .capsule)
+                .glassEffect(.clear.interactive(), in: shape)
                 .shadow(color: .white.opacity(max(glowOpacity, 0.10)), radius: max(glowRadius, 4), y: 0)
         }
     }
@@ -1536,8 +1580,8 @@ extension View {
     /// Apply Voice's pill surface treatment (glass / black / niche) as a
     /// modifier so the glass effect sits on the SAME view node as any
     /// glassEffectID — required for GlassEffectContainer morphing.
-    func glassCapsule(fillOpacity: Double = 0.55, glowLevel: CGFloat = 0) -> some View {
-        modifier(GlassCapsuleModifier(fillOpacity: fillOpacity, glowLevel: glowLevel))
+    func glassCapsule(fillOpacity: Double = 0.55, glowLevel: CGFloat = 0, shape: AnyShape = AnyShape(Capsule(style: .continuous))) -> some View {
+        modifier(GlassCapsuleModifier(fillOpacity: fillOpacity, glowLevel: glowLevel, shape: shape))
     }
 }
 
@@ -1800,7 +1844,10 @@ private struct HoverActionButton: View {
 
 private struct TooltipCapsule: View {
     let label: String
-    let hotkey: String
+    /// Optional hotkey hint. When empty (e.g. the lock-mode control tooltips,
+    /// which have no keyboard shortcut) the accent hint is omitted entirely so
+    /// the capsule sizes to just the label.
+    var hotkey: String = ""
 
     /// Pink/lilac accent for the hotkey hint, matching the reference design.
     private static let hotkeyColor = Color(red: 1.0, green: 0.6, blue: 0.85)
@@ -1810,9 +1857,11 @@ private struct TooltipCapsule: View {
             Text(label)
                 .font(.sans(11, weight: .semibold))
                 .foregroundStyle(.white)
-            Text(hotkey)
-                .font(.sans(10, weight: .medium))
-                .foregroundStyle(Self.hotkeyColor)
+            if !hotkey.isEmpty {
+                Text(hotkey)
+                    .font(.sans(10, weight: .medium))
+                    .foregroundStyle(Self.hotkeyColor)
+            }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 5)
@@ -2078,6 +2127,20 @@ private struct LockedPill: View {
     let onCancel: () -> Void
     let onConfirm: () -> Void
 
+    // Blur "text-spawn" state. Each time the live partial text changes we kick
+    // `textBlur` up to a small radius (and dim opacity slightly) then animate
+    // it back to 0 over a short duration, so freshly-transcribed words appear
+    // to materialize in rather than snapping on. Kept subtle + short so the
+    // frequent livePartialText updates never read as laggy.
+    @State private var textBlur: CGFloat = 0
+    @State private var textSpawnOpacity: Double = 1
+
+    /// Which control button is currently hovered, driving the floating
+    /// tooltip. `nil` = no tooltip. Wispr-Flow-style: hovering the X shows
+    /// "Cancel", hovering the checkmark shows "Finish and paste".
+    private enum HoveredControl { case cancel, confirm }
+    @State private var hoveredControl: HoveredControl?
+
     private var audioPeak: Float {
         state.audioLevels.max() ?? 0
     }
@@ -2105,47 +2168,77 @@ private struct LockedPill: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        let hasText = !state.livePartialText.isEmpty
+        return VStack(spacing: 0) {
             // Live-partial preview (only when partial text is available).
             // Literal `Color.white` is intentional here: the pill capsule is
             // always a dark glass surface regardless of system theme, so the
             // text needs to be a fixed light value, not `.primary`.
-            if !state.livePartialText.isEmpty {
+            if hasText {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
                         Text(state.livePartialText)
-                            .font(.sans(11, weight: .regular))
+                            .font(.sans(13, weight: .regular))
+                            .lineSpacing(3)
                             .foregroundStyle(
                                 state.livePartialIsVolatile
-                                    ? Color.white.opacity(0.55)
-                                    : Color.white
+                                    ? Color.white.opacity(0.60)
+                                    : Color.white.opacity(0.95)
                             )
                             .multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
+                            // Blur "text-spawn": the partial text materializes
+                            // in on each update (radius + opacity → resting).
+                            .blur(radius: textBlur)
+                            .opacity(textSpawnOpacity)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 13)
                             .id("bottom")
                     }
-                    .frame(maxHeight: 80)
+                    // Subtle recessed text-area treatment so the scrolling copy
+                    // reads as a distinct panel above the controls row, not as
+                    // one undifferentiated capsule.
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(Color.black.opacity(0.16))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5)
+                            )
+                    )
+                    .frame(maxWidth: .infinity)
+                    .frame(maxHeight: 156)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 12)
+                    .padding(.bottom, 10)
                     .onChange(of: state.livePartialText) { _, _ in
+                        // Kick the spawn effect: blur/dim, then settle. Short
+                        // (~0.16s) so rapid ASR updates stay smooth, never laggy.
+                        textBlur = 5
+                        textSpawnOpacity = 0.45
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            textBlur = 0
+                            textSpawnOpacity = 1
+                        }
                         withAnimation(.easeOut(duration: 0.12)) {
                             proxy.scrollTo("bottom", anchor: .bottom)
                         }
                     }
                 }
-                .frame(maxWidth: .infinity)
-
-                // Hairline separator between partial text and the controls row.
-                Rectangle()
-                    .fill(Color.white.opacity(0.10))
-                    .frame(height: 0.5)
             }
 
             // Controls row: X | lock-glyph + waveform | ✓
             // The amber lock glyph + warm-tinted bars give locked mode a
             // distinct visual identity vs. push-to-talk (cool neutral).
             HStack(spacing: 5) {
-                ActionButton(systemName: "xmark", hoverTint: Color.red.opacity(0.55), action: onCancel)
+                ActionButton(
+                    systemName: "xmark",
+                    hoverTint: Color.red.opacity(0.55),
+                    action: onCancel,
+                    onHoverChange: { hovering in
+                        hoveredControl = hovering ? .cancel : (hoveredControl == .cancel ? nil : hoveredControl)
+                    }
+                )
 
                 Image(systemName: "lock.fill")
                     .font(.system(size: 8, weight: .semibold))
@@ -2159,10 +2252,20 @@ private struct LockedPill: View {
                 )
                 .frame(width: 68, height: 16)
 
-                ActionButton(systemName: "checkmark", hoverTint: Color.green.opacity(0.55), action: onConfirm)
+                ActionButton(
+                    systemName: "checkmark",
+                    hoverTint: Color.green.opacity(0.55),
+                    action: onConfirm,
+                    onHoverChange: { hovering in
+                        hoveredControl = hovering ? .confirm : (hoveredControl == .confirm ? nil : hoveredControl)
+                    }
+                )
             }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 3)
+            .padding(.horizontal, hasText ? 8 : 4)
+            // Slightly roomier controls row in card mode so it sits as a
+            // clear footer beneath the text panel; compact when pill-only.
+            .padding(.top, hasText ? 2 : 3)
+            .padding(.bottom, hasText ? 8 : 3)
         }
         // Apply glass surface using the shared glassCapsule modifier so that
         // GlassEffectContainer can see the .glassEffect at the outer level and
@@ -2171,11 +2274,18 @@ private struct LockedPill: View {
         // .clipShape AFTER the glass modifier, which is safe — the glass
         // renders at the capsule shape and the clip trims it to the rounded
         // rect when text is present.
-        .glassCapsule(fillOpacity: 0.85)
+        .glassCapsule(
+            fillOpacity: 0.85,
+            // Match the glass material's shape to the visible card so there's
+            // no fully-capsule glass layer left showing under the rounded clip.
+            shape: state.livePartialText.isEmpty
+                ? AnyShape(Capsule(style: .continuous))
+                : AnyShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        )
         .clipShape(
             state.livePartialText.isEmpty
                 ? AnyShape(Capsule(style: .continuous))
-                : AnyShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                : AnyShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
         )
         .overlay(
             Group {
@@ -2183,12 +2293,42 @@ private struct LockedPill: View {
                     Capsule(style: .continuous)
                         .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.6)
                 } else {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    RoundedRectangle(cornerRadius: 13, style: .continuous)
                         .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.6)
                 }
             }
         )
         .shadow(color: .black.opacity(0.18), radius: 8, x: 0, y: 3)
+        // Floating control tooltip. Rendered as the OUTERMOST overlay — after
+        // the .clipShape above — so it can extend ABOVE the pill body without
+        // being clipped by the rounded-rect/capsule mask. The enclosing
+        // OverlayContent frame is bottom-aligned with slack above the pill
+        // (same space the EnginePolishToast floats into), so the negative
+        // y-offset has room and never gets cut off. Hit-testing is disabled so
+        // the tooltip can never steal hover from the button beneath it.
+        .overlay(alignment: tooltipAlignment) {
+            if let hovered = hoveredControl {
+                TooltipCapsule(label: hovered == .cancel ? "Cancel" : "Finish and paste")
+                    .fixedSize()
+                    .offset(y: -34)
+                    .transition(.opacity.combined(with: .offset(y: 4)))
+                    .allowsHitTesting(false)
+                    .zIndex(20)
+            }
+        }
+        .animation(.easeOut(duration: 0.14), value: hoveredControl)
+    }
+
+    /// Anchor the tooltip horizontally over the hovered control: the X sits at
+    /// the leading edge of the controls row, the checkmark at the trailing
+    /// edge, so we bias the floating capsule toward that side rather than
+    /// dead-center (which would read as belonging to the waveform).
+    private var tooltipAlignment: Alignment {
+        switch hoveredControl {
+        case .cancel: return .topLeading
+        case .confirm: return .topTrailing
+        case .none: return .top
+        }
     }
 }
 
@@ -2198,6 +2338,10 @@ private struct ActionButton: View {
     let systemName: String
     let hoverTint: Color
     let action: () -> Void
+    /// Reports hover-enter/exit to the parent so it can drive a floating
+    /// tooltip rendered OUTSIDE this button's clipped pill body. Optional so
+    /// existing call sites that don't want a tooltip stay unchanged.
+    var onHoverChange: ((Bool) -> Void)? = nil
 
     @State private var isHovering = false
     @State private var isPressed = false
@@ -2250,6 +2394,7 @@ private struct ActionButton: View {
             .onHover { hovering in
                 isHovering = hovering
                 if hovering { NSCursor.pointingHand.set() } else { NSCursor.arrow.set() }
+                onHoverChange?(hovering)
             }
             .simultaneousGesture(
                 DragGesture(minimumDistance: 0)

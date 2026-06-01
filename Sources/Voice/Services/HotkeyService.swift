@@ -52,8 +52,6 @@ extension Notification.Name {
     /// Posted by the menu when the user picks a different hotkey.
     /// HotkeyService listens and re-binds monitors.
     static let voiceHotkeyChanged = Notification.Name("voiceHotkeyChanged")
-    /// Posted when the user presses ⌥1 to trigger Polish Selection.
-    static let voicePolishSelection = Notification.Name("voice.polishSelection")
     /// Posted when the user presses the Escape key globally. The AppDelegate
     /// decides whether to act on it (only when a dictation is past the
     /// recording stage — idle ESC is a no-op so we don't shadow system Esc).
@@ -205,20 +203,17 @@ struct CapturedHotkey: Codable, Hashable, Identifiable {
 enum HotkeyRole: String, CaseIterable {
     case pushToTalk = "ptt"
     case handsFree  = "lock"
-    case polish     = "polish"
 
     var displayName: String {
         switch self {
         case .pushToTalk: return "Push to talk"
         case .handsFree:  return "Hands-free mode"
-        case .polish:     return "Polish selection"
         }
     }
     var subtitle: String {
         switch self {
         case .pushToTalk: return "Hold fn to say something short, release to paste"
         case .handsFree:  return "Double-tap fn to start hands-free, tap fn again to stop"
-        case .polish:     return "Select any text, press this to polish it in place"
         }
     }
 
@@ -226,23 +221,22 @@ enum HotkeyRole: String, CaseIterable {
     ///
     /// These match Wispr Flow exactly:
     ///   - Push to talk:  hold `fn` alone (modifier-only, fn bit = 0x800000).
-    ///   - Hands-free:    `fn + Space`.
+    ///   - Hands-free:    DOUBLE-TAP `fn` (two quick presses) — no separate
+    ///                    binding; the PTT state machine latches on double-tap.
     /// On keyboards without an Apple fn key, the user can rebind PTT to
-    /// Ctrl+Opt (and hands-free to Ctrl+Opt+Space) via Settings; the NSEvent
-    /// fallback monitor handles those non-fn bindings.
+    /// Ctrl+Opt via Settings (double-tapping that then latches hands-free);
+    /// the NSEvent fallback monitor handles those non-fn bindings.
     var defaultBindings: [CapturedHotkey] {
         switch self {
         case .pushToTalk:
             // fn alone, modifier-only.
             return [CapturedHotkey(keyCode: nil, modifiersRaw: 0x800000)]
         case .handsFree:
-            // No separate binding — hands-free is entered by double-tapping fn
-            // (two quick fn presses within the double-tap window). The PTT state
-            // machine handles this natively; no extra binding needed.
+            // Hands-free is entered by DOUBLE-TAPPING the push-to-talk key
+            // (two quick fn presses within the double-tap window) — handled
+            // natively by the PTT state machine. The double-tap IS the
+            // hands-free trigger, so there is intentionally no separate binding.
             return []
-        case .polish:
-            // Option+1 — matches prior hardcoded binding so existing users keep it.
-            return [CapturedHotkey(keyCode: 18, modifiersRaw: NSEvent.ModifierFlags.option.rawValue)]
         }
     }
 
@@ -250,7 +244,6 @@ enum HotkeyRole: String, CaseIterable {
         switch self {
         case .pushToTalk: return "hotkeys.captured.ptt"
         case .handsFree:  return "hotkeys.captured.lock"
-        case .polish:     return "hotkeys.captured.polish"
         }
     }
 
@@ -370,9 +363,6 @@ class HotkeyService {
     @ObservationIgnored
     private var lockBindings:   [CapturedHotkey] { HotkeyRole.handsFree.loadBindings() }
 
-    @ObservationIgnored
-    private var polishBindings: [CapturedHotkey] { HotkeyRole.polish.loadBindings() }
-
     /// Whether the hotkey-driven recording session is active (PTT held or
     /// locked). Mirrors transition state for UI binding.
     var isHotkeyActive: Bool = false
@@ -394,7 +384,6 @@ class HotkeyService {
     @ObservationIgnored private var state: State = .idle
     @ObservationIgnored private var globalMonitor: Any?
     @ObservationIgnored private var localMonitor: Any?
-    @ObservationIgnored private var polishSelectionMonitor: Any?
     /// Passive global monitor for the Escape key (virtual keycode 53). Used
     /// to cancel an in-flight dictation when the user presses Esc anywhere on
     /// the system. We don't consume the event — Esc continues to dismiss the
@@ -504,27 +493,6 @@ class HotkeyService {
             return event
         }
 
-        // Polish-selection global shortcut — configurable via HotkeyRole.polish.
-        // Defaults to ⌥1 (matching prior hardcoded binding) but the user can
-        // change it in Settings > Polish.
-        let polishHotkeys = polishBindings
-        polishSelectionMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self else { return }
-            let matched = polishHotkeys.contains { binding in
-                if let kc = binding.keyCode {
-                    guard event.keyCode == kc else { return false }
-                }
-                let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                let required = NSEvent.ModifierFlags(rawValue: binding.modifiersRaw)
-                    .intersection(.deviceIndependentFlagsMask)
-                return mods == required
-            }
-            guard matched else { return }
-            DispatchQueue.main.async {
-                NotificationCenter.default.post(name: .voicePolishSelection, object: nil)
-            }
-        }
-
         // === Escape key cancel-in-flight monitor ===
         // Virtual keycode 53 (kVK_Escape) WITHOUT any modifiers. We listen
         // GLOBALLY (events outside VOICE) and LOCALLY (when VOICE is
@@ -580,9 +548,24 @@ class HotkeyService {
         pressInitiatedByFnTap = false
         hotkeyIsDown = false
         activeRole = nil
+        // Keep the state machine consistent with the latch. stopMonitoring()
+        // force-clears hotkeyIsDown; if `state` were left at .pressed / .armed /
+        // .lockedAndPressed the two would desync and the next fresh press would
+        // hit a defensive no-op (e.g. (.pressed, .keyDown)), wedging the hotkey.
+        // This matters on the recreateTapIfNeeded() → startMonitoring() rebuild
+        // path (sleep/wake, AX-permission toggle), which tears down via here.
+        // A live .locked recording is owned by the delegate's recordingState, not
+        // by `state`, so resetting the FSM doesn't abort it — the user can still
+        // tap to stop. The pending double-tap timer is invalidated below, so
+        // dropping out of .armed loses no in-flight commit.
+        if state != .idle {
+            Telemetry.log("hotkey.fsm_reset", properties: ["from": "\(state)"])
+            state = .idle
+            isHotkeyActive = false
+            pressDownAt = nil
+        }
         if let m = globalMonitor { NSEvent.removeMonitor(m); globalMonitor = nil }
         if let m = localMonitor { NSEvent.removeMonitor(m); localMonitor = nil }
-        if let m = polishSelectionMonitor { NSEvent.removeMonitor(m); polishSelectionMonitor = nil }
         if let m = escapeGlobalMonitor { NSEvent.removeMonitor(m); escapeGlobalMonitor = nil }
         if let m = escapeLocalMonitor { NSEvent.removeMonitor(m); escapeLocalMonitor = nil }
         doubleTapTimer?.invalidate()
@@ -627,6 +610,7 @@ class HotkeyService {
         guard fnTapActive, let tap = fnKeyTap else { return }
         if !tap.isAlive() {
             print("[VOICE-HK] health check: fn tap is dead — recreating")
+            Telemetry.log("hotkey.eventtap_dead", properties: ["source": "healthCheck"])
             recreateTapIfNeeded()
         }
     }
@@ -688,12 +672,14 @@ class HotkeyService {
             tap.rearm()
             if tap.isAlive() {
                 print("[VOICE-HK] tap rearmed in place")
+                Telemetry.log("hotkey.eventtap_reenabled", properties: ["how": "rearm"])
                 return
             }
         }
         // Case C: full rebuild. startMonitoring() tears down and reinstalls
         // everything (tap, NSEvent monitors, observers, timer).
         print("[VOICE-HK] recreating event tap from scratch")
+        Telemetry.log("hotkey.eventtap_reenabled", properties: ["how": "rebuild"])
         startMonitoring()
     }
 
@@ -709,12 +695,20 @@ class HotkeyService {
             0x40 | 0x20 | 0x10 | 0x8 | 0x2000 | 0x1 | 0x4 | 0x2 | 0x800000
         if (currentFlags & relevantMask) == 0 {
             print("[VOICE-HK] modifier latch desync detected — clearing stale hotkeyIsDown")
+            Telemetry.log("hotkey.latch_desync_cleared", properties: ["state": "\(state)"])
             hotkeyIsDown = false
             activeRole = nil
             pressInitiatedByFnTap = false
-            // If state machine thinks something is held, release safely.
-            if case .pressed = state {
+            // If the state machine thinks a key is still physically held, release
+            // it safely. Both .pressed AND .lockedAndPressed are "key-is-down"
+            // states whose only exit is a keyUp — if sleep/wake swallowed that
+            // keyUp we'd be wedged forever (recording never stops, or the lock
+            // exit never completes). Synthesize the keyUp for both.
+            switch state {
+            case .pressed, .lockedAndPressed:
                 transition(event: .keyUp)
+            default:
+                break
             }
         }
     }
@@ -857,6 +851,7 @@ class HotkeyService {
             state = .pressed(since: now)
             pressDownAt = now
             isHotkeyActive = true
+            Telemetry.log("hotkey.activate", properties: ["from": "idle"])
             fireDelegateSync { $0.hotkeyDidActivate() }
 
         // .pressed ── keyUp ──▶ .idle (long hold) or .armed (short tap)
@@ -881,6 +876,7 @@ class HotkeyService {
                 state = .idle
                 isHotkeyActive = false
                 pressDownAt = nil
+                Telemetry.log("hotkey.deactivate", properties: ["held_ms": Int(held * 1000)])
                 fireDelegateSync { $0.hotkeyDidDeactivate() }
             }
 
@@ -890,6 +886,7 @@ class HotkeyService {
             state = .locked
             isLocked = true
             pressDownAt = Date()
+            Telemetry.log("hotkey.doubletap_lock", properties: ["from": "armed"])
             fireDelegateSync { $0.hotkeyDidDoubleTap() }
 
         // .armed ── window expired ──▶ .idle (no double-tap, discard)
@@ -897,12 +894,14 @@ class HotkeyService {
             state = .idle
             isHotkeyActive = false
             pressDownAt = nil
+            Telemetry.log("hotkey.quick_release")
             fireDelegateSync { $0.hotkeyDidQuickRelease() }
 
         // .locked ── keyDown ──▶ .lockedAndPressed (third tap — exit + commit)
         case (.locked, .keyDown):
             state = .lockedAndPressed
             pressDownAt = Date()
+            Telemetry.log("hotkey.activate", properties: ["from": "locked"])
             fireDelegateSync { $0.hotkeyDidActivate() }
 
         // .armed ── keyUp ──▶ ignored
@@ -929,6 +928,7 @@ class HotkeyService {
             isLocked = true
             isHotkeyActive = true
             pressDownAt = Date()
+            Telemetry.log("hotkey.doubletap_lock", properties: ["from": "handsfree"])
             fireDelegateSync { $0.hotkeyDidActivate() }
             fireDelegateSync { $0.hotkeyDidDoubleTap() }
 
@@ -938,6 +938,7 @@ class HotkeyService {
             isLocked = false
             isHotkeyActive = false
             pressDownAt = nil
+            Telemetry.log("hotkey.deactivate", properties: ["from": "handsfree_unlock"])
             fireDelegateSync { $0.hotkeyDidActivate() }
 
         // .pressed ── handsFreeTap ──▶ .locked
@@ -953,6 +954,7 @@ class HotkeyService {
             isHotkeyActive = true
             // Keep pressDownAt — the recording that began on the fn .keyDown
             // owns it; lock mode doesn't restart the recording.
+            Telemetry.log("hotkey.doubletap_lock", properties: ["from": "pressed"])
             fireDelegateSync { $0.hotkeyDidDoubleTap() }
 
         // .armed ── handsFreeTap ──▶ .locked
@@ -970,6 +972,7 @@ class HotkeyService {
             // third-tap collision after fn+Space combo.
             hotkeyIsDown = false
             pressDownAt = nil
+            Telemetry.log("hotkey.doubletap_lock", properties: ["from": "armed_fnspace"])
             fireDelegateSync { $0.hotkeyDidDoubleTap() }
 
         // Defensive — handsFreeTap while a lock-exit press is mid-flight: ignore.

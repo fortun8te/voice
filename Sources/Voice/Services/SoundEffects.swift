@@ -108,6 +108,50 @@ enum SoundEffects {
         }
     }
 
+    /// Hands-free lock-engaged earcon. Two quick warm taps — a "latched"
+    /// signature distinct from the single start tap (mirrors Wispr's
+    /// two-tap popo-lock feel without shipping their asset). ~170ms.
+    static func playLock() {
+        guard enabled else { return }
+        renderAndPlay(duration: 0.17, peakAmplitude: 0.20) { t, dur in
+            let n = noiseTransient(t: t, decayMs: 5, color: .mid) * 0.40
+            // Tap 1 at onset, Tap 2 offset ~55ms → "ka-chunk" lock rhythm.
+            let tap1 = pluckTone(
+                t: t, freq: 440.0, decay: 0.030,
+                harmonics: [(1.0, 1.00), (2.0, 0.25), (3.0, 0.08)],
+                inharmonicity: 0.003
+            )
+            let t2 = t - 0.055
+            let tap2 = t2 > 0 ? pluckTone(
+                t: t2, freq: 440.0, decay: 0.035,
+                harmonics: [(1.0, 1.00), (2.0, 0.25), (3.0, 0.08)],
+                inharmonicity: 0.003
+            ) : 0
+            return (noise: n, body: (tap1 + tap2) * 0.70, t: t, dur: dur)
+        }
+    }
+
+    /// Error / no-speech earcon. Low, slightly dissonant falling double-tone —
+    /// reads unmistakably as "wrong" without being harsh. Quiet. ~240ms.
+    static func playError() {
+        guard enabled else { return }
+        renderAndPlay(duration: 0.24, peakAmplitude: 0.17) { t, dur in
+            let n = noiseTransient(t: t, decayMs: 6, color: .low) * 0.30
+            // Two low tones a minor-second apart (G3 + G#3) → gentle dissonance,
+            // both gliding down slightly for a "deflating" negative feel.
+            let glide = 1.0 - 0.10 * smoothRise(t: t, ms: 80)
+            let a = pluckTone(
+                t: t, freq: 196.00 * glide, decay: 0.090,
+                harmonics: [(1.0, 1.00), (2.0, 0.18)], inharmonicity: 0.002
+            )
+            let b = pluckTone(
+                t: t, freq: 207.65 * glide, decay: 0.090,
+                harmonics: [(1.0, 0.70)], inharmonicity: 0.002
+            )
+            return (noise: n, body: (a + b) * 0.60, t: t, dur: dur)
+        }
+    }
+
     // MARK: - Synthesis helpers
 
     private enum NoiseColor { case high, mid, low }

@@ -1,22 +1,24 @@
 // NVIDIAPolisher.swift
 //
-// NVIDIA NIM is the PRIMARY cloud polish provider, sitting at the top of the
-// fallback chain:
-//   NVIDIA → Cerebras → Hyperbolic → Groq → local
+// NVIDIA NIM is a cloud polish provider. NOTE: it is currently DISABLED in
+// the dictation routing — Qwen3Polisher forces `nvidiaAvailable = false`
+// because NVIDIA's gpt-oss-120b clogged mid-stream. Cerebras is now primary.
+// This provider remains a ready fallback and is still used by VideoSummarizer.
 //
-// Why primary:
-//   - Hosts gpt-oss-120b on NVIDIA's own NIM infrastructure with strong
-//     quality parity to Cerebras / Hyperbolic.
+// Effective dictation chain today:  Cerebras → Hyperbolic → Groq → local
+// If re-enabled it would sit at:     NVIDIA → Cerebras → Hyperbolic → Groq → local
+//
+// Background:
+//   - Hosts OpenAI-compatible models on NVIDIA's own NIM infrastructure.
 //   - Free tier is account-level: 40 RPM with 1000-5000 lifetime credits,
 //     no credit card required to start.
-//   - Separate quota from Cerebras / Hyperbolic / Groq → when one provider
-//     is rate-limited, the others usually aren't.
+//   - Separate quota from Cerebras / Hyperbolic / Groq.
 //
 // API surface: OpenAI-compatible /v1/chat/completions (same as Cerebras /
 // Hyperbolic / Groq).
 // Endpoint: https://integrate.api.nvidia.com/v1/chat/completions
-// Model: openai/gpt-oss-120b (note the `openai/` prefix — NVIDIA namespaces
-// the model differently from Cerebras's plain `gpt-oss-120b`).
+// Model: mistralai/mistral-small-4-119b-2603 (switched off gpt-oss-120b,
+// which returns answers in a reasoning field / clogged).
 //
 // Get a free API key at build.nvidia.com (key format: nvapi-...). Store it
 // in UserDefaults under key "voice.nvidiaAPIKey". No bundled key — NVIDIA
@@ -31,10 +33,14 @@
 // rate-limit (HTTP 429), fall through immediately to the next provider —
 // retrying just burns the budget before we have to demote anyway.
 //
-// Timeout: HARD 8s total. NVIDIA's 120B model has documented occasional
+// Timeout: HARD 6s total. NVIDIA's 120B model has documented occasional
 // hangs where the SSE stream stalls mid-response; the hard ceiling guards
-// against the routing layer waiting forever. First-token timeout is 4s
-// so we fail fast on cold-start or dead-key situations.
+// against the routing layer waiting forever. First-token timeout is 3s
+// so we fail fast on cold-start or dead-key situations, and a 3s MID-STREAM
+// stall detector aborts when the stream starts then goes silent (the
+// documented 120B hang). Timeout failures (first-token / total / stall) are
+// NEVER retried — a hung endpoint won't recover in a 200ms backoff, and
+// retrying just stacks latency before we demote to Cerebras anyway.
 //
 // Reasoning effort: `reasoning_effort: "low"` is sent in the payload — for
 // gpt-oss the lowest setting still produces clean polish output without
@@ -50,7 +56,7 @@ public final class NVIDIAPolisher {
 
     /// NVIDIA NIM model ID. Note the `openai/` prefix — NVIDIA namespaces
     /// models by author, unlike Cerebras (plain `gpt-oss-120b`).
-    private let model = "openai/gpt-oss-120b"
+    private let model = "mistralai/mistral-small-4-119b-2603"
 
     private let endpoint = URL(string: "https://integrate.api.nvidia.com/v1/chat/completions")!
 
@@ -144,15 +150,20 @@ public final class NVIDIAPolisher {
         }
         lastFailureReason = nil
 
-        // HARD 8s total ceiling regardless of input length. NVIDIA's 120B
+        // HARD 6s total ceiling regardless of input length. NVIDIA's 120B
         // model has documented occasional hangs where the SSE stream STARTS
-        // then stalls mid-response — the 4s first-token budget already catches
-        // a dead/cold endpoint, so this ceiling only governs a mid-stream
-        // stall. Dictation outputs are short (a healthy response finishes well
-        // under 4s), so 8s is generous while keeping the p95 fail-over to
-        // Cerebras fast instead of making the user wait 15s on a stall.
-        let resolvedTotalTimeout: TimeInterval = timeoutSeconds ?? 8.0
-        let firstTokenTimeout: TimeInterval = min(4.0, resolvedTotalTimeout)
+        // then stalls mid-response — the 3s first-token budget catches a
+        // dead/cold endpoint, the 3s mid-stream stall detector (see
+        // `stallTimeout`) catches the start-then-hang case, and this ceiling
+        // is the absolute backstop. Dictation outputs are short (a healthy
+        // response finishes well under 3s), so this keeps the p95 fail-over
+        // to Cerebras fast instead of stacking a long stall onto the chain.
+        let resolvedTotalTimeout: TimeInterval = timeoutSeconds ?? 6.0
+        let firstTokenTimeout: TimeInterval = min(3.0, resolvedTotalTimeout)
+        // Mid-stream stall: if streaming has started but no new token arrives
+        // for this long, abort and fall through. Targets the 120B mid-response
+        // hang specifically.
+        let stallTimeout: TimeInterval = 3.0
 
         for attempt in 0...maxRetries {
             let result = await polishOnce(
@@ -161,7 +172,8 @@ public final class NVIDIAPolisher {
                 apiKey: apiKey,
                 maxTokens: maxTokens,
                 totalTimeout: resolvedTotalTimeout,
-                firstTokenTimeout: firstTokenTimeout
+                firstTokenTimeout: firstTokenTimeout,
+                stallTimeout: stallTimeout
             )
 
             switch result {
@@ -169,15 +181,21 @@ public final class NVIDIAPolisher {
                 return polished
 
             case .transientFailure(let reason):
-                // Rate-limit: don't retry. NVIDIA free tier is 40 RPM
-                // account-level — if we got rejected, the window is
-                // congested and waiting for a retry burns budget before
-                // we have to demote anyway. Matches Cerebras / Hyperbolic
-                // policy: fall through immediately.
-                if reason == "rate-limit" {
+                // Don't retry rate-limit OR any timeout/stall. A hung 120B
+                // stream won't recover within a 200ms backoff — retrying
+                // just stacks 6s ceilings before we demote to Cerebras
+                // anyway. Fall through immediately so the chain stays bounded.
+                let noRetry = reason == "rate-limit"
+                    || reason == "timeout-firsttoken"
+                    || reason == "timeout-total"
+                    || reason == "stall"
+                    // empty-response is deterministic — retrying stacks 6s
+                    // ceilings before demoting to Cerebras anyway.
+                    || reason == "empty-response"
+                if noRetry {
                     recordFailure(reason)
                     lastFailureReason = reason
-                    print("[NVIDIA] rate-limit — falling through immediately (no retry)")
+                    print("[NVIDIA] \(reason) — falling through immediately (no retry)")
                     return nil
                 }
                 if attempt < maxRetries {
@@ -207,7 +225,8 @@ public final class NVIDIAPolisher {
         apiKey: String,
         maxTokens: Int,
         totalTimeout: TimeInterval,
-        firstTokenTimeout: TimeInterval
+        firstTokenTimeout: TimeInterval,
+        stallTimeout: TimeInterval
     ) async -> AttemptResult {
         let started = CFAbsoluteTimeGetCurrent()
 
@@ -224,7 +243,6 @@ public final class NVIDIAPolisher {
             ],
             "temperature": 0.2,
             "max_tokens": maxTokens,
-            "reasoning_effort": "low",
             "stream": true,
         ]
 
@@ -232,6 +250,9 @@ public final class NVIDIAPolisher {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        // Browser-style User-Agent. Mirrors CerebrasPolisher's Cloudflare 1010
+        // fix; harmless on hosts that aren't Cloudflare-fronted.
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         do {
             req.httpBody = try JSONSerialization.data(withJSONObject: payload)
         } catch {
@@ -255,21 +276,34 @@ public final class NVIDIAPolisher {
                 return classifyHTTPStatus(http.statusCode)
             }
 
-            // SSE streaming with first-token timeout race.
-            var accumulated = ""
-            var firstTokenSeen = false
+            // SSE streaming with a first-token timeout race AND a mid-stream
+            // stall detector. NVIDIA's 120B occasionally emits a first token
+            // then goes silent; `progress` tracks the wall-clock time of the
+            // last token so the watchdog task can abort a stall.
+            let progress = StreamProgress()
 
             let streamResult: AttemptResult? = await withTaskGroup(of: AttemptResult?.self) { group -> AttemptResult? in
-                group.addTask { [firstTokenTimeout] in
+                // Watchdog: first-token budget, then per-token stall budget.
+                group.addTask { [firstTokenTimeout, stallTimeout] in
+                    // Phase 1: wait for the first token.
                     try? await Task.sleep(nanoseconds: UInt64(firstTokenTimeout * 1_000_000_000))
-                    return .transientFailure("timeout-firsttoken")
+                    if !progress.firstTokenSeen {
+                        return .transientFailure("timeout-firsttoken")
+                    }
+                    // Phase 2: poll for mid-stream stalls. If the gap since the
+                    // last token exceeds stallTimeout, abort.
+                    let pollNs: UInt64 = 250_000_000  // 250ms
+                    while !progress.done {
+                        if progress.secondsSinceLastToken() > stallTimeout {
+                            return .transientFailure("stall")
+                        }
+                        try? await Task.sleep(nanoseconds: pollNs)
+                    }
+                    return nil
                 }
                 group.addTask {
                     do {
                         for try await line in asyncBytes.lines {
-                            if !firstTokenSeen, !line.isEmpty {
-                                firstTokenSeen = true
-                            }
                             if line.isEmpty { continue }
                             if line == "data: [DONE]" { break }
                             guard line.hasPrefix("data: ") else { continue }
@@ -277,11 +311,22 @@ public final class NVIDIAPolisher {
                             guard let jsonData = jsonStr.data(using: .utf8),
                                   let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
                             if let choices = parsed["choices"] as? [[String: Any]],
-                               let delta = choices.first?["delta"] as? [String: Any],
-                               let chunk = delta["content"] as? String {
-                                accumulated += chunk
+                               let delta = choices.first?["delta"] as? [String: Any] {
+                                if let chunk = delta["content"] as? String {
+                                    progress.appendToken(chunk)
+                                }
+                                // Capture reasoning-channel text as a fallback
+                                // only (see CerebrasPolisher). Also counts as a
+                                // token for the stall watchdog so a reasoning-
+                                // only stream isn't killed as a false stall.
+                                if let r = delta["reasoning"] as? String {
+                                    progress.appendReasoning(r)
+                                } else if let r = delta["reasoning_content"] as? String {
+                                    progress.appendReasoning(r)
+                                }
                             }
                         }
+                        progress.markDone()
                         return nil
                     } catch let urlError as URLError where urlError.code == .timedOut {
                         return .transientFailure("timeout-total")
@@ -298,7 +343,9 @@ public final class NVIDIAPolisher {
                 if let firstResult = await group.next() {
                     group.cancelAll()
                     if firstResult == nil { return nil }
-                    if case .transientFailure("timeout-firsttoken") = firstResult, firstTokenSeen {
+                    // First-token timeout is only honored if no token arrived;
+                    // otherwise the watchdog already transitioned to stall mode.
+                    if case .transientFailure("timeout-firsttoken") = firstResult, progress.firstTokenSeen {
                         return await group.next() ?? nil
                     }
                     return firstResult
@@ -307,11 +354,24 @@ public final class NVIDIAPolisher {
             }
 
             if let earlyExit = streamResult {
+                if case .transientFailure("stall") = earlyExit {
+                    let dt = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
+                    print("[NVIDIA] mid-stream stall after \(dt)ms (no token for >\(Int(stallTimeout))s) — aborting")
+                }
                 return earlyExit
             }
 
             let dt = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
-            let result = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            var result = progress.accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Recover the answer from the reasoning channel if content was
+            // empty and the text doesn't look like exposed chain-of-thought.
+            if result.isEmpty {
+                let reasoning = progress.accumulatedReasoning.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !reasoning.isEmpty, !CerebrasPolisher.looksLikeChainOfThought(reasoning) {
+                    print("[NVIDIA] content empty — recovered answer from reasoning field (\(reasoning.count) chars)")
+                    result = reasoning
+                }
+            }
             guard !result.isEmpty else {
                 print("[NVIDIA] empty streamed response")
                 return .transientFailure("empty-response")
@@ -358,5 +418,64 @@ public final class NVIDIAPolisher {
 
     private func recordFailure(_ reason: String) {
         failureCounts[reason, default: 0] += 1
+    }
+}
+
+/// Thread-safe progress tracker shared between the SSE consumer task and the
+/// stall watchdog task. The consumer runs off the main actor; the watchdog
+/// polls `secondsSinceLastToken()`. A plain lock keeps it `Sendable` without
+/// pulling in actor hops on the hot streaming path.
+private final class StreamProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _accumulated = ""
+    private var _accumulatedReasoning = ""
+    private var _firstTokenSeen = false
+    private var _done = false
+    private var _lastTokenAt = CFAbsoluteTimeGetCurrent()
+
+    func appendToken(_ chunk: String) {
+        lock.lock(); defer { lock.unlock() }
+        _accumulated += chunk
+        _firstTokenSeen = true
+        _lastTokenAt = CFAbsoluteTimeGetCurrent()
+    }
+
+    /// Reasoning-channel text, kept separate as a fallback. Counts as activity
+    /// for the stall watchdog so a reasoning-only stream isn't false-killed.
+    func appendReasoning(_ chunk: String) {
+        lock.lock(); defer { lock.unlock() }
+        _accumulatedReasoning += chunk
+        _firstTokenSeen = true
+        _lastTokenAt = CFAbsoluteTimeGetCurrent()
+    }
+
+    func markDone() {
+        lock.lock(); defer { lock.unlock() }
+        _done = true
+    }
+
+    var accumulated: String {
+        lock.lock(); defer { lock.unlock() }
+        return _accumulated
+    }
+
+    var accumulatedReasoning: String {
+        lock.lock(); defer { lock.unlock() }
+        return _accumulatedReasoning
+    }
+
+    var firstTokenSeen: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _firstTokenSeen
+    }
+
+    var done: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _done
+    }
+
+    func secondsSinceLastToken() -> TimeInterval {
+        lock.lock(); defer { lock.unlock() }
+        return CFAbsoluteTimeGetCurrent() - _lastTokenAt
     }
 }

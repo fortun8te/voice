@@ -43,7 +43,7 @@ struct VoiceApp: App {
     /// CallAppDetector polls SCShareableContent + CoreAudio every ~2s to detect
     /// Discord/Zoom/Teams/Slack/FaceTime calls. Off by default — opt-in for
     /// auto meeting capture.
-    @AppStorage("voice.enableMeetingDetection") private var enableMeetingDetection: Bool = true
+    @AppStorage("voice.enableMeetingDetection") private var enableMeetingDetection: Bool = false
     /// Master kill switch for *automatic* meeting detection. When true, every
     /// auto-start path (CallAppDetector, Chrome MeetBridge, voiceAutoStartMeeting
     /// notification) is short-circuited regardless of the per-detector flags.
@@ -103,10 +103,11 @@ enum BackgroundActivityGate {
         if privacyMode { return false }
         // Inverted kill switch — explicit OFF wins.
         if UserDefaults.standard.bool(forKey: "voice.disableMeetingDetection") { return false }
-        // Default to ON if unset — meeting recording is core product behavior.
-        // The defensive guards (whitelist, frontmost-app match, MeetBridge participant
-        // check, sustained-presence ticks) prevent false positives.
-        if UserDefaults.standard.object(forKey: "voice.enableMeetingDetection") == nil { return true }
+        // Default to OFF if unset. Meeting/call auto-detection polls
+        // SCShareableContent (ScreenCaptureKit), which lights the macOS
+        // screen-recording indicator — too alarming to enable for everyone by
+        // default. It is now strictly opt-in from Settings.
+        if UserDefaults.standard.object(forKey: "voice.enableMeetingDetection") == nil { return false }
         return UserDefaults.standard.bool(forKey: "voice.enableMeetingDetection")
     }
 
@@ -159,6 +160,18 @@ struct VoiceEntryPoint {
             // RunLoop trick as --polish-harness above.
             Task { @MainActor in
                 await PolishScriptsHarness.run()
+                exit(0)
+            }
+            RunLoop.main.run()
+            return
+        }
+        if args.dropFirst().first == "--rerun-audio" {
+            // Re-transcribe + re-polish the last N saved dictations from their
+            // retained .caf audio, comparing OLD vs NEW output + latency.
+            // `swift run -c release Voice --rerun-audio [N]` (default 10).
+            let n = (args.count > 2 ? Int(args[2]) : nil) ?? 10
+            Task { @MainActor in
+                await RerunAudioHarness.run(limit: n)
                 exit(0)
             }
             RunLoop.main.run()
@@ -918,12 +931,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var errorDismissTask: Task<Void, Never>?
     private var onboardingWindow: NSPanel?
     private var errorObserver: NSObjectProtocol?
+    /// Set true once `applicationDidFinishLaunching` has run far enough that any
+    /// further `applicationShouldHandleReopen` is a genuine USER reopen (Dock
+    /// click / re-launch of the running app) rather than the spurious reopen
+    /// macOS delivers at launch — notably for launch-at-login. We use this to
+    /// stop the app from opening its window + stealing focus on its own at
+    /// startup. Flipped true at the very end of didFinishLaunching.
+    private var didFinishLaunchingComplete = false
     /// All block-based NotificationCenter observers we register. We hold the
     /// tokens so `applicationWillTerminate` can remove every one — previously
     /// only `errorObserver` got cleaned up, leaving the didBecomeActive +
-    /// voiceOpenBigMenu + voicePolishSelection observers as zombies if the
+    /// voiceOpenBigMenu observers as zombies if the
     /// process is ever re-spawned in the same address space (tests, hot reload).
     private var notificationTokens: [NSObjectProtocol] = []
+
+    /// Observers registered on `NSWorkspace.shared.notificationCenter` (sleep /
+    /// wake). These live on a DIFFERENT center than `notificationTokens`, so
+    /// they must be removed from the workspace center in `applicationWillTerminate`
+    /// — mixing them into `notificationTokens` would leak them (removeObserver on
+    /// the default center is a silent no-op for workspace tokens).
+    private var workspaceTokens: [NSObjectProtocol] = []
 
     /// Meeting ID handed off from a "Transcript ready" notification click. Picked
     /// up by BigMenuWindow on first appearance (and via .onReceive for the
@@ -938,6 +965,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         print("[VOICE-ICON] startup: bundlePath=\(Bundle.main.bundlePath)")
         print("[VOICE-ICON] startup: bundleId=\(Bundle.main.bundleIdentifier ?? "<nil>")")
+
+        // Learn-from-correction: when the user fixes a misheard word right
+        // after a paste, surface a short "Added 'X'" pill. The learner already
+        // persists the term to the boosted vocabulary (ASR + polish).
+        CorrectionLearner.shared.onWordLearned = { [weak self] word in
+            self?.showToast("Added \u{2018}\(word)\u{2019}")
+        }
+
+        // ONE-TIME MIGRATION (V2): force meeting auto-detection OFF for existing
+        // installs. The default for `voice.enableMeetingDetection` is now false,
+        // but a user who ran an earlier build may have it explicitly stored as
+        // `true` in UserDefaults — they'd keep getting auto screen-audio capture
+        // (and the orange screen-recording indicator) at idle. Run exactly once,
+        // guarded by `voice.meetingDetectionMigratedV2`, to bring those installs
+        // to the safe default. The user can still re-enable it from Settings
+        // afterward (we only flip the stored value once; the toggle remains live).
+        let migratedKey = "voice.meetingDetectionMigratedV2"
+        if !UserDefaults.standard.bool(forKey: migratedKey) {
+            UserDefaults.standard.set(false, forKey: "voice.enableMeetingDetection")
+            UserDefaults.standard.set(true, forKey: migratedKey)
+            print("[VOICE-MIGRATE] meetingDetectionMigratedV2: forced voice.enableMeetingDetection=false (one-time)")
+        }
+
+        // One-time: force wake word OFF. Always-on wake word runs a continuous
+        // speech recognizer that nudges the system's now-playing media app
+        // (the "music starts on its own" bug). It had also re-enabled itself
+        // with the catastrophic default phrase "voice" (said constantly). Force
+        // it off once; if a user truly wants it they re-enable from Settings.
+        let wakeWordMigratedKey = "voice.wakeWordForcedOffV1"
+        if !UserDefaults.standard.bool(forKey: wakeWordMigratedKey) {
+            UserDefaults.standard.set(false, forKey: "voice.wakeWordEnabled")
+            UserDefaults.standard.set("off", forKey: "voice.wakeWordMode")
+            // Repair the insane "voice" default so any future enable is sane.
+            if (UserDefaults.standard.string(forKey: "voice.wakeWordPhrase") ?? "").lowercased() == "voice" {
+                UserDefaults.standard.set("hey voice", forKey: "voice.wakeWordPhrase")
+            }
+            UserDefaults.standard.set(true, forKey: wakeWordMigratedKey)
+            print("[VOICE-MIGRATE] wakeWordForcedOffV1: forced wake word OFF (one-time)")
+        }
 
         // Seed the user's own name (used to filter "Michael" out of the
         // participant list so meeting titles don't include the local user).
@@ -1056,6 +1122,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.showToast("Cloud unreachable (\(reason)) — using local model.")
         }
         notificationTokens.append(cloudFallbackToken)
+
+        // LIFECYCLE SIGNALS: system sleep/wake. Previously unobserved — a
+        // recording in flight when the lid closed left the audio engine in an
+        // undefined state on wake (the AVAudioEngine input node can come back
+        // detached after a sleep cycle). On sleep we defensively finish any
+        // active recording so its audio is flushed to disk rather than lost;
+        // on wake we emit a snapshot so the JSONL log shows the engine's state
+        // at the moment dictation might next be attempted.
+        let ws = NSWorkspace.shared.notificationCenter
+        let sleepToken = ws.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Telemetry.signal("lifecycle.sleep", recordingState.isRecording ? "recording_active" : "idle")
+            // Flush an in-flight recording so sleep can't strand its audio file.
+            if self.recordingState.isRecording {
+                self.finishRecording()
+            }
+        }
+        workspaceTokens.append(sleepToken)
+        let wakeToken = ws.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Telemetry.signal("lifecycle.wake")
+            self.emitDebugSnapshot(reason: "wake")
+        }
+        workspaceTokens.append(wakeToken)
 
         // Belt-and-suspenders: re-assert at 0.1 s (before Dock finishes its first
         // cache write) and again at 1.5 s (after any post-launch Dock refresh).
@@ -1351,6 +1449,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Telemetry.log("app.launched", properties: [
             "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         ])
+        // At-a-glance state dump in events.jsonl on every launch.
+        emitDebugSnapshot(reason: "launch")
 
         // Safety timer (0.5Hz / every 2s) — force-clears a stuck
         // `pendingRecordingStart` flag when it's sat true for more than 2s
@@ -1377,6 +1477,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         print("[VOICE] Launched")
+
+        // Launch has fully settled. From here on, an `applicationShouldHandle
+        // Reopen` is a genuine user gesture and may open the window. Any reopen
+        // delivered DURING launch (e.g. launch-at-login) was suppressed above,
+        // so the app stays a focusless .accessory menu-bar agent at startup.
+        didFinishLaunchingComplete = true
     }
 
     /// Wraps a startup step in do/catch + telemetry. Errors don't stop launch.
@@ -1387,6 +1493,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             Telemetry.log("startup.failed", properties: ["step": name, "error": "\(error)"])
             print("[VOICE] startup step '\(name)' failed: \(error)")
         }
+    }
+
+    /// Emit a `debug.snapshot` to events.jsonl capturing current health/config
+    /// at a glance. Fired at launch and at failure points so a reader can see
+    /// the app's full state without reconstructing it from scattered lines.
+    /// NEVER logs the full cloud key — `Telemetry.snapshot` masks it to a
+    /// prefix. `failureReasons` lets callers attach recent error context.
+    @MainActor
+    private func emitDebugSnapshot(reason: String, failureReasons: [String] = []) {
+        var extra: [String: Any] = [
+            // Cloud / Cerebras-first routing state. Raw key is masked inside
+            // Telemetry.snapshot via the "cloud_key_raw" convention.
+            "cloud_enabled": CerebrasPolisher.isEnabled,
+            "cloud_available": CerebrasPolisher.isAvailable,
+            "cloud_key_raw": CerebrasPolisher.apiKey,
+            "wake_word": UserDefaults.standard.string(forKey: "voice.wakeWordMode") ?? "off",
+            "wake_word_enabled": UserDefaults.standard.bool(forKey: "voice.wakeWordEnabled"),
+            "meeting_detect": UserDefaults.standard.bool(forKey: "voice.enableMeetingDetection"),
+            "default_model": UserDefaults.standard.string(forKey: "audioSource") ?? "microphone",
+            "accessibility": AXIsProcessTrusted(),
+            "model_state": "\(coordinator.state.modelState)",
+            "is_recording": recordingState.isRecording,
+            "transcribing_count": recordingState.transcribingCount,
+            "last_polish_engine": PolishStatus.shared.lastEngine ?? "none",
+        ]
+        if !failureReasons.isEmpty {
+            extra["recent_failures"] = failureReasons
+        }
+        Telemetry.snapshot(reason: reason, extra: extra)
     }
 
     // MARK: - App Icon Assertion
@@ -1484,6 +1619,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// tells AppKit not to try to spawn a new window for an untitled doc
     /// (we're an LSUIElement-ish app — there's nothing to spawn).
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        // FOCUS-STEAL FIX: macOS delivers a reopen event at launch in several
+        // configurations — most importantly when the app is launched at login,
+        // or relaunched while already registered. Acting on that reopen would
+        // pop the BigMenu window and pull focus away from whatever the user is
+        // typing into, which is exactly the unwanted "window opens on its own"
+        // behavior. We are a background (.accessory) menu-bar app: opening the
+        // window must be an EXPLICIT user gesture (clicking the menu-bar item /
+        // Dock icon / a menu command). So only honor a reopen once launch has
+        // fully settled — a Dock-icon click after startup still works.
+        guard didFinishLaunchingComplete else {
+            Telemetry.log("app.reopen_suppressed", properties: ["reason": "launch_in_progress"])
+            return false
+        }
         if !hasVisibleWindows {
             openBigMenu()
         }
@@ -1514,11 +1662,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // BUGFIX: remove every block-based observer we registered.
         // Previously only `errorObserver` got cleaned up; the didBecomeActive
-        // and voiceOpenBigMenu / voicePolishSelection observers leaked.
+        // and voiceOpenBigMenu observers leaked.
         for token in notificationTokens {
             NotificationCenter.default.removeObserver(token)
         }
         notificationTokens.removeAll()
+        // Workspace observers (sleep/wake) live on a separate center — remove
+        // them there, or they leak (the loop above wouldn't reach them).
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        for token in workspaceTokens {
+            wsCenter.removeObserver(token)
+        }
+        workspaceTokens.removeAll()
         // Best-effort: if a recording is still in flight, stop it so the
         // file isn't left half-flushed. We don't await — terminate doesn't
         // give us time, but stopRecording's writer will close synchronously.
@@ -1535,18 +1690,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // Confirm before quitting if a recording is active. Users have
-        // lost dictations to accidental cmd-Q exactly once and that's enough.
-        if recordingState.isRecording || recordingState.isLocked {
-            let alert = NSAlert()
-            alert.messageText = "Recording in progress"
-            alert.informativeText = "Quitting will discard this dictation. Continue?"
-            alert.addButton(withTitle: "Quit")
-            alert.addButton(withTitle: "Cancel")
-            alert.alertStyle = .warning
-            return alert.runModal() == .alertFirstButtonReturn ? .terminateNow : .terminateCancel
-        }
+        // ALWAYS allow quit immediately. We deliberately do NOT pop a modal
+        // confirm here: on a menu-bar (LSUIElement) app the alert can't always
+        // come to the front, and a stuck/phantom recording state left it hanging
+        // invisibly — making the app impossible to quit. Losing an in-flight
+        // dictation on an explicit quit is acceptable; an un-quittable app is not.
         return .terminateNow
+    }
+
+    /// Bulletproof quit, wired to the menu "Quit VOICE" item. `NSApp.terminate`
+    /// can be blocked, deferred, or hang (a wedged main thread, a stray modal,
+    /// a background task). We schedule a hard `exit(0)` fallback on a BACKGROUND
+    /// queue — so it fires even if the main thread is completely wedged — and
+    /// the app is guaranteed to die within ~0.8s no matter what.
+    @objc func quitNow() {
+        Telemetry.log("app.terminate", properties: ["via": "menu-quit"])
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.8) { exit(0) }
+        NSApp.terminate(nil)
     }
 
     private func setupMenuBar() {
@@ -1678,7 +1838,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         diagItem.target = self
         menu.addItem(diagItem)
 
-        menu.addItem(NSMenuItem(title: "Quit VOICE", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        let quitItem = NSMenuItem(title: "Quit VOICE", action: #selector(quitNow), keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
         statusItem?.menu = menu
 
         // Adaptive-rate menu bar icon refresh:
@@ -2040,7 +2202,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         about.target = self
         menu.addItem(about)
         menu.addItem(NSMenuItem.separator())
-        let quit = NSMenuItem(title: "Quit VOICE", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit VOICE", action: #selector(quitNow), keyEquivalent: "q")
+        quit.target = self
         menu.addItem(quit)
         // Anchor the popup under the toolbar item.
         if let button = sender as? NSButton {
@@ -2217,7 +2380,16 @@ extension AppDelegate {
         ) { [weak self] note in
             let message = (note.userInfo?["message"] as? String) ?? "Something went wrong."
             Telemetry.log("error.surface", properties: ["message": message])
-            Task { @MainActor in self?.showToast(message) }
+            // Error / no-speech earcon — single chokepoint for every error
+            // surface (incl. "Didn't catch that"). Self-gates on the toggle.
+            SoundEffects.playError()
+            Task { @MainActor in
+                guard let self else { return }
+                self.showToast(message)
+                // Dump full health/config alongside the error so the JSONL log
+                // carries enough context to diagnose it in isolation.
+                self.emitDebugSnapshot(reason: "error", failureReasons: [message])
+            }
         }
 
         // Mic-capture failed at meeting start. Surface a clear warning so the
@@ -2282,18 +2454,6 @@ extension AppDelegate {
             }
         }
         notificationTokens.append(openMeetingFromNotifToken)
-
-        // Opt+1 → polish selected text in any field.
-        // BUGFIX: capture the token so applicationWillTerminate can remove it.
-        let polishSelectionToken = NotificationCenter.default.addObserver(
-            forName: .voicePolishSelection,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            print("[VOICE-OPT1] notification received")
-            MainActor.assumeIsolated { self?.handlePolishSelection() }
-        }
-        notificationTokens.append(polishSelectionToken)
 
         // Global Escape → cancel any in-flight dictation work. HotkeyService
         // posts this on every Esc keyDown; cancelInFlightProcessing() gates on
@@ -3136,8 +3296,11 @@ private struct OnboardingView: View {
 extension AppDelegate: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard (notification.object as AnyObject?) === bigMenuWindow else { return }
-        // Hide from Dock + Cmd-Tab when the window closes — back to silent agent mode.
-        NSApp.setActivationPolicy(.accessory)
+        // Stay a normal Dock app after the window closes so VOICE is ALWAYS
+        // findable + quittable (Dock, Cmd-Tab, Force Quit). We no longer drop
+        // back to .accessory ("hidden agent") on close — the user wants it
+        // visible, not hidden. (Scene is Settings{EmptyView()}, so no stray
+        // window opens; the Dock icon just stays put.)
     }
 
     // MARK: - Overlay
@@ -4056,16 +4219,28 @@ extension AppDelegate: NSWindowDelegate {
     private func enterLockMode() {
         recordingState.isLocked = true
         hotkeyService.isLocked = true
+        // Hands-free latched — distinct "lock" earcon (self-gates on the
+        // soundEffectsEnabled toggle).
+        SoundEffects.playLock()
         // Auto-commit after silence in lock mode.
-        // TODO(bug-hunt): the isLocked check runs before the async-dispatch,
-        // so a user-tapped Cancel between the check and the runloop turn
-        // could let a stale silence-timeout finishRecording() fire after
-        // cancel. Low-likelihood (one runloop iteration) but the right fix
-        // is re-checking isLocked inside the dispatched block.
+        // RACE HARDENING: the silence-timeout fires on a Timer's run-loop
+        // callback, then hops to main via async. Between the outer guard and
+        // the dispatched block a user-tapped Cancel / third-tap exit / a fresh
+        // recording can flip isLocked or isRecording. We re-check BOTH flags
+        // inside the dispatched block so a stale timeout can never commit a
+        // recording that's already been cancelled, committed, or superseded.
+        // (isLocked alone wasn't enough: a PTT recording that started after a
+        // lock-exit is recording-but-not-locked, and a cancel clears isRecording
+        // before isLocked in some paths.)
         coordinator.audioCapture.onSilenceTimeout = { [weak self] in
-            guard let self, self.recordingState.isLocked else { return }
+            guard let self, self.recordingState.isLocked, self.recordingState.isRecording else { return }
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.recordingState.isLocked else { return }
+                guard let self,
+                      self.recordingState.isLocked,
+                      self.recordingState.isRecording else {
+                    print("[VOICE-HK] silence-timeout fired but state changed (locked/recording) — ignoring stale commit")
+                    return
+                }
                 self.finishRecording()
             }
         }
@@ -4182,6 +4357,10 @@ extension AppDelegate: NSWindowDelegate {
         recordingState.sessionCancelled = true
         // Scope the cancel to the CURRENT session (see cancelInFlightProcessing).
         recordingState.cancelledSessionID = recordingState.recordingSessionID
+        Telemetry.signal("recording.cancel", "user", [
+            "session": recordingState.recordingSessionID,
+            "was_recording": recordingState.isRecording
+        ])
         print("[VOICE] Cancel → stop transcribing, retain recording")
         // Stop the max-duration watchdog — this recording is ending.
         cancelMaxDurationWatchdog()
@@ -4419,6 +4598,10 @@ extension AppDelegate: NSWindowDelegate {
         // new session (see 5.2 "race between finishRecording and re-press").
         let mySession = recordingState.recordingSessionID
         print("[VOICE-HK] finishRecording: wasRecording=\(wasRecording)  started=\(started?.description ?? "nil")  session=\(mySession)")
+        Telemetry.signal("recording.finish", wasRecording ? "commit" : "noop", [
+            "session": mySession,
+            "duration_s": started.map { Int(Date().timeIntervalSince($0)) } ?? 0
+        ])
 
         // === ATOMIC CLAIM: synchronously stop audio capture and snapshot the
         // current recording's resources BEFORE we return from this function.
@@ -4617,6 +4800,17 @@ extension AppDelegate: NSWindowDelegate {
 
             if rawText.isEmpty {
                 vlog("[VOICE] Empty transcript → silent")
+                // STALE-FLAG GUARD: the coordinator may have set
+                // skipPolishForCurrent for THIS session before we discovered the
+                // transcript was empty. We return before the normal consume site
+                // below, so clear it here (only if we still own live state) —
+                // otherwise the NEXT dictation inherits this session's stale
+                // short-clip flag and wrongly skips its own LLM polish.
+                if iOwnLiveState {
+                    recordingState.skipPolishForCurrent = false
+                    recordingState.graniteTranscript = nil
+                    recordingState.moonshineTranscript = nil
+                }
                 return
             }
 
@@ -4657,6 +4851,14 @@ extension AppDelegate: NSWindowDelegate {
                     object: nil,
                     userInfo: ["message": "Transcript saved to clipboard — mixed script detected"]
                 )
+                // STALE-FLAG GUARD (same rationale as the empty-transcript path):
+                // consume this session's per-clip polish flags before returning so
+                // a stale skipPolishForCurrent can't leak into the next dictation.
+                if iOwnLiveState {
+                    recordingState.skipPolishForCurrent = false
+                    recordingState.graniteTranscript = nil
+                    recordingState.moonshineTranscript = nil
+                }
                 return
             }
 
@@ -5066,13 +5268,17 @@ extension AppDelegate: NSWindowDelegate {
                         try? await Task.sleep(nanoseconds: 60_000_000)
                         self.cursorPaster.undoLastPaste()
                         try? await Task.sleep(nanoseconds: 60_000_000)
-                        if autoCopy {
-                            pb.clearContents()
-                            pb.setString(finalText, forType: .string)
-                        }
+                        // TRANSCRIPT-LOSS SAFETY NET (mirrors the final-paste
+                        // path): keep the polished text on the clipboard as the
+                        // recovery net whether or not auto-copy is on, and never
+                        // restore the prior clipboard over it. If the synthetic
+                        // repaste fails, CursorPaster's toast tells the user to
+                        // press Cmd+V — that must actually paste their transcript.
+                        pb.clearContents()
+                        pb.setString(finalText, forType: .string)
                         self.cursorPaster.pasteAtCursor(
                             finalText,
-                            restoreClipboard: !autoCopy,
+                            restoreClipboard: false,
                             preFormatted: polishOwnedFormatting
                         )
                         try? await Task.sleep(nanoseconds: 60_000_000)
@@ -5166,22 +5372,52 @@ extension AppDelegate: NSWindowDelegate {
                     // and cleanup above already ran — only the cursor write is skipped.
                     guard !self.recordingState.isCancelled(for: mySession) else {
                         print("[VOICE-HK] finishRecording: session was cancelled — skipping paste")
+                        Telemetry.signal("paste.skipped", "cancelled", ["session": mySession])
                         return
                     }
                     print("[VOICE] Calling pasteAtCursor...")
                     print("[VOICE-RACE] PASTE-FIRE site=final session=\(mySession) chars=\(finalText.count) text=\"\(finalText.prefix(60))\"")
                     print("[VOICE-TIMING] paste fired at \(Date()) chars=\(finalText.count)")
                     print("[VOICE-FUNNEL] STAGE 4 PASTE text=\"\(finalText)\" chars=\(finalText.count) target=\(capturedTargetForTask ?? "nil")")
+                    // TRANSCRIPT-LOSS SAFETY NET: if auto-copy is off we'd
+                    // normally restoreClipboard after the paste — but CursorPaster's
+                    // own failure paths (secure-field abort, focus-changed) post a
+                    // ".voiceError" toast telling the user the text is "copied —
+                    // press Cmd+V". Restoring the prior clipboard makes that recovery
+                    // a lie: their transcript would be GONE. So when auto-paste is on
+                    // but auto-copy is off, leave the transcript on the clipboard as
+                    // the recovery net (restoreClipboard:false). The user gets a
+                    // working Cmd+V if the synthetic paste didn't land. When auto-copy
+                    // is on the transcript is already the clipboard contents, so the
+                    // net is intact either way.
+                    if !autoCopy {
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        pb.setString(finalText, forType: .string)
+                    }
                     // preFormatted=true when polish ran with the field-context hint:
                     // the LLM already chose the right leading space / casing / list
                     // numbering relative to existing text. Pasting verbatim avoids
                     // the legacy rule-based adjuster from re-mangling the output.
                     cursorPaster.pasteAtCursor(
                         finalText,
-                        restoreClipboard: !autoCopy,
+                        restoreClipboard: false,
                         preFormatted: polishOwnedFormatting
                     )
                     print("[VOICE] pasteAtCursor completed preFormatted=\(polishOwnedFormatting)")
+                    // Learn-from-correction: capture the target element now and
+                    // schedule a delayed check for an in-field fix of a misheard
+                    // word. No-op when AX is denied / no focused element.
+                    let learnSnapshot = cursorPaster.captureTargetSnapshot()
+                    CorrectionLearner.shared.track(pastedText: finalText, snapshot: learnSnapshot)
+                    Telemetry.signal("paste.success", "final", [
+                        "session": mySession,
+                        "chars": finalText.count,
+                        "target": capturedTargetForTask ?? "nil"
+                    ])
+                    // Paste-complete earcon — the subliminal "done" tick.
+                    // Self-gates on the soundEffectsEnabled toggle.
+                    SoundEffects.playDone()
                     // Update rolling context so next dictation can resolve
                     // ambiguous words using what was just said.
                     Qwen3Polisher.shared.updateRollingContext(finalText)

@@ -24,8 +24,13 @@ public final class GroqPolisher {
     public static let shared = GroqPolisher()
     private init() {}
 
-    /// Free-tier model on Groq. Fast 8B — fallback quality, minimal latency.
-    private let model = "llama-3.1-8b-instant"
+    /// Free-tier model on Groq. llama-3.3-70b-versatile: real fallback quality
+    /// (70B, far better than 8b-instant at self-correction / formatting), still
+    /// fast (~0.6s) and — unlike gpt-oss — NOT a reasoning model, so it never
+    /// burns its token budget thinking and returns empty. This is the lane that
+    /// catches a Cerebras 429, so quality matters: it must produce output the
+    /// user would actually paste, not a degraded local-tier result.
+    private let model = "llama-3.3-70b-versatile"
 
     private let endpoint = URL(string: "https://api.groq.com/openai/v1/chat/completions")!
 
@@ -138,6 +143,22 @@ public final class GroqPolisher {
                 return polished
 
             case .transientFailure(let reason):
+                // Don't retry rate-limit or timeouts — Groq is last in the
+                // cloud chain, so a stacked retry here directly delays the
+                // local-MLX fallback. A hung/congested endpoint won't recover
+                // in a 200ms backoff. Network blips still get one retry.
+                let noRetry = reason == "rate-limit"
+                    || reason == "timeout-firsttoken"
+                    || reason == "timeout-total"
+                    // empty-response is deterministic — retrying just delays the
+                    // local-MLX fallback (Groq is the last cloud link).
+                    || reason == "empty-response"
+                if noRetry {
+                    recordFailure(reason)
+                    lastFailureReason = reason
+                    print("[GROQ] \(reason) — falling through immediately (no retry)")
+                    return nil
+                }
                 if attempt < maxRetries {
                     let delay = backoffMs[attempt]
                     print("[GROQ] transient failure (\(reason)) — retry \(attempt + 1)/\(maxRetries) in \(delay)ms")
@@ -186,6 +207,9 @@ public final class GroqPolisher {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        // Browser-style User-Agent. Mirrors CerebrasPolisher's Cloudflare 1010
+        // fix; harmless on hosts that aren't Cloudflare-fronted.
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         do {
             req.httpBody = try JSONSerialization.data(withJSONObject: payload)
         } catch {
@@ -211,6 +235,10 @@ public final class GroqPolisher {
 
             // SSE streaming with first-token timeout race.
             var accumulated = ""
+            // Fallback buffer for the reasoning channel — see Cerebras for the
+            // rationale. Some models stream the answer in `delta.reasoning` /
+            // `delta.reasoning_content` with content null.
+            var accumulatedReasoning = ""
             var firstTokenSeen = false
 
             let streamResult: AttemptResult? = await withTaskGroup(of: AttemptResult?.self) { group -> AttemptResult? in
@@ -231,9 +259,15 @@ public final class GroqPolisher {
                             guard let jsonData = jsonStr.data(using: .utf8),
                                   let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
                             if let choices = parsed["choices"] as? [[String: Any]],
-                               let delta = choices.first?["delta"] as? [String: Any],
-                               let chunk = delta["content"] as? String {
-                                accumulated += chunk
+                               let delta = choices.first?["delta"] as? [String: Any] {
+                                if let chunk = delta["content"] as? String {
+                                    accumulated += chunk
+                                }
+                                if let r = delta["reasoning"] as? String {
+                                    accumulatedReasoning += r
+                                } else if let r = delta["reasoning_content"] as? String {
+                                    accumulatedReasoning += r
+                                }
                             }
                         }
                         return nil
@@ -265,7 +299,16 @@ public final class GroqPolisher {
             }
 
             let dt = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
-            let result = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            var result = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Recover the answer from the reasoning channel if content was
+            // empty and the text doesn't look like exposed chain-of-thought.
+            if result.isEmpty {
+                let reasoning = accumulatedReasoning.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !reasoning.isEmpty, !CerebrasPolisher.looksLikeChainOfThought(reasoning) {
+                    print("[GROQ] content empty — recovered answer from reasoning field (\(reasoning.count) chars)")
+                    result = reasoning
+                }
+            }
             guard !result.isEmpty else {
                 print("[GROQ] empty streamed response")
                 return .transientFailure("empty-response")

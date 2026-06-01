@@ -742,9 +742,33 @@ class CursorPaster {
 
     /// Snapshot of (frontmost app bundle id, focused AX element identity)
     /// taken just before paste, so we can detect mid-flight focus loss.
-    private struct PasteTargetSnapshot {
+    /// Exposed (not private) so the CorrectionLearner can re-read the same
+    /// element's text value a few seconds after paste to detect user fixes.
+    struct PasteTargetSnapshot {
         let bundleId: String?
         let focusedElement: AXUIElement?
+    }
+
+    /// Public snapshot of the current paste target. Call this right after a
+    /// successful auto-paste so the learner can re-read the same element later.
+    /// Mirrors `currentPasteTargetSnapshot()` (which is taken pre-paste); a
+    /// post-paste sample is what we want for correction tracking because the
+    /// focus is settled and the element identity matches what the user edits.
+    func captureTargetSnapshot() -> PasteTargetSnapshot {
+        return currentPasteTargetSnapshot()
+    }
+
+    /// Re-read the current full text value of a previously-snapshotted element
+    /// via kAXValueAttribute. Returns nil when AX is not trusted, the snapshot
+    /// has no element, or the element is stale / doesn't expose a string value.
+    /// Reuses the exact attribute read used everywhere else in this file.
+    func currentText(of snapshot: PasteTargetSnapshot) -> String? {
+        guard AXIsProcessTrusted() else { return nil }
+        guard let element = snapshot.focusedElement else { return nil }
+        var textRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &textRef) == .success,
+              let text = textRef as? String else { return nil }
+        return text
     }
 
     private func currentPasteTargetSnapshot() -> PasteTargetSnapshot {

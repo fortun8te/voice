@@ -129,11 +129,13 @@ public final class HyperbolicPolisher {
         lastFailureReason = nil
 
         // Hyperbolic is ~5x slower than Cerebras per token (~571 t/s vs
-        // ~3000 t/s) and has higher TTFT. Give it more headroom than Groq
-        // gets — 15s total — but keep the first-token budget tight (4s)
-        // so we fail fast on cold-start or dead-key situations.
-        let resolvedTotalTimeout: TimeInterval = timeoutSeconds ?? (text.count <= 80 ? 8.0 : 15.0)
-        let firstTokenTimeout: TimeInterval = min(4.0, resolvedTotalTimeout)
+        // ~3000 t/s) and has higher TTFT. It sits 4th in the chain, so its
+        // budget has to stay small or a single slow Hyperbolic call blows the
+        // bounded worst-case for the whole chain. Tight first-token budget
+        // (3s) to fail fast on cold-start / dead-key, and a 4s/6s total so a
+        // genuinely-slow response still fails over to Groq / local quickly.
+        let resolvedTotalTimeout: TimeInterval = timeoutSeconds ?? (text.count <= 80 ? 4.0 : 6.0)
+        let firstTokenTimeout: TimeInterval = min(3.0, resolvedTotalTimeout)
 
         for attempt in 0...maxRetries {
             let result = await polishOnce(
@@ -155,10 +157,17 @@ public final class HyperbolicPolisher {
                 // for a retry only burns the fallback budget. Fall through
                 // to the next fallback immediately. Matches CerebrasPolisher
                 // policy.
-                if reason == "rate-limit" {
+                let noRetry = reason == "rate-limit"
+                    || reason == "timeout-firsttoken"
+                    || reason == "timeout-total"
+                    // empty-response is deterministic — retrying on the slowest
+                    // cloud link (~571 t/s) burns the most fallback budget for
+                    // no gain. Fall through to Groq immediately.
+                    || reason == "empty-response"
+                if noRetry {
                     recordFailure(reason)
                     lastFailureReason = reason
-                    print("[HYPERBOLIC] rate-limit — falling through immediately (no retry)")
+                    print("[HYPERBOLIC] \(reason) — falling through immediately (no retry)")
                     return nil
                 }
                 if attempt < maxRetries {
@@ -209,6 +218,10 @@ public final class HyperbolicPolisher {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        // Browser-style User-Agent. Mirrors CerebrasPolisher's Cloudflare 1010
+        // fix: some OpenAI-compatible hosts sit behind Cloudflare and reject
+        // URLSession's default CFNetwork UA. Harmless on hosts that don't.
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         do {
             req.httpBody = try JSONSerialization.data(withJSONObject: payload)
         } catch {
@@ -234,6 +247,10 @@ public final class HyperbolicPolisher {
 
             // SSE streaming with first-token timeout race.
             var accumulated = ""
+            // Fallback buffer for the reasoning channel — see Cerebras for the
+            // rationale. gpt-oss on some hosts streams the answer in
+            // `delta.reasoning` / `delta.reasoning_content` with content null.
+            var accumulatedReasoning = ""
             var firstTokenSeen = false
 
             let streamResult: AttemptResult? = await withTaskGroup(of: AttemptResult?.self) { group -> AttemptResult? in
@@ -254,9 +271,15 @@ public final class HyperbolicPolisher {
                             guard let jsonData = jsonStr.data(using: .utf8),
                                   let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else { continue }
                             if let choices = parsed["choices"] as? [[String: Any]],
-                               let delta = choices.first?["delta"] as? [String: Any],
-                               let chunk = delta["content"] as? String {
-                                accumulated += chunk
+                               let delta = choices.first?["delta"] as? [String: Any] {
+                                if let chunk = delta["content"] as? String {
+                                    accumulated += chunk
+                                }
+                                if let r = delta["reasoning"] as? String {
+                                    accumulatedReasoning += r
+                                } else if let r = delta["reasoning_content"] as? String {
+                                    accumulatedReasoning += r
+                                }
                             }
                         }
                         return nil
@@ -288,7 +311,16 @@ public final class HyperbolicPolisher {
             }
 
             let dt = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
-            let result = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            var result = accumulated.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Recover the answer from the reasoning channel if content was
+            // empty and the text doesn't look like exposed chain-of-thought.
+            if result.isEmpty {
+                let reasoning = accumulatedReasoning.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !reasoning.isEmpty, !CerebrasPolisher.looksLikeChainOfThought(reasoning) {
+                    print("[HYPERBOLIC] content empty — recovered answer from reasoning field (\(reasoning.count) chars)")
+                    result = reasoning
+                }
+            }
             guard !result.isEmpty else {
                 print("[HYPERBOLIC] empty streamed response")
                 return .transientFailure("empty-response")
